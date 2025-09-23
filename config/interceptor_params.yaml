@@ -1,0 +1,59 @@
+interceptor_node:
+  ros__parameters:
+    use_simulation: false
+    
+    # Physics parameters
+    physics:
+      # mass: 1.5
+      g: 9.81
+      # t_max: 30.0
+      # t_min: 1.0
+      drag_coeff: 0.325
+    
+    # Control limits  
+    limits:
+      roll_pitch_rate_max: 12.56  # 4*pi rad/s
+      yaw_rate_max: 6.28          # 2*pi rad/s
+      att_limit: 0.785            # pi/4 rad
+    
+    # MPC parameters
+    mpc:
+      n_horizon: 30
+      tf: 1.0
+      v_desired: 20.0
+    
+    # Initial conditions
+    initial_conditions:
+      drone: [0.0, 0.0, 10.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+      target_pos: [50.0, 10.0, 15.0] 
+      target_vel: [-5.0, 2.0, 1.0]
+    
+    # Perception parameters
+    perception:
+      delay: 0.05
+      bbox_pos_std_dev: 2.0
+      bbox_size_std_dev: 5.0
+    
+    # Control execution delay compensation
+    control:
+      execution_delay: 0.10  # 0.10 seconds delay compensation
+    
+    # Target properties
+    target:
+      physical_size_truth: 0.8
+      physical_size_est: 1.0
+    
+    # Camera parameters
+    camera:
+      fov_deg: 40.0
+      width_px: 640
+      focal_length_mm: 12.0
+      pixel_size_um: 3.45
+    
+    # Cost function weights
+    cost:
+      w_los: 100.0
+      w_align: 0.5
+      w_closing_speed: 1.0
+      w_u_rates: 1.0
+      w_u_thrust: 0.1
