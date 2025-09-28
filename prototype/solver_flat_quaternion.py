@@ -18,8 +18,8 @@ T_MAX = 80.0        # 最大推力 (N)
 T_MIN = 5.0         # 最小推力 (N)
 DRAG_COEFF = 0.1625    # 线性空气阻力系数
 ROLL_PITCH_RATE_MAX = 2.0 * np.pi # 最大欧拉角速率 (rad/s)
-YAW_RATE_MAX = 1.0 * np.pi # 最大欧拉角速率 (rad/s)
-ATT_LIMIT = np.pi/4 # 姿态角限制 (Roll & Pitch)
+YAW_RATE_MAX = 0.5 * np.pi # 最大欧拉角速率 (rad/s)
+ATT_LIMIT = np.pi/5 # 姿态角限制 (Roll & Pitch)
 
 # ======== MPC 控制器参数 (MPC Controller Parameters) ========
 N_HORIZON = 50       # 预测时域步数
@@ -32,7 +32,7 @@ INTERCEPTION_DISTANCE = 0.8 # 成功拦截的距离阈值 (m)
 
 # ======== 感知模型参数 (Perception Model Parameters) ========
 PERCEPTION_DELAY = 0.05  # 感知延迟 (s)
-BBOX_POS_STD_DEV = 2.0  # 检测框中心位置的测量噪声标准差 (pixels)
+BBOX_POS_STD_DEV = 5.0  # 检测框中心位置的测量噪声标准差 (pixels)
 BBOX_SIZE_STD_DEV = 5.0 # 检测框尺寸的测量噪声标准差 (pixels)
 
 # ======== 控制执行延时参数 (Control Execution Delay Parameters) ========

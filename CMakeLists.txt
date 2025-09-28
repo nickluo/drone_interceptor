@@ -57,46 +57,46 @@ include_directories(
 # =============================================================================
 
 # Original Euler angle version
-add_executable(interceptor_node 
-    src/interceptor_node.cpp
+# add_executable(interceptor_node 
+#     src/interceptor_node.cpp
 
-    ${ACADOS_GENERATED_CODE_DIR}/drone_interceptor_mpc_model/drone_interceptor_mpc_expl_ode_fun.c
-    ${ACADOS_GENERATED_CODE_DIR}/drone_interceptor_mpc_model/drone_interceptor_mpc_expl_vde_forw.c
-    ${ACADOS_GENERATED_CODE_DIR}/drone_interceptor_mpc_model/drone_interceptor_mpc_expl_vde_adj.c
+#     ${ACADOS_GENERATED_CODE_DIR}/drone_interceptor_mpc_model/drone_interceptor_mpc_expl_ode_fun.c
+#     ${ACADOS_GENERATED_CODE_DIR}/drone_interceptor_mpc_model/drone_interceptor_mpc_expl_vde_forw.c
+#     ${ACADOS_GENERATED_CODE_DIR}/drone_interceptor_mpc_model/drone_interceptor_mpc_expl_vde_adj.c
 
-    ${ACADOS_GENERATED_CODE_DIR}/drone_interceptor_mpc_cost/drone_interceptor_mpc_cost_y_0_fun.c
-    ${ACADOS_GENERATED_CODE_DIR}/drone_interceptor_mpc_cost/drone_interceptor_mpc_cost_y_0_fun_jac_ut_xt.c
-    ${ACADOS_GENERATED_CODE_DIR}/drone_interceptor_mpc_cost/drone_interceptor_mpc_cost_y_0_hess.c
-    ${ACADOS_GENERATED_CODE_DIR}/drone_interceptor_mpc_cost/drone_interceptor_mpc_cost_y_fun.c
-    ${ACADOS_GENERATED_CODE_DIR}/drone_interceptor_mpc_cost/drone_interceptor_mpc_cost_y_fun_jac_ut_xt.c
-    ${ACADOS_GENERATED_CODE_DIR}/drone_interceptor_mpc_cost/drone_interceptor_mpc_cost_y_hess.c
-    ${ACADOS_GENERATED_CODE_DIR}/drone_interceptor_mpc_cost/drone_interceptor_mpc_cost_y_e_fun.c
-    ${ACADOS_GENERATED_CODE_DIR}/drone_interceptor_mpc_cost/drone_interceptor_mpc_cost_y_e_fun_jac_ut_xt.c
-    ${ACADOS_GENERATED_CODE_DIR}/drone_interceptor_mpc_cost/drone_interceptor_mpc_cost_y_e_hess.c
+#     ${ACADOS_GENERATED_CODE_DIR}/drone_interceptor_mpc_cost/drone_interceptor_mpc_cost_y_0_fun.c
+#     ${ACADOS_GENERATED_CODE_DIR}/drone_interceptor_mpc_cost/drone_interceptor_mpc_cost_y_0_fun_jac_ut_xt.c
+#     ${ACADOS_GENERATED_CODE_DIR}/drone_interceptor_mpc_cost/drone_interceptor_mpc_cost_y_0_hess.c
+#     ${ACADOS_GENERATED_CODE_DIR}/drone_interceptor_mpc_cost/drone_interceptor_mpc_cost_y_fun.c
+#     ${ACADOS_GENERATED_CODE_DIR}/drone_interceptor_mpc_cost/drone_interceptor_mpc_cost_y_fun_jac_ut_xt.c
+#     ${ACADOS_GENERATED_CODE_DIR}/drone_interceptor_mpc_cost/drone_interceptor_mpc_cost_y_hess.c
+#     ${ACADOS_GENERATED_CODE_DIR}/drone_interceptor_mpc_cost/drone_interceptor_mpc_cost_y_e_fun.c
+#     ${ACADOS_GENERATED_CODE_DIR}/drone_interceptor_mpc_cost/drone_interceptor_mpc_cost_y_e_fun_jac_ut_xt.c
+#     ${ACADOS_GENERATED_CODE_DIR}/drone_interceptor_mpc_cost/drone_interceptor_mpc_cost_y_e_hess.c
 
-    ${ACADOS_GENERATED_CODE_DIR}/acados_solver_drone_interceptor_mpc.c
-)
+#     ${ACADOS_GENERATED_CODE_DIR}/acados_solver_drone_interceptor_mpc.c
+# )
 
-ament_target_dependencies(interceptor_node
-    rclcpp
-    geometry_msgs
-    nav_msgs
-    vision_msgs
-    quadrotor_msgs
-)
+# ament_target_dependencies(interceptor_node
+#     rclcpp
+#     geometry_msgs
+#     nav_msgs
+#     vision_msgs
+#     quadrotor_msgs
+# )
 
-target_link_directories(interceptor_node PRIVATE
-    ${ACADOS_GENERATED_CODE_DIR}
-)
+# target_link_directories(interceptor_node PRIVATE
+#     ${ACADOS_GENERATED_CODE_DIR}
+# )
 
-# Link our nodes against the ACADOS solver library
-target_link_libraries(interceptor_node
-    # acados_solver_drone_interceptor_mpc
-    acados
-    blasfeo
-    hpipm
-    m
-)
+# # Link our nodes against the ACADOS solver library
+# target_link_libraries(interceptor_node
+#     # acados_solver_drone_interceptor_mpc
+#     acados
+#     blasfeo
+#     hpipm
+#     m
+# )
 
     
 # Quaternion version
@@ -141,7 +141,7 @@ target_link_libraries(interceptor_node_quaternion
 
 
 install(TARGETS
-  interceptor_node
+#   interceptor_node
   interceptor_node_quaternion
   DESTINATION lib/${PROJECT_NAME} 
 )

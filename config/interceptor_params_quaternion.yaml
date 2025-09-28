@@ -9,7 +9,7 @@ interceptor_node_quaternion:
     
     # Control limits  
     limits:
-      att_limit: 1.0 #0.785398       # pi/4 rad (45 degrees)
+      att_limit: 0.785398       # pi/4 rad (45 degrees)
     
     # MPC parameters
     mpc:
@@ -20,36 +20,28 @@ interceptor_node_quaternion:
     # Simulation parameters
     sim:
       interception_dist: 0.8
-      # Initial conditions - 四元数格式: [px, py, pz, vx, vy, vz, qw, qx, qy, qz, wx, wy, wz]
       initial_conditions:
-        drone: [0.0, 0.0, 10.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]  # 四元数初始状态
-        # target_pos: [50.0, 10.0, 15.0]
         # target_vel: [-5.0, 2.0, 1.0]
-        target_pos: [0.0, 8.0, 42.5]
+        target_pos: [0.0, 8.0, 42.0]
         target_vel: [0.0, 0.0, 0.0]
     
     # Perception parameters
     perception:
       delay: 0.05
-      bbox_pos_std_dev: 2.0
-      bbox_size_std_dev: 5.0
+      bbox_pos_std_dev: 3.0
+      bbox_size_std_dev: 3.0
+      target_physical_size_est: 1.0
     
     # Control execution delay compensation
     control:
       execution_delay: 0.1  # 0.1 seconds (100ms) delay compensation for real flight
-      # body_rate_scale: 0.2  # Scale down body rate commands for smoother control
       rate_tc: 0.008        # First-order response time constant for body rates
       max_history_time_factor: 2.0  # History buffer size as multiple of execution_delay
     
-    # Target properties
-    target:
-      physical_size_truth: 0.8
-      physical_size_est: 1.0
-    
     # Camera parameters
     camera:
-      fov_deg: 40.0
-      width_px: 0
+      fov_deg: 25.0
+      width_px: 640
       focal_length_mm: 12.0
       pixel_size_um: 3.45
     
