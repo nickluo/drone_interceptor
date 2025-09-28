@@ -273,3 +273,20 @@ double get_yaw_from_quaternion(const Eigen::Vector4d& quat) {
     double cosy_cosp = 1 - 2 * (qy * qy + qz * qz);
     return std::atan2(siny_cosp, cosy_cosp);
 }
+
+// 四元数积分函数
+Eigen::Vector4d integrate_quaternion(const Eigen::Vector4d& quat, const Eigen::Vector3d& body_rates, double dt) {
+    // 使用四元数微分方程进行积分
+    double p = body_rates(0), q = body_rates(1), r = body_rates(2);
+    
+    // 四元数导数矩阵
+    Eigen::Matrix4d omega_matrix;
+    omega_matrix <<  0, -p, -q, -r,
+                        p,  0,  r, -q,
+                        q, -r,  0,  p,
+                        r,  q, -p,  0;
+    
+    // 一阶积分近似
+    Eigen::Vector4d quat_dot = 0.5 * omega_matrix * quat;
+    return quat + quat_dot * dt;
+}
