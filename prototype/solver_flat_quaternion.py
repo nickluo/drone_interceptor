@@ -320,7 +320,7 @@ def plot_results(hist, dt):
     ax.scatter(hist['x'][0, 0], hist['x'][0, 1], hist['x'][0, 2], c='b', s=100, marker='o', label='Drone Start')
     ax.scatter(hist['target_true'][0, 0], hist['target_true'][0, 1], hist['target_true'][0, 2], c='r', s=100, marker='x', label='Target Start')
     ax.set_xlabel('East [m]'); ax.set_ylabel('North [m]'); ax.set_zlabel('Up [m]')
-    ax.legend(); ax.set_title('3D Trajectory (Quaternion Version)'); ax.grid(True); ax.axis('equal'); plt.show()
+    ax.legend(); ax.set_title('3D Trajectory (Quaternion Version)'); ax.grid(True); ax.axis('auto'); plt.show()
     
     # 性能指标图
     fig, axs = plt.subplots(3, 1, figsize=(15, 12), sharex=True)
