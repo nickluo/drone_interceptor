@@ -2,7 +2,6 @@
 #include <chrono>
 #include <cmath>
 
-// Eigen for linear algebra
 #include <Eigen/Dense>
 
 #include "interceptor_node_quaternion.h"
@@ -108,17 +107,19 @@ void InterceptorNodeQuaternion::load_parameters()
     // 相机参数
     double cam_focal_mm, cam_pixel_um;
     int cam_width_px;
+    int native_width_px;
     double fov_deg;
     this->get_parameter("camera.fov_deg", fov_deg);
+    this->get_parameter("camera.native_width_px", native_width_px);
     this->get_parameter("camera.width_px", cam_width_px);
     this->get_parameter("camera.focal_length_mm", cam_focal_mm);
     this->get_parameter("camera.pixel_size_um", cam_pixel_um);
-    if (cam_width_px > 0) {
+    if (fov_deg > 0.0) {
         cam_width_px_ = cam_width_px;
         cam_focal_length_ = cam_width_px * 0.5 / tan(fov_deg * M_PI / 180.0 / 2.0);
     } else {
-        cam_focal_length_ = cam_focal_mm * 1000.0 / cam_pixel_um;
-        cam_width_px_ = floor(2.0 * cam_focal_length_ * tan(fov_deg * M_PI / 180.0 / 2.0));
+        double scale_factor = static_cast<double>(cam_width_px) / static_cast<double>(native_width_px);
+        cam_focal_length_ = cam_focal_mm * 1000.0 / cam_pixel_um * scale_factor;
     }
 
     if (use_simulation_)

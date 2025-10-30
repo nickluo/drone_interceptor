@@ -44,7 +44,6 @@ private:
         this->declare_parameter<std::vector<double>>("sim.initial_conditions.target_pos", {100.0, 20.0, 15.0});
         this->declare_parameter<std::vector<double>>("sim.initial_conditions.target_vel", {-10.0, 10.0, 2.5});
 
-        this->declare_parameter<double>("perception.delay", 0.05);
         this->declare_parameter<double>("perception.bbox_pos_std_dev", 2.0);
         this->declare_parameter<double>("perception.bbox_size_std_dev", 5.0);
         this->declare_parameter<double>("perception.target_physical_size_est", 1.0);
@@ -53,8 +52,13 @@ private:
         this->declare_parameter<double>("control.rate_tc", 0.05);
         this->declare_parameter<double>("control.max_history_time_factor", 2.0);
 
-        this->declare_parameter<double>("camera.fov_deg", 40.0);
-        this->declare_parameter<int>("camera.width_px", 0);
+        this->declare_parameter<int>("camera.width_px", 640);
+
+        // For fov based calculation
+        this->declare_parameter<double>("camera.fov_deg", -1.0);
+
+        // For focal length based calculation
+        this->declare_parameter<int>("camera.native_width_px", 640);
         this->declare_parameter<double>("camera.focal_length_mm", 12.0);
         this->declare_parameter<double>("camera.pixel_size_um", 3.45);
 

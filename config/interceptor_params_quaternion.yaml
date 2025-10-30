@@ -27,7 +27,6 @@ interceptor_node_quaternion:
     
     # Perception parameters
     perception:
-      delay: 0.05
       bbox_pos_std_dev: 3.0
       bbox_size_std_dev: 3.0
       target_physical_size_est: 1.0
@@ -40,8 +39,13 @@ interceptor_node_quaternion:
     
     # Camera parameters
     camera:
-      fov_deg: 25.0
       width_px: 640
+
+      # For FOV based calculation
+      # fov_deg: 30.0
+
+      # For focal length based calculation
+      native_width_px: 1920
       focal_length_mm: 12.0
       pixel_size_um: 3.45
     
