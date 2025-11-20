@@ -16,6 +16,7 @@
   <!-- Custom message for bounding box -->
   <depend>vision_msgs</depend>
   <depend>quadrotor_msgs</depend>
+  <depend>sensor_msgs</depend>
 
   <!-- Eigen is a dependency for linear algebra -->
   <!-- <depend>eigen</depend> -->

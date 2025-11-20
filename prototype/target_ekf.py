@@ -34,7 +34,7 @@ class TargetEKF:
         self.P = self.F @ self.P @ self.F.T + self.Q
 
 
-    def update(self, z, drone_pos, psi):
+    def update(self, z, drone_pos, psi, gimbal_r, gimbal_p, gimbal_y):
         """EKF 更新步骤"""
         # --- 计算雅可比矩阵 H ---
         # 测量函数 h(x) 将目标状态 x 映射到测量空间 z = [u, v, size]
@@ -42,8 +42,23 @@ class TargetEKF:
         p_target = self.x[0:3]
 
         los_W = p_target - drone_pos
+        
+        # R_W_G (World to Gimbal Base)
         cpsi, spsi = np.cos(psi), np.sin(psi)
-        R_W_C = np.array([[cpsi, spsi, 0], [-spsi, cpsi, 0], [0, 0, 1]])
+        R_W_G = np.array([[cpsi, spsi, 0], [-spsi, cpsi, 0], [0, 0, 1]])
+        
+        # R_G_C (Gimbal Base to Camera)
+        c1, s1 = np.cos(gimbal_y), np.sin(gimbal_y)
+        c2, s2 = np.cos(gimbal_r), np.sin(gimbal_r)
+        c3, s3 = np.cos(gimbal_p), np.sin(gimbal_p)
+        
+        R_G_C = np.array([
+            [c1*c3-s1*s2*s3, s1*c3+c1*s2*s3, -c2*s3],
+            [-s1*c2,          c1*c2,           s2],
+            [c1*s3+s1*s2*c3, s1*s3-c1*s2*c3,  c2*c3]
+        ])
+        
+        R_W_C = R_G_C @ R_W_G
         los_C = R_W_C @ los_W
         
         x, y, z_c = los_C[0], los_C[1], los_C[2]
@@ -80,13 +95,29 @@ class TargetEKF:
         self.x = self.x + K @ y_residual
         self.P = (np.eye(6) - K @ H) @ self.P
 
-    def noisy_bbox_to_pos(self, bbox, drone_pos, psi):
+    def noisy_bbox_to_pos(self, bbox, drone_pos, psi, gimbal_r, gimbal_p, gimbal_y):
         """辅助函数:将单个带噪bbox转换为3D位置估计(用于绘图)"""
         if bbox['size'] < 1e-6: 
             return drone_pos
         distance = self.focal_length * self.target_size_est / bbox['size']
+        
+        # R_W_G
         cpsi, spsi = np.cos(psi), np.sin(psi)
-        R_C_W = np.array([[cpsi, -spsi, 0], [spsi, cpsi, 0], [0, 0, 1]])
+        R_W_G = np.array([[cpsi, spsi, 0], [-spsi, cpsi, 0], [0, 0, 1]])
+        
+        # R_G_C
+        c1, s1 = np.cos(gimbal_y), np.sin(gimbal_y)
+        c2, s2 = np.cos(gimbal_r), np.sin(gimbal_r)
+        c3, s3 = np.cos(gimbal_p), np.sin(gimbal_p)
+        
+        R_G_C = np.array([
+            [c1*c3-s1*s2*s3, s1*c3+c1*s2*s3, -c2*s3],
+            [-s1*c2,          c1*c2,           s2],
+            [c1*s3+s1*s2*c3, s1*s3-c1*s2*c3,  c2*c3]
+        ])
+        
+        R_C_W = (R_G_C @ R_W_G).T # 转置即逆矩阵
+        
         los_C_dir = np.array([1, bbox['u']/self.focal_length, bbox['v']/self.focal_length])
         los_W_dir = R_C_W @ (los_C_dir / np.linalg.norm(los_C_dir))
         return drone_pos + distance * los_W_dir

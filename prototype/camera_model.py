@@ -14,12 +14,30 @@ class CameraModel:
 
     def project(self, drone_state, target_pos) -> Tuple[Dict[str, float], bool]:
         """将3D世界中的目标投影到相机平面。"""
-        drone_pos, psi = drone_state[0:3], drone_state[8]
+        drone_pos = drone_state[0:3]
+        psi = drone_state[8]
+        # 提取云台角度 (假设在状态向量的第13, 14, 15位: index 12, 13, 14)
+        gimbal_r, gimbal_p, gimbal_y = drone_state[12], drone_state[13], drone_state[14]
+
         los_W = target_pos - drone_pos
         
+        # R_W_G (World to Gimbal Base/Stabilized Frame) - 仅包含偏航角
         cpsi, spsi = np.cos(psi), np.sin(psi)
-        R_W_C = np.array([[cpsi, spsi, 0], [-spsi, cpsi, 0], [0, 0, 1]])
-        los_C = R_W_C @ los_W
+        R_W_G = np.array([[cpsi, spsi, 0], [-spsi, cpsi, 0], [0, 0, 1]])
+        
+        # R_G_C (Gimbal Base to Camera) - 云台旋转
+        c1, s1 = np.cos(gimbal_y), np.sin(gimbal_y)
+        c2, s2 = np.cos(gimbal_r), np.sin(gimbal_r)
+        c3, s3 = np.cos(gimbal_p), np.sin(gimbal_p)
+        
+        # 旋转矩阵: Gimbal -> Camera (与ACADOS模型保持一致)
+        R_G_C = np.array([
+            [c1*c3-s1*s2*s3, s1*c3+c1*s2*s3, -c2*s3],
+            [-s1*c2,          c1*c2,           s2],
+            [c1*s3+s1*s2*c3, s1*s3-c1*s2*c3,  c2*c3]
+        ])
+
+        los_C = R_G_C @ R_W_G @ los_W
         
         dist_cam_x = los_C[0]
         if dist_cam_x <= 0.1: 

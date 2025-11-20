@@ -3,12 +3,7 @@
 #include <Eigen/Dense>
 
 // Define fixed-size vector types for performance
-using Vector5d = Eigen::Matrix<double, 5, 1>;
 using Vector6d = Eigen::Matrix<double, 6, 1>;
-using Vector7d = Eigen::Matrix<double, 7, 1>;
-using Vector9d = Eigen::Matrix<double, 9, 1>;
-using Vector13d = Eigen::Matrix<double, 13, 1>;
-using Vector16d = Eigen::Matrix<double, 16, 1>;
 
 // ============================================================================
 // EMAFilter Class (from exp_filter.py)
@@ -103,19 +98,69 @@ public:
         P_ = F_ * P_ * F_.transpose() + Q_;
     }
 
-    void update(const Bbox& z, const Eigen::Vector3d& drone_pos, double psi) {
+    // void update(const Bbox& z, const Eigen::Vector3d& drone_pos, double psi) {
+    //     if (!is_initialized_) return;
+        
+    //     // --- 计算雅可比矩阵 H ---
+    //     Eigen::Vector3d p_target = x_.head<3>();
+    //     Eigen::Vector3d los_W = p_target - drone_pos;
+
+    //     double cpsi = std::cos(psi);
+    //     double spsi = std::sin(psi);
+    //     Eigen::Matrix3d R_W_C;
+    //     R_W_C <<  cpsi, spsi, 0,
+    //              -spsi, cpsi, 0,
+    //                  0,    0, 1;
+        
+    //     Eigen::Vector3d los_C = R_W_C * los_W;
+    //     double x_c = los_C(0), y_c = los_C(1), z_c = los_C(2);
+
+    //     if (x_c < 1e-3) return; // 避免除以零
+
+    //     // 预测的测量值
+    //     Eigen::Vector3d z_pred;
+    //     z_pred << focal_length_ * y_c / x_c,
+    //               focal_length_ * z_c / x_c,
+    //               focal_length_ * target_size_est_ / x_c;
+
+    //     // 计算雅可比矩阵 H (dh/d(p_target))
+    //     Eigen::Vector3d r1 = R_W_C.row(0);
+    //     Eigen::Vector3d r2 = R_W_C.row(1);
+    //     Eigen::Vector3d r3 = R_W_C.row(2);
+
+    //     Eigen::Vector3d dx_dp = r1;
+    //     Eigen::Vector3d dy_dp = r2;
+    //     Eigen::Vector3d dz_dp = r3;
+
+    //     Eigen::RowVector3d du_dp = (focal_length_ / x_c) * dy_dp.transpose() - (focal_length_ * y_c / (x_c * x_c)) * dx_dp.transpose();
+    //     Eigen::RowVector3d dv_dp = (focal_length_ / x_c) * dz_dp.transpose() - (focal_length_ * z_c / (x_c * x_c)) * dx_dp.transpose();
+    //     Eigen::RowVector3d dsize_dp = -(focal_length_ * target_size_est_ / (x_c * x_c)) * dx_dp.transpose();
+
+    //     Eigen::MatrixXd H = Eigen::MatrixXd::Zero(3, 6);
+    //     H.block<1,3>(0,0) = du_dp;
+    //     H.block<1,3>(1,0) = dv_dp;
+    //     H.block<1,3>(2,0) = dsize_dp;
+
+    //     // --- 卡尔曼增益、状态和协方差更新 ---
+    //     Eigen::Vector3d y_residual;
+    //     y_residual << -z.u, -z.v, z.size;
+    //     y_residual -= z_pred;
+
+    //     Eigen::Matrix3d S = H * P_ * H.transpose() + R_;
+    //     Eigen::MatrixXd K = P_ * H.transpose() * S.inverse();
+        
+    //     x_ = x_ + K * y_residual;
+    //     P_ = (Eigen::MatrixXd::Identity(6, 6) - K * H) * P_;
+    // }
+
+    void update(const Bbox& z, const Eigen::Vector3d& drone_pos, Eigen::Quaterniond q_C_W) {
         if (!is_initialized_) return;
         
         // --- 计算雅可比矩阵 H ---
         Eigen::Vector3d p_target = x_.head<3>();
         Eigen::Vector3d los_W = p_target - drone_pos;
 
-        double cpsi = std::cos(psi);
-        double spsi = std::sin(psi);
-        Eigen::Matrix3d R_W_C;
-        R_W_C <<  cpsi, spsi, 0,
-                 -spsi, cpsi, 0,
-                     0,    0, 1;
+        Eigen::Matrix3d R_W_C = q_C_W.toRotationMatrix().transpose();
         
         Eigen::Vector3d los_C = R_W_C * los_W;
         double x_c = los_C(0), y_c = los_C(1), z_c = los_C(2);
@@ -158,34 +203,45 @@ public:
         P_ = (Eigen::MatrixXd::Identity(6, 6) - K * H) * P_;
     }
     
-    Eigen::Vector3d noisy_bbox_to_pos(const Bbox& bbox, const Eigen::Vector3d& drone_pos, double psi) {
-        // 参考 Python 版本的注释
-        // cpsi, spsi = np.cos(psi), np.sin(psi)
-        // R_W_C = np.array([[cpsi, spsi, 0], [-spsi, cpsi, 0], [0, 0, 1]])
-        // # 反推距离
-        // est_dist_cam_x = self.f * self.target_size / bbox['size_x']
-        // est_los_C_y = -bbox['u'] * est_dist_cam_x / self.f
-        // est_los_C_z = -bbox['v'] * est_dist_cam_x / self.f
-        // est_los_C = np.array([est_dist_cam_x, est_los_C_y, est_los_C_z])
+    // Eigen::Vector3d noisy_bbox_to_pos(const Bbox& bbox, const Eigen::Vector3d& drone_pos, double psi) {
+    //     // 参考 Python 版本的注释
+    //     // cpsi, spsi = np.cos(psi), np.sin(psi)
+    //     // R_W_C = np.array([[cpsi, spsi, 0], [-spsi, cpsi, 0], [0, 0, 1]])
+    //     // # 反推距离
+    //     // est_dist_cam_x = self.f * self.target_size / bbox['size_x']
+    //     // est_los_C_y = -bbox['u'] * est_dist_cam_x / self.f
+    //     // est_los_C_z = -bbox['v'] * est_dist_cam_x / self.f
+    //     // est_los_C = np.array([est_dist_cam_x, est_los_C_y, est_los_C_z])
 
-        // # 转回世界坐标系
-        // R_C_W = R_W_C.T
-        // est_los_W = R_C_W @ est_los_C
-        // est_target_pos = drone_pos + est_los_W
+    //     // # 转回世界坐标系
+    //     // R_C_W = R_W_C.T
+    //     // est_los_W = R_C_W @ est_los_C
+    //     // est_target_pos = drone_pos + est_los_W
 
-        // if (bbox.size < 1e-6) {
-        //     return drone_pos;
-        // }
-        // printf("drone_pos: [%f, %f, %f], psi: %f, bbox: [u=%f, v=%f, size=%f]\n", 
-        //        drone_pos.x(), drone_pos.y(), drone_pos.z(), psi, bbox.u, bbox.v, bbox.size);
-        // printf("focal_length_: %f, target_size_est_: %f\n", focal_length_, target_size_est_);
+    //     // if (bbox.size < 1e-6) {
+    //     //     return drone_pos;
+    //     // }
+    //     // printf("drone_pos: [%f, %f, %f], psi: %f, bbox: [u=%f, v=%f, size=%f]\n", 
+    //     //        drone_pos.x(), drone_pos.y(), drone_pos.z(), psi, bbox.u, bbox.v, bbox.size);
+    //     // printf("focal_length_: %f, target_size_est_: %f\n", focal_length_, target_size_est_);
 
+    //     double est_dist_cam_x = focal_length_ * target_size_est_ / bbox.size;
+    //     double cpsi = std::cos(psi), spsi = std::sin(psi);
+    //     Eigen::Matrix3d R_C_W;
+    //     R_C_W << cpsi, -spsi, 0,
+    //              spsi,  cpsi, 0,
+    //                 0,     0, 1;
+    //     double est_los_C_y = -bbox.u * est_dist_cam_x / focal_length_;
+    //     double est_los_C_z = -bbox.v * est_dist_cam_x / focal_length_;
+    //     Eigen::Vector3d est_los_C(est_dist_cam_x, est_los_C_y, est_los_C_z);
+    //     Eigen::Vector3d est_los_W = R_C_W * est_los_C;
+    //     Eigen::Vector3d est_target_pos = drone_pos + est_los_W;
+    //     return est_target_pos;
+    // }
+
+    Eigen::Vector3d noisy_bbox_to_pos(const Bbox& bbox, const Eigen::Vector3d& drone_pos, Eigen::Quaterniond q_C_W) {
         double est_dist_cam_x = focal_length_ * target_size_est_ / bbox.size;
-        double cpsi = std::cos(psi), spsi = std::sin(psi);
-        Eigen::Matrix3d R_C_W;
-        R_C_W << cpsi, -spsi, 0,
-                 spsi,  cpsi, 0,
-                    0,     0, 1;
+        Eigen::Matrix3d R_C_W = q_C_W.toRotationMatrix();
         double est_los_C_y = -bbox.u * est_dist_cam_x / focal_length_;
         double est_los_C_z = -bbox.v * est_dist_cam_x / focal_length_;
         Eigen::Vector3d est_los_C(est_dist_cam_x, est_los_C_y, est_los_C_z);

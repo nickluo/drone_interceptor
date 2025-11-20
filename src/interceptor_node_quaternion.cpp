@@ -31,8 +31,8 @@ InterceptorNodeQuaternion::InterceptorNodeQuaternion()
     output_filter_ = std::make_unique<EMAFilter>(static_cast<int>(N_HORIZON_ / TF_ * 0.1), 4);
     
     // 初始化四元数状态
-    x_warm_start_.resize(N_HORIZON_ + 1, Vector13d::Zero());
-    u_warm_start_.resize(N_HORIZON_, Eigen::Vector4d::Zero());
+    x_warm_start_.resize(N_HORIZON_ + 1, VectorX::Zero());
+    u_warm_start_.resize(N_HORIZON_, VectorU::Zero());
     
     // 初始化状态设置
     for (int i = 0; i <= N_HORIZON_; ++i) x_warm_start_[i] = drone_state_;
@@ -65,6 +65,9 @@ InterceptorNodeQuaternion::InterceptorNodeQuaternion()
         odom_sub_ = this->create_subscription<nav_msgs::msg::Odometry>(
             "/fpv/odom", rclcpp::QoS(rclcpp::KeepLast(1)).best_effort(), 
             std::bind(&InterceptorNodeQuaternion::odom_callback, this, std::placeholders::_1), sub_options);
+        gimbal_sub_ = this->create_subscription<sensor_msgs::msg::Imu>(
+            "/fpv/gimbal", rclcpp::QoS(rclcpp::KeepLast(1)).best_effort(), 
+            std::bind(&InterceptorNodeQuaternion::gimbal_callback, this, std::placeholders::_1), sub_options);
         bbox_sub_ = this->create_subscription<vision_msgs::msg::Detection2D>(
             "/fpv/target_bbox", rclcpp::QoS(rclcpp::KeepLast(10)).best_effort(), 
             std::bind(&InterceptorNodeQuaternion::bbox_callback, this, std::placeholders::_1), sub_options);
@@ -103,6 +106,9 @@ void InterceptorNodeQuaternion::load_parameters()
     max_history_time_ = control_execution_delay_ * max_history_time_factor;
     this->get_parameter("limits.att_limit", att_limit_);
     dt_ = TF_ / N_HORIZON_;
+
+    this->get_parameter("gimbal.rp_coeff", gimbal_rp_coeff_);
+    this->get_parameter("gimbal.y_coeff", gimbal_y_coeff_);
 
     // 相机参数
     double cam_focal_mm, cam_pixel_um;
@@ -155,6 +161,20 @@ void InterceptorNodeQuaternion::mission_complete_callback(const std_msgs::msg::B
         }
     }
 }
+
+void InterceptorNodeQuaternion::gimbal_callback(const sensor_msgs::msg::Imu::SharedPtr msg) 
+{
+    gimbal_received_ = true;
+    {
+        std::lock_guard<std::mutex> lock(mtx_gimbal_);
+        current_gimbal_orientation_ = Eigen::Quaterniond(msg->orientation.w, msg->orientation.x, msg->orientation.y, msg->orientation.z);
+    }
+    {
+        std::lock_guard<std::mutex> lock(mtx_drone_state_);
+        // 利用协方差字段存储欧拉角 (r, p, y)
+        drone_state_.tail<3>() << Eigen::Vector3d(msg->orientation_covariance[0], msg->orientation_covariance[1], msg->orientation_covariance[2]);
+    }
+}
     
 void InterceptorNodeQuaternion::odom_callback(const nav_msgs::msg::Odometry::SharedPtr msg) 
 {
@@ -168,14 +188,21 @@ void InterceptorNodeQuaternion::odom_callback(const nav_msgs::msg::Odometry::Sha
         std::lock_guard<std::mutex> lock(mtx_drone_state_);
         // 提取位置
         drone_state_.head<3>() << msg->pose.pose.position.x, msg->pose.pose.position.y, msg->pose.pose.position.z;
-        // 提取四元数
-        drone_state_.segment<4>(6) << q.w(), q.x(), q.y(), q.z();
         // 提取速度
         drone_state_.segment<3>(3) = vel_world;
+        // 提取四元数
+        drone_state_.segment<4>(6) << q.w(), q.x(), q.y(), q.z();
         // 提取角速度
-        drone_state_.tail<3>() << msg->twist.twist.angular.x, msg->twist.twist.angular.y, msg->twist.twist.angular.z;
-        update_control_history(rclcpp::Time(msg->header.stamp).seconds(), drone_state_.tail<3>());
+        drone_state_.segment<3>(10) << msg->twist.twist.angular.x, msg->twist.twist.angular.y, msg->twist.twist.angular.z;
+
+        if (!gimbal_received_)
+        {
+            drone_state_.tail<3>() << Eigen::Vector3d::Zero();
+        }
     }
+
+    update_control_history(rclcpp::Time(msg->header.stamp).seconds(), Eigen::Vector3d(
+        msg->twist.twist.angular.x, msg->twist.twist.angular.y, msg->twist.twist.angular.z));
 
     if (is_completed_) 
         return;
@@ -197,8 +224,11 @@ void InterceptorNodeQuaternion::odom_callback(const nav_msgs::msg::Odometry::Sha
 
     if (!odom_received_)
     {
-        for (int i = 0; i <= N_HORIZON_; ++i)
-            x_warm_start_[i] = drone_state_;
+        {
+            std::lock_guard<std::mutex> lock(mtx_drone_state_);
+            for (int i = 0; i <= N_HORIZON_; ++i)
+                x_warm_start_[i] = drone_state_;
+        }
         for (int i = 0; i < N_HORIZON_; ++i) 
             u_warm_start_[i] << msg->twist.twist.angular.x, msg->twist.twist.angular.y, msg->twist.twist.angular.z, G_;
         odom_received_ = true;
@@ -216,7 +246,7 @@ void InterceptorNodeQuaternion::bbox_callback(const vision_msgs::msg::Detection2
         is_visible_ = current_bbox_.header.frame_id != "";
     }
 
-    Vector13d curr_drone_state;
+    VectorX curr_drone_state;
     {
         std::lock_guard<std::mutex> lock(mtx_drone_state_);
         curr_drone_state = drone_state_;
@@ -228,14 +258,26 @@ void InterceptorNodeQuaternion::bbox_callback(const vision_msgs::msg::Detection2
         bbox.u = msg->bbox.center.position.x - cam_width_px_ / 2.0;
         bbox.v = msg->bbox.center.position.y - cam_width_px_ / 2.0;
         bbox.size = msg->bbox.size_x;
-
-        double psi = get_yaw_from_quaternion(curr_drone_state.segment<4>(6));
-        std::lock_guard<std::mutex> lock(mtx_ekf_);
-        if (ekf_->is_initialized())
-            ekf_->update(bbox, curr_drone_state.head<3>(), psi);
+        
+        Eigen::Quaterniond gimbal_orientation;
+        if (gimbal_received_)
+        {
+            std::lock_guard<std::mutex> lock(mtx_gimbal_);
+            gimbal_orientation = current_gimbal_orientation_;
+        }
         else
         {
-            Eigen::Vector3d raw_pos_est = ekf_->noisy_bbox_to_pos(bbox, curr_drone_state.head<3>(), psi);
+            double psi = get_yaw_from_quaternion(curr_drone_state.segment<4>(6));
+            Eigen::AngleAxisd yaw_rot(psi, Eigen::Vector3d::UnitZ());
+            gimbal_orientation = Eigen::Quaterniond(yaw_rot);
+        }
+
+        std::lock_guard<std::mutex> lock(mtx_ekf_);
+        if (ekf_->is_initialized())
+            ekf_->update(bbox, curr_drone_state.head<3>(), gimbal_orientation);
+        else
+        {
+            Eigen::Vector3d raw_pos_est = ekf_->noisy_bbox_to_pos(bbox, curr_drone_state.head<3>(), gimbal_orientation);
             ekf_->initialize(raw_pos_est);
         }
     }
@@ -313,7 +355,7 @@ void InterceptorNodeQuaternion::simulation_loop()
 
 void InterceptorNodeQuaternion::run_control_cycle(const Eigen::Vector3d &pos_est, const Eigen::Vector3d &vel_est) 
 {
-    Vector13d curr_drone_state;
+    VectorX curr_drone_state;
     {
         std::lock_guard<std::mutex> lock(mtx_drone_state_);
         curr_drone_state = drone_state_;
@@ -339,14 +381,14 @@ void InterceptorNodeQuaternion::run_control_cycle(const Eigen::Vector3d &pos_est
     }
     
     // 使用延迟补偿的预测状态设置初始条件约束
-    Vector13d predicted_state = predict_delayed_state(curr_drone_state, control_execution_delay_);
+    VectorX predicted_state = predict_delayed_state(curr_drone_state, control_execution_delay_);
     ocp_nlp_constraints_model_set(nlp_config_, nlp_dims_, nlp_in_, nlp_out_, 0, "lbx", predicted_state.data());
     ocp_nlp_constraints_model_set(nlp_config_, nlp_dims_, nlp_in_, nlp_out_, 0, "ubx", predicted_state.data());
 
-    Vector16d p_vec;
+    VectorP p_vec;
     for (int k = 0; k <= N_HORIZON_; ++k) {
         Eigen::Vector3d predicted_target_pos = pos_est + (k * dt_) * vel_est;
-        p_vec << predicted_target_pos, vel_est, DRAG_COEFF_, V_DESIRED_, RATE_TC_, w_cost_;
+        p_vec << predicted_target_pos, vel_est, DRAG_COEFF_, V_DESIRED_, RATE_TC_, w_cost_, gimbal_rp_coeff_, gimbal_y_coeff_;
         drone_interceptor_mpc_quat_acados_update_params(acados_capsule_, k, p_vec.data(), p_vec.size());
     }
 
@@ -374,13 +416,13 @@ void InterceptorNodeQuaternion::run_control_cycle(const Eigen::Vector3d &pos_est
         output_filter_->reset();
         for (int i = 0; i < N_HORIZON_; ++i) {
             x_warm_start_[i] = curr_drone_state;
-            u_warm_start_[i] = Eigen::Vector4d(0, 0, 0, G_);
+            u_warm_start_[i] = VectorU(0, 0, 0, G_);
         }
         x_warm_start_[N_HORIZON_] = x_warm_start_[N_HORIZON_ - 1];
         return;
     }
 
-    Eigen::Vector4d u_optimal_raw;
+    VectorU u_optimal_raw;
     ocp_nlp_out_get(nlp_config_, nlp_dims_, nlp_out_, 0, "u", u_optimal_raw.data());
 
     // Warm start update
@@ -441,9 +483,9 @@ Eigen::Vector3d InterceptorNodeQuaternion::get_history_body_rates(const Eigen::V
 }
 
 // 延迟补偿状态预测函数
-Vector13d InterceptorNodeQuaternion::predict_delayed_state(const Vector13d& current_state, double delay_time) 
+VectorX InterceptorNodeQuaternion::predict_delayed_state(const VectorX& current_state, double delay_time) 
 {
-    Vector13d predicted_state = current_state;
+    VectorX predicted_state = current_state;
 
     if (control_history_.empty() || delay_time < 1e-3)
     {
@@ -474,7 +516,7 @@ Vector13d InterceptorNodeQuaternion::predict_delayed_state(const Vector13d& curr
         average_body_rates /= valid_samples;
     } else {
         // 如果没有有效样本，使用最近的角速度
-        average_body_rates = current_state.tail<3>();;
+        average_body_rates = current_state.segment<3>(10);
     }
     
     // 预测姿态变化 (四元数积分)

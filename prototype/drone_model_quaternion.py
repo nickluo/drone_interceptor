@@ -17,13 +17,15 @@ class DroneModelQuaternion:
         
         # --- 状态和控制变量 ---
         # 其中 q = [qw, qx, qy, qz] 是四元数 (scalar-first convention)
-        x = ca.SX.sym('x', 13)      # type: ignore # 状态: [px, py, pz, vx, vy, vz, qw, qx, qy, qz, wx, wy, wz]
+        x = ca.SX.sym('x', 16)      # type: ignore # 状态: [px, py, pz, vx, vy, vz, qw, qx, qy, qz, wx, wy, wz, gimbal_r, gimbal_p, gimbal_y]
         u = ca.SX.sym('u', 4)       # type: ignore # 控制: [u_wx, u_wy, u_wz, thrust] (机体角速度 + 推力加速度)
-        params = ca.SX.sym('p', 16) # type: ignore # 参数: [p_target, v_target, drag_coeff, v_desired, rate_tc, w_cost]
+        params = ca.SX.sym('p', 18) # type: ignore # 参数: [p_target, v_target, drag_coeff, v_desired, rate_tc, w_cost, gimbal_omega_coeff]
 
         drag_coeff = params[6]
         v_desired = params[7]
         rate_tc = params[8]
+        gimbal_RP_coeff = params[16]
+        gimbal_Y_coeff = params[17]
 
         # --- 权重 ---
         W_los = params[9]  # 视线误差权重
@@ -33,13 +35,16 @@ class DroneModelQuaternion:
         W_tilt = params[13]         # 倾斜角误差权重
         W_u_alpha = params[14]      # 角速度变化率权重
         W_u_thrust = params[15]     # 油门控制量权重
-
+        
         # --- 提取状态变量 ---
         pos = x[0:3]        # 位置
         vel = x[3:6]        # 速度  
         quat = x[6:10]      # 四元数 [qw, qx, qy, qz]
         qw, qx, qy, qz = quat[0], quat[1], quat[2], quat[3]
         wx, wy, wz = x[10], x[11], x[12]  # 机体角速度 [wx, wy, wz]
+        gimbal_r = x[13]  # 云台滚转角
+        gimbal_p = x[14]  # 云台俯仰角
+        gimbal_y = x[15]  # 云台偏航角
 
         # --- 提取控制变量 ---
         u_wx, u_wy, u_wz, u_az = u[0], u[1], u[2], u[3]  # 机体角速度和推力加速度
@@ -79,8 +84,14 @@ class DroneModelQuaternion:
             (u_wy - wy) / rate_tc, 
             (u_wz - wz) / (rate_tc * 2) )  # 角速度变化率
         
+        gimbal_dot = ca.vertcat(
+            -gimbal_r * gimbal_RP_coeff, 
+            -gimbal_p * gimbal_RP_coeff, 
+            -gimbal_y * gimbal_Y_coeff
+        )  # 云台角速度
+        
         # 完整的显式动力学方程
-        f_expl = ca.vertcat(pos_dot, vel_dot, quat_dot, omega_dot)
+        f_expl = ca.vertcat(pos_dot, vel_dot, quat_dot, omega_dot, gimbal_dot)
 
         # ======== 代价函数 (Cost Function) ========
 
@@ -95,14 +106,27 @@ class DroneModelQuaternion:
         # 从四元数计算cos(psi)和sin(psi)
         cpsi = 1 - 2*(qy**2 + qz**2)  # cos(psi) 从四元数
         spsi = 2*(qw*qz + qx*qy)      # sin(psi) 从四元数
+
+        c1 = ca.cos(gimbal_y)
+        s1 = ca.sin(gimbal_y)
+        c2 = ca.cos(gimbal_r)
+        s2 = ca.sin(gimbal_r)
+        c3 = ca.cos(gimbal_p)
+        s3 = ca.sin(gimbal_p)
         
-        # 世界坐标系到相机坐标系的变换矩阵 (只考虑偏航角旋转)
-        R_W_C = ca.vertcat(
+        # Gimbal(YPR Order in FLU)到Camera的旋转矩阵
+        R_G_C = ca.vertcat(
+            ca.horzcat( c1*c3-s1*s2*s3, s1*c3+c1*s2*s3, -c2*s3), 
+            ca.horzcat(-s1*c2,          c1*c2,           s2), 
+            ca.horzcat( c1*s3+s1*s2*c3, s1*s3-c1*s2*c3,  c2*c3)
+        )
+        # 世界到Gimbal的旋转矩阵 (仅偏航)
+        R_W_G = ca.vertcat(
             ca.horzcat(cpsi, spsi, 0), 
             ca.horzcat(-spsi, cpsi, 0), 
             ca.horzcat(0, 0, 1)
-        )
-        los_C = R_W_C @ los_W
+        ) 
+        los_C =  R_G_C @ R_W_G @ los_W
         # los_error_y = ca.atan2(los_C[1], los_C[0]) / ca.pi
         # los_error_z = ca.atan2(los_C[2], los_C[0]) / ca.pi
         coeff = ca.tanh(los_C[0]*0.25)
@@ -309,11 +333,13 @@ class DroneModelQuaternion:
         euler_initial = self.constants['DRONE_INITIAL_STATE'][6:9]  # [phi, theta, psi]
         quat_initial = self.euler_to_quaternion(euler_initial[0], euler_initial[1], euler_initial[2])
         omega_initial = self.constants['DRONE_INITIAL_STATE'][9:12]  # [wx, wy, wz]
+        gimbal_initial = self.constants['DRONE_INITIAL_STATE'][12:15]  # [gr, gp, gy]
 
         x0_quat = np.hstack([
             self.constants['DRONE_INITIAL_STATE'][0:6],  # 位置和速度
             quat_initial,  # 四元数
-            omega_initial  # 角速度
+            omega_initial,  # 角速度
+            gimbal_initial  # 云台角度
         ])
         ocp.constraints.x0 = x0_quat
         ocp.parameter_values = np.zeros(self.model.p.shape) # type: ignore
@@ -322,11 +348,15 @@ class DroneModelQuaternion:
         ocp.solver_options.qp_solver = 'PARTIAL_CONDENSING_HPIPM'
         ocp.solver_options.hessian_approx = 'GAUSS_NEWTON'
         ocp.solver_options.integrator_type = 'ERK'
+        # ocp.solver_options.sim_method_num_stages = 2 # 减少积分级数以加速 (RK2)
+        ocp.solver_options.sim_method_num_steps = 1
+        ocp.solver_options.qp_solver_cond_N = 5 # 部分冷凝视界
         ocp.solver_options.nlp_solver_type = 'SQP_RTI'
         ocp.solver_options.N_horizon = self.constants['N_HORIZON']
         ocp.solver_options.tf = self.constants['TF']
         ocp.solver_options.ext_fun_compile_flags = '-O3'
-        ocp.solver_options.nlp_solver_max_iter = 50
+        ocp.solver_options.nlp_solver_max_iter = 1 # SQP_RTI 只需要1次迭代
+        ocp.solver_options.print_level = 0
         return ocp
 
     def generate_solver(self)->AcadosOcpSolver:

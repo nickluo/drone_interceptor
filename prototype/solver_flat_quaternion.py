@@ -22,9 +22,10 @@ YAW_RATE_MAX = 0.5 * np.pi # 最大欧拉角速率 (rad/s)
 ATT_LIMIT = np.pi/5 # 姿态角限制 (Roll & Pitch)
 
 # ======== MPC 控制器参数 (MPC Controller Parameters) ========
-N_HORIZON = 50       # 预测时域步数
-TF = 1.0             # 预测时域总时长 (s)
-V_DESIRED = 15.0     # 期望接近速度 (m/s)
+CTRL_FREQ_HZ = 50    # 控制器频率 (Hz)
+TF = 1.0            # 预测时域总时长 (s)
+N_HORIZON = int(TF * CTRL_FREQ_HZ) # 预测时域步数
+V_DESIRED = 20.0     # 期望接近速度 (m/s)
 
 # ======== 仿真设置 (Simulation Settings) ========
 SIM_TIME = 15.0      # 总仿真时长 (s)
@@ -43,9 +44,10 @@ RATE_TC = 0.01  # 角速度一阶响应时间常数 (s)
 DRONE_INITIAL_STATE = np.array([0.0, 0.0, 10.0,     # Position (p_x, p_y, p_z)
                                 0.0, 0.0, 0.0,      # Velocity (v_x, v_y, v_z)
                                 0.0, 0.0, 0.0,     # Attitude (phi, theta, psi) - 将被转换为四元数
-                                0.0, 0.0, 0.0])
+                                0.0, 0.0, 0.0,     # Omega (wx, wy, wz)
+                                0.0, 0.0, 0.0])    # Gimbal (r, p, y)
 TARGET_INITIAL_POS = np.array([100.0, 20.0, 15.0])
-TARGET_VELOCITY = np.array([-10.0, 10.0, 2.5]) # 目标做匀速直线运动
+TARGET_VELOCITY = np.array([-10.0, 10.0, 0.5]) # 目标做匀速直线运动
 # TARGET_INITIAL_POS = np.array([100.0, 20.0, 15.0])
 # TARGET_VELOCITY = np.array([0.0, 0.0, 0.0]) # 目标静止
 
@@ -71,24 +73,32 @@ W_TILT = 0.000001         # 倾斜角误差权重
 W_U_ALPHA = 0.0001       # 角速度变化率权重
 W_U_THRUST = 0.0001    # 油门控制量权重
 
+# ======== 云台参数 (Gimbal Parameters) ========
+GIMBAL_RP_COEFF = 1.2
+GIMBAL_Y_COEFF = 1.5
+GIMBAL_DISTURBANCE_COEFF = 0.05 # 模拟无人机旋转对云台的影响
+
 def convert_euler_to_quaternion_state(euler_state):
     """将欧拉角状态转换为四元数状态"""
-    # 输入: [px, py, pz, vx, vy, vz, phi, theta, psi] (9维)
-    # 输出: [px, py, pz, vx, vy, vz, qw, qx, qy, qz, wx, wy, wz] (13维)
+    # 输入: [px, py, pz, vx, vy, vz, phi, theta, psi, wx, wy, wz, gr, gp, gy] (15维)
+    # 输出: [px, py, pz, vx, vy, vz, qw, qx, qy, qz, wx, wy, wz, gr, gp, gy] (16维)
     pos_vel = euler_state[0:6]
     euler_angles = euler_state[6:9]
     omega = euler_state[9:12]
+    gimbal = euler_state[12:15]
     quat = DroneModelQuaternion.euler_to_quaternion(euler_angles[0], euler_angles[1], euler_angles[2])
-    return np.hstack([pos_vel, quat, omega])
+    return np.hstack([pos_vel, quat, omega, gimbal])
 
 def convert_quaternion_to_euler_state(quat_state):
     """将四元数状态转换为欧拉角状态（用于显示和记录）"""
-    # 输入: [px, py, pz, vx, vy, vz, qw, qx, qy, qz, wx, wy, wz] (13维)
-    # 输出: [px, py, pz, vx, vy, vz, phi, theta, psi] (9维)
+    # 输入: [px, py, pz, vx, vy, vz, qw, qx, qy, qz, wx, wy, wz, gr, gp, gy] (16维)
+    # 输出: [px, py, pz, vx, vy, vz, phi, theta, psi, wx, wy, wz, gr, gp, gy] (15维)
     pos_vel = quat_state[0:6]
     quat = quat_state[6:10]
+    omega = quat_state[10:13]
+    gimbal = quat_state[13:16]
     euler_angles = DroneModelQuaternion.quaternion_to_euler(quat)
-    return np.hstack([pos_vel, euler_angles])
+    return np.hstack([pos_vel, euler_angles, omega, gimbal])
 
 MODEL_CONSTANTS = {
     'G' : G,
@@ -179,11 +189,13 @@ def main():
         if meas_visible:
             target_lost_counter = 0 # 目标可见，重置计数器
             drone_pos, psi = drone_state_at_meas[0:3], drone_state_at_meas[8]
-            raw_pos_est = estimator.noisy_bbox_to_pos(meas_bbox, drone_pos, psi)
+            gimbal_r, gimbal_p, gimbal_y = drone_state_at_meas[12], drone_state_at_meas[13], drone_state_at_meas[14]
+            
+            raw_pos_est = estimator.noisy_bbox_to_pos(meas_bbox, drone_pos, psi, gimbal_r, gimbal_p, gimbal_y)
             if not estimator.is_initialized:
                 estimator.initialize(raw_pos_est)
             else:
-                estimator.update(meas_bbox, drone_pos, psi)
+                estimator.update(meas_bbox, drone_pos, psi, gimbal_r, gimbal_p, gimbal_y)
         else:
             target_lost_counter += 1 # 目标丢失，增加计数器
             raw_pos_est = None
@@ -197,12 +209,13 @@ def main():
 
         # ------------------- 4. 规划 (Plan) -------------------
         if not estimator.is_initialized:
-            print(f"[WARNING] 步骤 {i}: EKF尚未初始化，跳过规划。")
+            print(f"[WARNING] 步骤 {i}: EKF尚未初始化, 跳过规划。")
             # 悬停指令：角速度为0，推力加速度等于重力加速度
             u_optimal_raw = np.array([0, 0, 0, G])
             # 保持悬停状态 (位置和速度不变，四元数归一化)
             x_current_quat[3:6] = 0.0  # 速度清零
             x_current_quat[6:10] = DroneModelQuaternion.normalize_quaternion(x_current_quat[6:10])
+            x_current_quat[13:16] = 0.0 # 云台归零
         else:
             pos_est = estimator.x[0:3]
             vel_est = estimator.x[3:6]
@@ -213,7 +226,7 @@ def main():
             for k in range(N_HORIZON + 1):
                 t_k = k * dt
                 predicted_target_pos_est = pos_est + t_k * vel_est
-                acados_solver.set(k, "p", np.hstack([predicted_target_pos_est, vel_est, DRAG_COEFF, V_DESIRED, RATE_TC, W_COST]))
+                acados_solver.set(k, "p", np.hstack([predicted_target_pos_est, vel_est, DRAG_COEFF, V_DESIRED, RATE_TC, W_COST, GIMBAL_RP_COEFF, GIMBAL_Y_COEFF]))
 
             t0 = time.time()
             status = acados_solver.solve()
@@ -228,6 +241,13 @@ def main():
 
             # 确保四元数归一化
             x_current_quat[6:10] = DroneModelQuaternion.normalize_quaternion(x_current_quat[6:10])
+
+            # --- 模拟云台受无人机机动影响 ---
+            # 简单的干扰模型：云台角速度受到机体角速度的干扰
+            wx, wy, wz = x_current_quat[10], x_current_quat[11], x_current_quat[12]
+            x_current_quat[13] += GIMBAL_DISTURBANCE_COEFF * wx * dt
+            x_current_quat[14] += GIMBAL_DISTURBANCE_COEFF * wy * dt
+            x_current_quat[15] += GIMBAL_DISTURBANCE_COEFF * wz * dt
 
             # --- 性能改进: 为下一次迭代准备热启动数据 ---
             for k in range(N_HORIZON-1):
@@ -371,17 +391,18 @@ def plot_results(hist, dt):
     plt.tight_layout(rect=[0, 0, 1, 0.96]); plt.show()
 
     # 状态和控制量图
-    fig, axs = plt.subplots(5, 1, figsize=(15, 18), sharex=True)
+    fig, axs = plt.subplots(6, 1, figsize=(15, 20), sharex=True)
     fig.suptitle('States and Control Inputs (Quaternion Version)', fontsize=16)
     axs[0].plot(time_axis_x, hist['x'][:, 0], label='px'); axs[0].plot(time_axis_x, hist['x'][:, 1], label='py'); axs[0].plot(time_axis_x, hist['x'][:, 2], label='pz'); axs[0].set_ylabel('Position [m]')
     axs[1].plot(time_axis_x, hist['x'][:, 3], label='vx'); axs[1].plot(time_axis_x, hist['x'][:, 4], label='vy'); axs[1].plot(time_axis_x, hist['x'][:, 5], label='vz'); axs[1].set_ylabel('Velocity [m/s]')
     axs[2].plot(time_axis_x, np.rad2deg(hist['x'][:, 6]), label='Roll'); axs[2].plot(time_axis_x, np.rad2deg(hist['x'][:, 7]), label='Pitch'); axs[2].plot(time_axis_x, np.rad2deg(hist['x'][:, 8]), label='Yaw'); axs[2].set_ylabel('Angle [deg]')
+    axs[3].plot(time_axis_x, np.rad2deg(hist['x'][:, 12]), label='Gimbal Roll'); axs[3].plot(time_axis_x, np.rad2deg(hist['x'][:, 13]), label='Gimbal Pitch'); axs[3].plot(time_axis_x, np.rad2deg(hist['x'][:, 14]), label='Gimbal Yaw'); axs[3].set_ylabel('Gimbal [deg]')
     if len(hist['u']) > 0:
-        axs[3].plot(time_axis_u, hist['u'][:, 0], label='wx (body-x rate)')
-        axs[3].plot(time_axis_u, hist['u'][:, 1], label='wy (body-y rate)')
-        axs[3].plot(time_axis_u, hist['u'][:, 2], label='wz (body-z rate)')
-        axs[3].set_ylabel('Body Ang. Vel [rad/s]')
-        axs[4].plot(time_axis_u, hist['u'][:, 3], label='Thrust [N]'); axs[4].set_ylabel('Thrust [N]'); axs[4].set_xlabel('Time [s]')
+        axs[4].plot(time_axis_u, hist['u'][:, 0], label='wx (body-x rate)')
+        axs[4].plot(time_axis_u, hist['u'][:, 1], label='wy (body-y rate)')
+        axs[4].plot(time_axis_u, hist['u'][:, 2], label='wz (body-z rate)')
+        axs[4].set_ylabel('Body Ang. Vel [rad/s]')
+        axs[5].plot(time_axis_u, hist['u'][:, 3], label='Thrust [N]'); axs[5].set_ylabel('Thrust [N]'); axs[5].set_xlabel('Time [s]')
     for ax in axs: ax.grid(True); ax.legend()
     plt.tight_layout(rect=[0, 0, 1, 0.96]); plt.show()
 

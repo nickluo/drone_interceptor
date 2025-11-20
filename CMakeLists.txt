@@ -18,6 +18,7 @@ find_package(rclcpp REQUIRED)
 find_package(geometry_msgs REQUIRED)
 find_package(nav_msgs REQUIRED)
 find_package(vision_msgs REQUIRED)
+find_package(sensor_msgs REQUIRED)
 find_package(quadrotor_msgs REQUIRED)
 find_package(Eigen3 REQUIRED)
 
@@ -128,6 +129,7 @@ ament_target_dependencies(interceptor_node_quaternion
     nav_msgs
     vision_msgs
     quadrotor_msgs
+    sensor_msgs
 )
 
 target_link_directories(interceptor_node_quaternion PRIVATE

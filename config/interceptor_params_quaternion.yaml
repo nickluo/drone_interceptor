@@ -48,6 +48,10 @@ interceptor_node_quaternion:
       native_width_px: 1920
       focal_length_mm: 12.0
       pixel_size_um: 3.45
+
+    gimbal:
+      rp_coeff : 1.2
+      y_coeff : 1.5
     
     # Cost function weights
     cost:
