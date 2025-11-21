@@ -29,7 +29,7 @@ V_DESIRED = 20.0     # 期望接近速度 (m/s)
 
 # ======== 仿真设置 (Simulation Settings) ========
 SIM_TIME = 15.0      # 总仿真时长 (s)
-INTERCEPTION_DISTANCE = 0.8 # 成功拦截的距离阈值 (m)
+INTERCEPTION_DISTANCE = 0.5 # 成功拦截的距离阈值 (m)
 
 # ======== 感知模型参数 (Perception Model Parameters) ========
 PERCEPTION_DELAY = 0.05  # 感知延迟 (s)
@@ -74,9 +74,9 @@ W_U_ALPHA = 0.0001       # 角速度变化率权重
 W_U_THRUST = 0.0001    # 油门控制量权重
 
 # ======== 云台参数 (Gimbal Parameters) ========
-GIMBAL_RP_COEFF = 1.2
-GIMBAL_Y_COEFF = 1.5
-GIMBAL_DISTURBANCE_COEFF = 0.05 # 模拟无人机旋转对云台的影响
+GIMBAL_RP_COEFF = 12.0
+GIMBAL_Y_COEFF = 10.0
+GIMBAL_DISTURBANCE_COEFF = 0.1 # 模拟无人机旋转对云台的影响
 
 def convert_euler_to_quaternion_state(euler_state):
     """将欧拉角状态转换为四元数状态"""
