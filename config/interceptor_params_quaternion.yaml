@@ -14,8 +14,9 @@ interceptor_node_quaternion:
     # MPC parameters
     mpc:
       n_horizon: 50
-      tf: 1.0
+      tf: 0.6
       v_desired: 15.0
+      tracking_distance: 50.0   # Desired tracking distance, interception only if 0.0
     
     # Simulation parameters
     sim:
@@ -55,13 +56,13 @@ interceptor_node_quaternion:
     
     # Cost function weights
     cost:
-      w_los: 50.0             # Line-of-sight error weight
-      w_align: 1.0            # Velocity alignment weight
-      w_closing_speed: 0.01     # Closing speed error weight
-      w_rates: 0.000001         # Body rate control effort weight
-      w_tilt: 0.000001          # Tilt angle error weight
-      w_u_alpha: 0.0001       # Body rate change weight
-      w_u_thrust: 0.0001    # Thrust control effort weight
+      w_los: 50.0              # Line-of-sight error weight
+      w_align: 1.0             # Velocity alignment weight
+      w_closing_speed: 0.1     # Closing speed error weight
+      w_rates: 0.000001        # Body rate control effort weight
+      w_tilt: 0.000001         # Tilt angle error weight
+      w_u_alpha: 0.0001        # Body rate change weight
+      w_u_thrust: 0.0001       # Thrust control effort weight
 
 # W_LOS = 10.0               # 视线误差权重
 # W_ALIGN = 1.0             # 速度对齐权重

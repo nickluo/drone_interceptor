@@ -23,13 +23,16 @@ ATT_LIMIT = np.pi/5 # 姿态角限制 (Roll & Pitch)
 
 # ======== MPC 控制器参数 (MPC Controller Parameters) ========
 CTRL_FREQ_HZ = 50    # 控制器频率 (Hz)
-TF = 1.0            # 预测时域总时长 (s)
+TF = 0.6            # 预测时域总时长 (s)
 N_HORIZON = int(TF * CTRL_FREQ_HZ) # 预测时域步数
 V_DESIRED = 20.0     # 期望接近速度 (m/s)
 
 # ======== 仿真设置 (Simulation Settings) ========
 SIM_TIME = 15.0      # 总仿真时长 (s)
 INTERCEPTION_DISTANCE = 0.5 # 成功拦截的距离阈值 (m)
+TRACKING_DISTANCE = 50.0 # 期望跟踪距离 (m)
+# TRACKING_DISTANCE_ADJ = TRACKING_DISTANCE + 2.0 * np.sqrt(TRACKING_DISTANCE)
+TRACKING_GAIN = 1.0 * np.sqrt(TRACKING_DISTANCE / V_DESIRED) # 距离保持控制增益
 
 # ======== 感知模型参数 (Perception Model Parameters) ========
 PERCEPTION_DELAY = 0.05  # 感知延迟 (s)
@@ -53,11 +56,11 @@ TARGET_VELOCITY = np.array([-10.0, 10.0, 0.5]) # 目标做匀速直线运动
 
 # ======== 目标与相机物理属性 (Target & Camera Properties) ========
 # --- 目标 ---
-TARGET_PHYSICAL_SIZE_TRUTH = 0.8  # 目标的真实物理尺寸 (m), 用于相机模型
-TARGET_PHYSICAL_SIZE_EST = 1.0    # 状态估计器使用的目标尺寸 (m), 可模拟估计误差
+TARGET_PHYSICAL_SIZE_TRUTH = 0.5  # 目标的真实物理尺寸 (m), 用于相机模型
+TARGET_PHYSICAL_SIZE_EST = 0.6    # 状态估计器使用的目标尺寸 (m), 可模拟估计误差
 
 # --- 相机 ---
-CAM_FOV_DEG = 40.0  # 相机水平视场角 (degrees)
+CAM_FOV_DEG = 30.0  # 相机水平视场角 (degrees)
 CAM_FOCAL_LENGTH_PHYSICAL = 12.0 # 物理焦距 (mm)
 CAM_PIXEL_SIZE = 3.45            # 像素尺寸 (um)
 # f(pixel) = f(mm) * 1000 / pixel_size(um)
@@ -65,13 +68,13 @@ CAM_FOCAL_LENGTH = CAM_FOCAL_LENGTH_PHYSICAL * 1000 / CAM_PIXEL_SIZE # 焦距 (i
 
 # ======== 代价函数 (Cost Function) ========
 # --- 权重 ---
-W_LOS = 100.0               # 视线误差权重
+W_LOS = 100.0             # 视线误差权重
 W_ALIGN = 1.0             # 速度对齐权重
-W_CLOSING_SPEED = 0.01    # 接近速度权重
-W_RATES = 0.000001          # 角速度控制量权重
+W_CLOSING_SPEED = 0.1     # 接近速度权重
+W_RATES = 0.000001        # 角速度控制量权重
 W_TILT = 0.000001         # 倾斜角误差权重
-W_U_ALPHA = 0.0001       # 角速度变化率权重
-W_U_THRUST = 0.0001    # 油门控制量权重
+W_U_ALPHA = 0.0001        # 角速度变化率权重
+W_U_THRUST = 0.0001       # 油门控制量权重
 
 # ======== 云台参数 (Gimbal Parameters) ========
 GIMBAL_RP_COEFF = 12.0
@@ -226,7 +229,17 @@ def main():
             for k in range(N_HORIZON + 1):
                 t_k = k * dt
                 predicted_target_pos_est = pos_est + t_k * vel_est
-                acados_solver.set(k, "p", np.hstack([predicted_target_pos_est, vel_est, DRAG_COEFF, V_DESIRED, RATE_TC, W_COST, GIMBAL_RP_COEFF, GIMBAL_Y_COEFF]))
+                if (TRACKING_DISTANCE > 0.001):
+                    # --- 计算期望接近速度 (Tracking Logic) ---
+                    x_k = acados_solver.get(k, "x")
+                    current_drone_pos = x_k[0:3]
+                    dist_to_target = np.linalg.norm(predicted_target_pos_est - current_drone_pos)
+                    dist_error = (dist_to_target - TRACKING_DISTANCE) / TRACKING_DISTANCE
+                    tracking_coeff = 2.0/(1.0 + np.exp(-TRACKING_GAIN * dist_error)) - 1.0
+                    v_exp = tracking_coeff * V_DESIRED
+                else:
+                    v_exp = V_DESIRED
+                acados_solver.set(k, "p", np.hstack([predicted_target_pos_est, vel_est, DRAG_COEFF, v_exp, RATE_TC, W_COST, GIMBAL_RP_COEFF, GIMBAL_Y_COEFF]))
 
             t0 = time.time()
             status = acados_solver.solve()
@@ -347,6 +360,7 @@ def plot_results(hist, dt):
     fig.suptitle('Interceptor Performance Metrics (Quaternion Version)', fontsize=16)
     if len(hist['distance']) > 0:
         axs[0].plot(time_axis_u, hist['distance'], label='Distance to Target')
+        axs[0].axhline(y=TRACKING_DISTANCE, color='g', linestyle='--', label=f'Tracking Dist ({TRACKING_DISTANCE} m)')
     axs[0].set_ylabel('Distance [m]'); axs[0].set_title('Distance Over Time')
     
     # 计算接近速度和LOS误差用于绘图

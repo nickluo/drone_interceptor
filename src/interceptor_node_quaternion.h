@@ -44,6 +44,7 @@ private:
         this->declare_parameter<int>("mpc.n_horizon", 50);
         this->declare_parameter<double>("mpc.tf", 1.0);
         this->declare_parameter<double>("mpc.v_desired", 25.0);
+        this->declare_parameter<double>("mpc.tracking_distance", 0.0);
         
         // Simulation Only
         this->declare_parameter<double>("sim.interception_dist", 1.0);
@@ -97,7 +98,7 @@ private:
 
     // Member Variables
     bool use_simulation_;
-    double G_, DRAG_COEFF_, V_DESIRED_, RATE_TC_;
+    double G_, DRAG_COEFF_, V_DESIRED_, RATE_TC_, TRACKING_DISTANCE_, TRACKING_GAIN_;
     double bbox_pos_std_dev_, bbox_size_std_dev_;
     double target_physical_size_est_;
     double cam_focal_length_, max_angle_rad_, cam_width_px_;

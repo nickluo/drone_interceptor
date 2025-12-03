@@ -95,6 +95,8 @@ void InterceptorNodeQuaternion::load_parameters()
     this->get_parameter("mpc.n_horizon", N_HORIZON_);
     this->get_parameter("mpc.tf", TF_);
     this->get_parameter("mpc.v_desired", V_DESIRED_);
+    this->get_parameter("mpc.tracking_distance", TRACKING_DISTANCE_);
+    TRACKING_GAIN_ = 1.0 * std::sqrt(TRACKING_DISTANCE_ / V_DESIRED_);
     this->get_parameter("physics.drag_coeff", DRAG_COEFF_);
     this->get_parameter("perception.bbox_pos_std_dev", bbox_pos_std_dev_);
     this->get_parameter("perception.bbox_size_std_dev", bbox_size_std_dev_);
@@ -388,7 +390,18 @@ void InterceptorNodeQuaternion::run_control_cycle(const Eigen::Vector3d &pos_est
     VectorP p_vec;
     for (int k = 0; k <= N_HORIZON_; ++k) {
         Eigen::Vector3d predicted_target_pos = pos_est + (k * dt_) * vel_est;
-        p_vec << predicted_target_pos, vel_est, DRAG_COEFF_, V_DESIRED_, RATE_TC_, w_cost_, gimbal_rp_coeff_, gimbal_y_coeff_;
+        double tracking_coeff = 1.0;
+        if (TRACKING_DISTANCE_ > 0.001) // Tracking logic if distance is set
+        {
+            VectorX x_k;
+            ocp_nlp_out_get(nlp_config_, nlp_dims_, nlp_out_, k, "x", x_k.data());
+            auto x_k_pos = x_k.head<3>();
+            double dist_to_target = (predicted_target_pos - x_k_pos).norm();
+            double dist_error = (dist_to_target - TRACKING_DISTANCE_) / TRACKING_DISTANCE_;
+            tracking_coeff = 2.0/(1.0 + std::exp(-TRACKING_GAIN_ * dist_error)) - 1.0;
+            // RCLCPP_INFO(this->get_logger(), "Step %d: Dist to target: %.2f m, Tracking coeff: %.2f", k, dist_to_target, tracking_coeff);
+        }
+        p_vec << predicted_target_pos, vel_est, DRAG_COEFF_, tracking_coeff * V_DESIRED_, RATE_TC_, w_cost_, gimbal_rp_coeff_, gimbal_y_coeff_;
         drone_interceptor_mpc_quat_acados_update_params(acados_capsule_, k, p_vec.data(), p_vec.size());
     }
 
