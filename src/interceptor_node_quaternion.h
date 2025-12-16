@@ -41,7 +41,7 @@ private:
         this->declare_parameter<double>("physics.g", 9.81);
         this->declare_parameter<double>("physics.drag_coeff", 0.1);
         this->declare_parameter<double>("limits.att_limit", M_PI / 4.0);
-        this->declare_parameter<int>("mpc.n_horizon", 50);
+        this->declare_parameter<int>("mpc.ctrl_rate", 50);
         this->declare_parameter<double>("mpc.tf", 1.0);
         this->declare_parameter<double>("mpc.v_desired", 25.0);
         this->declare_parameter<double>("mpc.tracking_distance", 0.0);
@@ -110,7 +110,7 @@ private:
     double max_history_time_;  // 最大历史保存时间
     
     int N_HORIZON_;
-    double TF_, dt_;
+    double dt_;
     VectorWcost w_cost_;
 
     double gimbal_rp_coeff_, gimbal_y_coeff_;

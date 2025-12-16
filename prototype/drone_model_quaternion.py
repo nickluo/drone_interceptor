@@ -44,7 +44,7 @@ class DroneModelQuaternion:
         wx, wy, wz = x[10], x[11], x[12]  # 机体角速度 [wx, wy, wz]
         gimbal_r = x[13]  # 云台滚转角
         gimbal_p = x[14]  # 云台俯仰角
-        gimbal_y = x[15]  # 云台偏航角
+        gimbal_y = x[15]  # 云台相对偏航角
 
         # --- 提取控制变量 ---
         u_wx, u_wy, u_wz, u_az = u[0], u[1], u[2], u[3]  # 机体角速度和推力加速度
@@ -81,7 +81,7 @@ class DroneModelQuaternion:
 
         omega_dot = ca.vertcat(
             (u_wx - wx) / rate_tc, 
-            (u_wy - wy) / rate_tc, 
+            (u_wy - wy) / rate_tc,
             (u_wz - wz) / (rate_tc * 2) )  # 角速度变化率
         
         gimbal_dot = ca.vertcat(

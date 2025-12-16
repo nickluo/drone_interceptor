@@ -12,10 +12,10 @@ from drone_model_quaternion import DroneModelQuaternion
 # 仿真参数与常量配置 (Simulation Parameters and Constants)
 # ------------------------------------------------------------------------------
 # ======== 物理常量 (Physics Constants) ========
-MASS = 2.0          # 无人机质量 (kg)
+MASS = 4.0          # 无人机质量 (kg)
 G = 9.8065            # 重力加速度 (m/s^2)
-T_MAX = 80.0        # 最大推力 (N)
-T_MIN = 5.0         # 最小推力 (N)
+A_MAX = 20.0        # 最大加速度 (m/s^2)
+A_MIN = 1.0         # 最小加速度 (m/s^2)
 DRAG_COEFF = 0.1625    # 线性空气阻力系数
 ROLL_PITCH_RATE_MAX = 2.0 * np.pi # 最大欧拉角速率 (rad/s)
 YAW_RATE_MAX = 0.5 * np.pi # 最大欧拉角速率 (rad/s)
@@ -23,14 +23,14 @@ ATT_LIMIT = np.pi/5 # 姿态角限制 (Roll & Pitch)
 
 # ======== MPC 控制器参数 (MPC Controller Parameters) ========
 CTRL_FREQ_HZ = 50    # 控制器频率 (Hz)
-TF = 0.6            # 预测时域总时长 (s)
+TF = 1.0            # 预测时域总时长 (s)
 N_HORIZON = int(TF * CTRL_FREQ_HZ) # 预测时域步数
 V_DESIRED = 20.0     # 期望接近速度 (m/s)
 
 # ======== 仿真设置 (Simulation Settings) ========
 SIM_TIME = 15.0      # 总仿真时长 (s)
 INTERCEPTION_DISTANCE = 0.5 # 成功拦截的距离阈值 (m)
-TRACKING_DISTANCE = 50.0 # 期望跟踪距离 (m)
+TRACKING_DISTANCE = 0.0 # 期望跟踪距离 (m)
 # TRACKING_DISTANCE_ADJ = TRACKING_DISTANCE + 2.0 * np.sqrt(TRACKING_DISTANCE)
 TRACKING_GAIN = 1.0 * np.sqrt(TRACKING_DISTANCE / V_DESIRED) # 距离保持控制增益
 
@@ -108,8 +108,8 @@ MODEL_CONSTANTS = {
     'ROLL_PITCH_RATE_MAX' : ROLL_PITCH_RATE_MAX,
     'YAW_RATE_MAX' : YAW_RATE_MAX,
     'ATT_LIMIT' : ATT_LIMIT,
-    'A_MIN' : T_MIN / MASS,
-    'A_MAX' : T_MAX / MASS,
+    'A_MIN' : A_MIN,
+    'A_MAX' : A_MAX,
     'N_HORIZON' : N_HORIZON,
     'TF' : TF,
     'DRONE_INITIAL_STATE' : DRONE_INITIAL_STATE

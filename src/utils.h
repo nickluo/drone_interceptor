@@ -202,42 +202,6 @@ public:
         x_ = x_ + K * y_residual;
         P_ = (Eigen::MatrixXd::Identity(6, 6) - K * H) * P_;
     }
-    
-    // Eigen::Vector3d noisy_bbox_to_pos(const Bbox& bbox, const Eigen::Vector3d& drone_pos, double psi) {
-    //     // 参考 Python 版本的注释
-    //     // cpsi, spsi = np.cos(psi), np.sin(psi)
-    //     // R_W_C = np.array([[cpsi, spsi, 0], [-spsi, cpsi, 0], [0, 0, 1]])
-    //     // # 反推距离
-    //     // est_dist_cam_x = self.f * self.target_size / bbox['size_x']
-    //     // est_los_C_y = -bbox['u'] * est_dist_cam_x / self.f
-    //     // est_los_C_z = -bbox['v'] * est_dist_cam_x / self.f
-    //     // est_los_C = np.array([est_dist_cam_x, est_los_C_y, est_los_C_z])
-
-    //     // # 转回世界坐标系
-    //     // R_C_W = R_W_C.T
-    //     // est_los_W = R_C_W @ est_los_C
-    //     // est_target_pos = drone_pos + est_los_W
-
-    //     // if (bbox.size < 1e-6) {
-    //     //     return drone_pos;
-    //     // }
-    //     // printf("drone_pos: [%f, %f, %f], psi: %f, bbox: [u=%f, v=%f, size=%f]\n", 
-    //     //        drone_pos.x(), drone_pos.y(), drone_pos.z(), psi, bbox.u, bbox.v, bbox.size);
-    //     // printf("focal_length_: %f, target_size_est_: %f\n", focal_length_, target_size_est_);
-
-    //     double est_dist_cam_x = focal_length_ * target_size_est_ / bbox.size;
-    //     double cpsi = std::cos(psi), spsi = std::sin(psi);
-    //     Eigen::Matrix3d R_C_W;
-    //     R_C_W << cpsi, -spsi, 0,
-    //              spsi,  cpsi, 0,
-    //                 0,     0, 1;
-    //     double est_los_C_y = -bbox.u * est_dist_cam_x / focal_length_;
-    //     double est_los_C_z = -bbox.v * est_dist_cam_x / focal_length_;
-    //     Eigen::Vector3d est_los_C(est_dist_cam_x, est_los_C_y, est_los_C_z);
-    //     Eigen::Vector3d est_los_W = R_C_W * est_los_C;
-    //     Eigen::Vector3d est_target_pos = drone_pos + est_los_W;
-    //     return est_target_pos;
-    // }
 
     Eigen::Vector3d noisy_bbox_to_pos(const Bbox& bbox, const Eigen::Vector3d& drone_pos, Eigen::Quaterniond q_C_W) {
         double est_dist_cam_x = focal_length_ * target_size_est_ / bbox.size;

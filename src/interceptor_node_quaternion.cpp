@@ -25,10 +25,10 @@ InterceptorNodeQuaternion::InterceptorNodeQuaternion()
     nlp_dims_ = drone_interceptor_mpc_quat_acados_get_nlp_dims(acados_capsule_);
     nlp_in_ = drone_interceptor_mpc_quat_acados_get_nlp_in(acados_capsule_);
     nlp_out_ = drone_interceptor_mpc_quat_acados_get_nlp_out(acados_capsule_);
-    
+
     ekf_ = std::make_unique<TargetEKF>(dt_, cam_focal_length_, target_physical_size_est_,
                                         bbox_pos_std_dev_, bbox_size_std_dev_);
-    output_filter_ = std::make_unique<EMAFilter>(static_cast<int>(N_HORIZON_ / TF_ * 0.1), 4);
+    output_filter_ = std::make_unique<EMAFilter>(static_cast<int>(RATE_TC_ * 2 / dt_), 4);
     
     // 初始化四元数状态
     x_warm_start_.resize(N_HORIZON_ + 1, VectorX::Zero());
@@ -92,8 +92,15 @@ void InterceptorNodeQuaternion::load_parameters()
 {
     this->get_parameter("use_simulation", use_simulation_);
     this->get_parameter("physics.g", G_);
-    this->get_parameter("mpc.n_horizon", N_HORIZON_);
-    this->get_parameter("mpc.tf", TF_);
+    
+    int ctrl_rate = 50;
+    this->get_parameter("mpc.ctrl_rate", ctrl_rate);
+    double TF = 1.0;
+    this->get_parameter("mpc.tf", TF);
+    N_HORIZON_ = static_cast<int>(TF * ctrl_rate);
+    dt_ = TF / N_HORIZON_;
+
+
     this->get_parameter("mpc.v_desired", V_DESIRED_);
     this->get_parameter("mpc.tracking_distance", TRACKING_DISTANCE_);
     TRACKING_GAIN_ = 1.0 * std::sqrt(TRACKING_DISTANCE_ / V_DESIRED_);
@@ -107,7 +114,7 @@ void InterceptorNodeQuaternion::load_parameters()
     this->get_parameter("control.max_history_time_factor", max_history_time_factor);
     max_history_time_ = control_execution_delay_ * max_history_time_factor;
     this->get_parameter("limits.att_limit", att_limit_);
-    dt_ = TF_ / N_HORIZON_;
+    
 
     this->get_parameter("gimbal.rp_coeff", gimbal_rp_coeff_);
     this->get_parameter("gimbal.y_coeff", gimbal_y_coeff_);
@@ -150,6 +157,13 @@ void InterceptorNodeQuaternion::load_parameters()
     this->get_parameter("cost.w_u_alpha", cost_weights_vec[5]);
     this->get_parameter("cost.w_u_thrust", cost_weights_vec[6]);
     for (int i=0; i < 7; ++i) w_cost_(i) = std::sqrt(cost_weights_vec[i]);
+    if (TRACKING_DISTANCE_ > 0.001) {
+        auto coeff = std::sqrt(10);
+        auto los_coeff = std::sqrt(TRACKING_DISTANCE_ * 0.1);
+        if (los_coeff > coeff) los_coeff = coeff;
+        w_cost_(0) /= los_coeff; // 减小视线误差权重以促进保持距离跟踪的稳定性
+        w_cost_(2) *= coeff; // 增加闭合速度权重以促进保持一定距离的跟踪
+    }
 }
 
 void InterceptorNodeQuaternion::mission_complete_callback(const std_msgs::msg::Bool::SharedPtr msg)
@@ -181,7 +195,15 @@ void InterceptorNodeQuaternion::gimbal_callback(const sensor_msgs::msg::Imu::Sha
 void InterceptorNodeQuaternion::odom_callback(const nav_msgs::msg::Odometry::SharedPtr msg) 
 {
     Eigen::Quaterniond q(msg->pose.pose.orientation.w, msg->pose.pose.orientation.x,
-                            msg->pose.pose.orientation.y, msg->pose.pose.orientation.z);
+                         msg->pose.pose.orientation.y, msg->pose.pose.orientation.z);
+    
+    // Check for NaNs in odometry
+    if (std::isnan(q.w()) || std::isnan(q.x()) || std::isnan(q.y()) || std::isnan(q.z()) ||
+        std::isnan(msg->pose.pose.position.x) || std::isnan(msg->pose.pose.position.y) || std::isnan(msg->pose.pose.position.z)) {
+        RCLCPP_ERROR(this->get_logger(), "NaN detected in odometry! Ignoring.");
+        return;
+    }
+
     // Eigen::Vector4d quat_normalized(q.w(), q.x(), q.y(), q.z());
     // 转换机体系速度到世界系速度
     Eigen::Vector3d vel_body(msg->twist.twist.linear.x, msg->twist.twist.linear.y, msg->twist.twist.linear.z);
@@ -241,7 +263,6 @@ void InterceptorNodeQuaternion::bbox_callback(const vision_msgs::msg::Detection2
 { 
     if (!odom_received_)
         return;
-    // vision_msgs::msg::BoundingBox2D bbox = msg->bbox;
     {
         std::lock_guard<std::mutex> lock(mtx_bbox_);
         current_bbox_ = *msg;
@@ -349,7 +370,6 @@ void InterceptorNodeQuaternion::simulation_loop()
         RCLCPP_INFO(this->get_logger(), "[SUCCESS] Target intercepted at distance %.2f m. Stopping simulation.", distance);
         // printf("[SUCCESS] Target intercepted at distance %.2f m. Stopping simulation. \n", distance);
         timer_->cancel();
-        
         // 悬停控制
         failsafe(true);
     }
@@ -384,6 +404,18 @@ void InterceptorNodeQuaternion::run_control_cycle(const Eigen::Vector3d &pos_est
     
     // 使用延迟补偿的预测状态设置初始条件约束
     VectorX predicted_state = predict_delayed_state(curr_drone_state, control_execution_delay_);
+    
+    // Check for NaNs in predicted state
+    if (predicted_state.hasNaN()) {
+        RCLCPP_ERROR(this->get_logger(), "NaN detected in predicted state! Resetting solver.");
+        failsafe(false);
+        output_filter_->reset();
+        // Reset warm start
+        for (int i = 0; i <= N_HORIZON_; ++i) x_warm_start_[i] = curr_drone_state;
+        for (int i = 0; i < N_HORIZON_; ++i) u_warm_start_[i] << 0, 0, 0, G_;
+        return;
+    }
+
     ocp_nlp_constraints_model_set(nlp_config_, nlp_dims_, nlp_in_, nlp_out_, 0, "lbx", predicted_state.data());
     ocp_nlp_constraints_model_set(nlp_config_, nlp_dims_, nlp_in_, nlp_out_, 0, "ubx", predicted_state.data());
 
@@ -454,7 +486,7 @@ void InterceptorNodeQuaternion::run_control_cycle(const Eigen::Vector3d &pos_est
     // 输出滤波
     Eigen::VectorXd u_filtered_dynamic = output_filter_->filter(u_optimal_raw);
     
-    if (timer_boot_count_ < N_HORIZON_ * 2)  // 前几次不发布控制，等待滤波器稳定
+    if (timer_boot_count_ < N_HORIZON_)  // 前几次不发布控制，等待滤波器稳定
     {
         timer_boot_count_++;
         return;
@@ -469,10 +501,13 @@ void InterceptorNodeQuaternion::run_control_cycle(const Eigen::Vector3d &pos_est
     control_msg->header.stamp = this->get_clock()->now();
     control_msg->control_mode = quadrotor_msgs::msg::ControlCommand::BODY_RATES;
     control_msg->armed = true;
-    control_msg->bodyrates.x = body_rates(0); // body p rate
-    control_msg->bodyrates.y = body_rates(1); // body q rate
-    control_msg->bodyrates.z = body_rates(2); // body r rate
+    // Hack : 这里乘以一个时间常数来近似实现一阶低通滤波器的效果
+    control_msg->bodyrates.x = body_rates(0) * RATE_TC_; // body p rate
+    control_msg->bodyrates.y = body_rates(1) * RATE_TC_; // body q rate
+    control_msg->bodyrates.z = body_rates(2) * RATE_TC_; // body r rate
     control_msg->collective_thrust = thrust_accel;
+    // RCLCPP_INFO(this->get_logger(), "Publishing control: p: %.2f, q: %.2f, r: %.2f, thrust: %.2f", 
+    //     body_rates(0), body_rates(1), body_rates(2), thrust_accel);
     control_pub_->publish(std::move(control_msg));
 }
 

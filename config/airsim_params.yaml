@@ -13,10 +13,10 @@ interceptor_node_quaternion:
     
     # MPC parameters
     mpc:
-      n_horizon: 50
-      tf: 0.6
+      ctrl_rate: 50
+      tf: 1.0
       v_desired: 15.0
-      tracking_distance: 50.0   # Desired tracking distance, interception only if 0.0
+      tracking_distance: 0.0   # Desired tracking distance, interception only if 0.0
     
     # Simulation parameters
     sim:
@@ -34,21 +34,21 @@ interceptor_node_quaternion:
     
     # Control execution delay compensation
     control:
-      execution_delay: 0.1  # 0.1 seconds (100ms) delay compensation for real flight
-      rate_tc: 0.008        # First-order response time constant for body rates
+      execution_delay: 0.05  # 0.05 seconds (50ms) delay compensation for real flight
+      rate_tc: 0.1           # First-order response time constant for body rates (Increased for stability)
       max_history_time_factor: 2.0  # History buffer size as multiple of execution_delay
     
     # Camera parameters
     camera:
-      width_px: 640
+      width_px: 960
 
       # For FOV based calculation
-      # fov_deg: 30.0
+      fov_deg: 30.0
 
       # For focal length based calculation
-      native_width_px: 1920
-      focal_length_mm: 12.0
-      pixel_size_um: 3.45
+      # native_width_px: 1920
+      # focal_length_mm: 12.0
+      # pixel_size_um: 3.45
 
     gimbal:
       rp_coeff : 12.0
@@ -57,11 +57,11 @@ interceptor_node_quaternion:
     # Cost function weights
     cost:
       w_los: 50.0              # Line-of-sight error weight
-      w_align: 1.0             # Velocity alignment weight
+      w_align: 5.0             # Velocity alignment weight
       w_closing_speed: 0.1     # Closing speed error weight
-      w_rates: 0.000001        # Body rate control effort weight
+      w_rates: 0.001           # Body rate control effort weight
       w_tilt: 0.000001         # Tilt angle error weight
-      w_u_alpha: 0.0001        # Body rate change weight
+      w_u_alpha: 0.001         # Body rate change weight
       w_u_thrust: 0.0001       # Thrust control effort weight
 
 # W_LOS = 10.0               # 视线误差权重

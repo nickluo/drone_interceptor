@@ -16,7 +16,7 @@ def generate_launch_description():
     pkg_dir = get_package_share_directory('drone_interceptor')
     
     # Path to the parameters file
-    config_file = os.path.join(pkg_dir, 'config', 'interceptor_params_quaternion.yaml')
+    config_file = os.path.join(pkg_dir, 'config', 'interceptor_params.yaml')
 
     # Declare a launch argument to switch between simulation and real mode
     use_simulation_arg = DeclareLaunchArgument(
