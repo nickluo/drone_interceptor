@@ -27,7 +27,7 @@ InterceptorNodeQuaternion::InterceptorNodeQuaternion()
     nlp_out_ = drone_interceptor_mpc_quat_acados_get_nlp_out(acados_capsule_);
 
     ekf_ = std::make_unique<TargetEKF>(dt_, cam_focal_length_, target_physical_size_est_,
-                                        bbox_pos_std_dev_, bbox_size_std_dev_);
+                                       bbox_pos_std_dev_, bbox_size_std_dev_);
     output_filter_ = std::make_unique<EMAFilter>(static_cast<int>(RATE_TC_ * 2 / dt_), 4);
     
     // 初始化四元数状态
@@ -455,17 +455,30 @@ void InterceptorNodeQuaternion::run_control_cycle(const Eigen::Vector3d &pos_est
     {
         RCLCPP_WARN(this->get_logger(), "ACADOS solver returned status %d.", status);
         // printf("ACADOS solver returned status %d.\n", status);
-        
-        // 保持控制
-        failsafe(false);
-        output_filter_->reset();
-        for (int i = 0; i < N_HORIZON_; ++i) {
-            x_warm_start_[i] = curr_drone_state;
-            u_warm_start_[i] = VectorU(0, 0, 0, G_);
+
+        target_lost_counter_++;
+        if (target_lost_counter_ > N_HORIZON_ * 0.5) {
+            RCLCPP_ERROR(this->get_logger(),
+                "ACADOS solver failed for too many times. Aborting.");
+            is_completed_ = true;
+            failsafe(true);
+            if (timer_) 
+                timer_->cancel();
         }
-        x_warm_start_[N_HORIZON_] = x_warm_start_[N_HORIZON_ - 1];
+        else {
+            // 保持控制
+            failsafe(false);
+            output_filter_->reset();
+            for (int i = 0; i < N_HORIZON_; ++i) {
+                x_warm_start_[i] = curr_drone_state;
+                u_warm_start_[i] = VectorU(0, 0, 0, G_);
+            }
+            x_warm_start_[N_HORIZON_] = x_warm_start_[N_HORIZON_ - 1];
+        }
         return;
     }
+
+    target_lost_counter_ = 0;
 
     VectorU u_optimal_raw;
     ocp_nlp_out_get(nlp_config_, nlp_dims_, nlp_out_, 0, "u", u_optimal_raw.data());

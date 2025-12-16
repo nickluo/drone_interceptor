@@ -131,6 +131,7 @@ private:
     Eigen::Vector3d target_pos_true_, target_vel_true_; // For sim
     double interception_dist_;
     int target_lost_counter_ = 0;
+    int solver_failure_counter_ = 0;
 
     std::unique_ptr<TargetEKF> ekf_;
     std::unique_ptr<EMAFilter> output_filter_;
