@@ -456,8 +456,8 @@ void InterceptorNodeQuaternion::run_control_cycle(const Eigen::Vector3d &pos_est
         RCLCPP_WARN(this->get_logger(), "ACADOS solver returned status %d.", status);
         // printf("ACADOS solver returned status %d.\n", status);
 
-        target_lost_counter_++;
-        if (target_lost_counter_ > N_HORIZON_ * 0.5) {
+        solver_failure_counter_++;
+        if (solver_failure_counter_ > N_HORIZON_ * 0.5) {
             RCLCPP_ERROR(this->get_logger(),
                 "ACADOS solver failed for too many times. Aborting.");
             is_completed_ = true;
@@ -478,7 +478,7 @@ void InterceptorNodeQuaternion::run_control_cycle(const Eigen::Vector3d &pos_est
         return;
     }
 
-    target_lost_counter_ = 0;
+    solver_failure_counter_ = 0;
 
     VectorU u_optimal_raw;
     ocp_nlp_out_get(nlp_config_, nlp_dims_, nlp_out_, 0, "u", u_optimal_raw.data());
@@ -499,7 +499,7 @@ void InterceptorNodeQuaternion::run_control_cycle(const Eigen::Vector3d &pos_est
     // 输出滤波
     Eigen::VectorXd u_filtered_dynamic = output_filter_->filter(u_optimal_raw);
     
-    if (timer_boot_count_ < N_HORIZON_)  // 前几次不发布控制，等待滤波器稳定
+    if (timer_boot_count_ < N_HORIZON_ * 2)  // 前几次不发布控制，等待滤波器稳定
     {
         timer_boot_count_++;
         return;
