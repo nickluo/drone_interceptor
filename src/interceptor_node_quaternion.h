@@ -11,6 +11,7 @@
 #include <sensor_msgs/msg/imu.hpp>
 #include <vision_msgs/msg/detection2_d.hpp>
 #include <std_msgs/msg/bool.hpp>
+#include <mavros_msgs/msg/status_text.hpp>
 
 #include "quadrotor_msgs/msg/control_command.hpp"
 #include "utils.h"
@@ -27,6 +28,21 @@ extern "C" {
     #include "acados_c/external_function_interface.h"
     #include "acados_solver_drone_interceptor_mpc_quat.h"
 }
+
+class StatusPublisher
+{
+public:
+    StatusPublisher(rclcpp::Node &node, int hz=1);
+    ~StatusPublisher();
+    bool publish(uint8_t severity, int count,const std::string& text, bool force=false);
+private:
+    rclcpp::Publisher<mavros_msgs::msg::StatusText>::SharedPtr status_pub_;
+    rclcpp::TimerBase::SharedPtr status_timer_;
+    std::mutex status_mtx_;
+    std::queue<std::tuple<uint8_t, int, std::string>> status_queue_;
+    int status_counter_ = -1;
+};
+
 
 class InterceptorNodeQuaternion : public rclcpp::Node 
 {
@@ -84,6 +100,7 @@ private:
     void load_parameters();
 
     void mission_complete_callback(const std_msgs::msg::Bool::SharedPtr msg);
+    void mission_launch_callback(const std_msgs::msg::Bool::SharedPtr msg);
     void odom_callback(const nav_msgs::msg::Odometry::SharedPtr msg);
     void bbox_callback(const vision_msgs::msg::Detection2D::SharedPtr msg);
     void gimbal_callback(const sensor_msgs::msg::Imu::SharedPtr msg);
@@ -92,6 +109,7 @@ private:
     void real_loop();
     void simulation_loop();
     void run_control_cycle(const Eigen::Vector3d &pos_est, const Eigen::Vector3d &vel_est);
+    void stop();
 
     void update_control_history(double current_time, const Eigen::Vector3d& body_rates);
     Eigen::Vector3d get_history_body_rates(const Eigen::Vector3d &current_body_rates, double delay_time);
@@ -126,9 +144,10 @@ private:
     rclcpp::Publisher<quadrotor_msgs::msg::ControlCommand>::SharedPtr control_pub_;
     rclcpp::Subscription<nav_msgs::msg::Odometry>::SharedPtr odom_sub_;
     rclcpp::Subscription<std_msgs::msg::Bool>::SharedPtr mission_complete_sub_;
+    rclcpp::Subscription<std_msgs::msg::Bool>::SharedPtr mission_launch_sub_;
     rclcpp::Subscription<vision_msgs::msg::Detection2D>::SharedPtr bbox_sub_;
     rclcpp::Subscription<sensor_msgs::msg::Imu>::SharedPtr gimbal_sub_;
-
+    
     VectorX drone_state_;
     Eigen::Vector3d target_pos_true_, target_vel_true_; // For sim
     double interception_dist_;
@@ -137,6 +156,7 @@ private:
 
     std::unique_ptr<TargetEKF> ekf_;
     std::unique_ptr<EMAFilter> output_filter_;
+    std::unique_ptr<StatusPublisher> status_publisher_;
     
     // 四元数版本的ACADOS接口
     drone_interceptor_mpc_quat_solver_capsule* acados_capsule_;
@@ -161,4 +181,5 @@ private:
     bool is_completed_ = false;
     std::atomic_bool odom_received_ {false};
     std::atomic_bool gimbal_received_ {false};
+    std::atomic_bool is_launched_ {false};
 };

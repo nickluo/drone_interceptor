@@ -48,6 +48,8 @@ InterceptorNodeQuaternion::InterceptorNodeQuaternion()
     control_pub_ = this->create_publisher<quadrotor_msgs::msg::ControlCommand>(
         "/fpv/control_command", 
         rclcpp::SensorDataQoS());
+    
+    status_publisher_ = std::make_unique<StatusPublisher>(*this, 2);
 
     if (use_simulation_) {
         RCLCPP_INFO(this->get_logger(), "Running in SIMULATION mode with QUATERNION dynamics.");
@@ -60,6 +62,8 @@ InterceptorNodeQuaternion::InterceptorNodeQuaternion()
         timer_ = this->create_wall_timer(std::chrono::duration<double>(dt_), 
             std::bind(&InterceptorNodeQuaternion::simulation_loop, this),
             timer_callback_group_);
+        is_completed_ = false;
+        is_launched_ = true;
     } else {
         RCLCPP_INFO(this->get_logger(), "Running in REAL mode with QUATERNION dynamics.");
         rclcpp::SubscriptionOptions sub_options;
@@ -76,6 +80,9 @@ InterceptorNodeQuaternion::InterceptorNodeQuaternion()
         mission_complete_sub_ = this->create_subscription<std_msgs::msg::Bool>(
             "/fpv/mission_complete", 10, 
             std::bind(&InterceptorNodeQuaternion::mission_complete_callback, this, std::placeholders::_1));
+        mission_launch_sub_ = this->create_subscription<std_msgs::msg::Bool>(
+            "/fpv/mission_launch", 10, 
+            std::bind(&InterceptorNodeQuaternion::mission_launch_callback, this, std::placeholders::_1));
     }
 }
     
@@ -173,16 +180,61 @@ void InterceptorNodeQuaternion::mission_complete_callback(const std_msgs::msg::B
 {
     if (!is_completed_ && msg->data) {
         RCLCPP_INFO(this->get_logger(), "Mission complete! Stopping control...");
-        is_completed_ = true;
-        failsafe(true);
-        if (timer_) {
-            timer_->cancel();
+        status_publisher_->publish(
+            mavros_msgs::msg::StatusText::INFO, 
+            1, "Mission complete. Stopping...", true); 
+        stop();
+    }
+}
+
+void InterceptorNodeQuaternion::mission_launch_callback(const std_msgs::msg::Bool::SharedPtr msg)
+{
+    if (is_launched_ || timer_) 
+        return;
+    if (msg->data) {
+        RCLCPP_INFO(this->get_logger(), "Mission launch received! Starting control...");
+        status_publisher_->publish(
+            mavros_msgs::msg::StatusText::INFO, 
+            1, "Mission launched. Starting...", true);
+        // 重置状态
+        {
+            std::lock_guard<std::mutex> lock(mtx_ekf_);
+            ekf_ = std::make_unique<TargetEKF>(dt_, cam_focal_length_, target_physical_size_est_,
+                                       bbox_pos_std_dev_, bbox_size_std_dev_);
         }
+        {
+            std::lock_guard<std::mutex> lock(mtx_drone_state_);
+            drone_state_.setZero();
+        }
+        {
+            std::lock_guard<std::mutex> lock(mtx_bbox_);
+            current_bbox_ = vision_msgs::msg::Detection2D();
+            is_visible_ = false;
+        }
+
+        output_filter_->reset();
+        control_history_.clear();
+
+        odom_received_ = false;
+        gimbal_received_ = false;
+
+        timer_boot_count_ = 0;
+        target_lost_counter_ = 0;
+        solver_failure_counter_ = 0;
+        
+        // 初始化状态设置
+        for (int i = 0; i <= N_HORIZON_; ++i) x_warm_start_[i] = drone_state_;
+        for (int i = 0; i < N_HORIZON_; ++i) u_warm_start_[i] << 0, 0, 0, G_;
+
+        is_completed_ = false;
+        is_launched_ = true;
     }
 }
 
 void InterceptorNodeQuaternion::gimbal_callback(const sensor_msgs::msg::Imu::SharedPtr msg) 
 {
+    if (!is_launched_) 
+        return;
     gimbal_received_ = true;
     {
         std::lock_guard<std::mutex> lock(mtx_gimbal_);
@@ -197,6 +249,8 @@ void InterceptorNodeQuaternion::gimbal_callback(const sensor_msgs::msg::Imu::Sha
     
 void InterceptorNodeQuaternion::odom_callback(const nav_msgs::msg::Odometry::SharedPtr msg) 
 {
+    if (!is_launched_) 
+        return;
     Eigen::Quaterniond q(msg->pose.pose.orientation.w, msg->pose.pose.orientation.x,
                          msg->pose.pose.orientation.y, msg->pose.pose.orientation.z);
     
@@ -264,7 +318,7 @@ void InterceptorNodeQuaternion::odom_callback(const nav_msgs::msg::Odometry::Sha
 
 void InterceptorNodeQuaternion::bbox_callback(const vision_msgs::msg::Detection2D::SharedPtr msg) 
 { 
-    if (!odom_received_)
+    if (!odom_received_ || !is_launched_)
         return;
     {
         std::lock_guard<std::mutex> lock(mtx_bbox_);
@@ -371,11 +425,19 @@ void InterceptorNodeQuaternion::simulation_loop()
     RCLCPP_INFO(this->get_logger(), "Distance to target: %.2f m", distance);
     if (distance < interception_dist_) {
         RCLCPP_INFO(this->get_logger(), "[SUCCESS] Target intercepted at distance %.2f m. Stopping simulation.", distance);
-        // printf("[SUCCESS] Target intercepted at distance %.2f m. Stopping simulation. \n", distance);
-        timer_->cancel();
-        // 悬停控制
-        failsafe(true);
+        stop();
     }
+}
+
+void InterceptorNodeQuaternion::stop() 
+{
+    if (timer_) {
+        timer_->cancel();
+        timer_ = nullptr;
+    }
+    is_completed_ = true;
+    is_launched_ = false;
+    failsafe(true);
 }
 
 void InterceptorNodeQuaternion::run_control_cycle(const Eigen::Vector3d &pos_est, const Eigen::Vector3d &vel_est) 
@@ -391,6 +453,11 @@ void InterceptorNodeQuaternion::run_control_cycle(const Eigen::Vector3d &pos_est
     } 
     else 
     {
+        if (target_lost_counter_ % 10 == 0) {
+            status_publisher_->publish(
+                mavros_msgs::msg::StatusText::WARNING, 
+                1, "Target lost. Blind flight", false);
+        }
         target_lost_counter_++;
         RCLCPP_WARN(this->get_logger(), "Target lost! Blind flight count: %d/%d", target_lost_counter_, N_HORIZON_);
     }
@@ -398,10 +465,10 @@ void InterceptorNodeQuaternion::run_control_cycle(const Eigen::Vector3d &pos_est
     if (target_lost_counter_ > N_HORIZON_ * 2) {
         RCLCPP_ERROR(this->get_logger(),
             "Target lost for too long. Aborting.");
-        is_completed_ = true;
-        failsafe(true);
-        if (timer_) 
-            timer_->cancel();
+        status_publisher_->publish(
+            mavros_msgs::msg::StatusText::ERROR, 
+            1, "Target lost. Aborting.", true);
+        stop();
         return;
     }
     
@@ -463,10 +530,10 @@ void InterceptorNodeQuaternion::run_control_cycle(const Eigen::Vector3d &pos_est
         if (solver_failure_counter_ > N_HORIZON_ * 0.5) {
             RCLCPP_ERROR(this->get_logger(),
                 "ACADOS solver failed for too many times. Aborting.");
-            is_completed_ = true;
-            failsafe(true);
-            if (timer_) 
-                timer_->cancel();
+            status_publisher_->publish(
+                mavros_msgs::msg::StatusText::ERROR, 
+                1, "ACADOS solver failed. Aborting.", true);    
+            stop();
         }
         else {
             // 保持控制
@@ -603,6 +670,52 @@ void InterceptorNodeQuaternion::update_control_history(double current_time, cons
     while (!control_history_.empty() && control_history_.front().first < cutoff_time) {
         control_history_.pop_front();
     }
+}
+
+StatusPublisher::StatusPublisher(rclcpp::Node &node, int hz)
+{
+    status_pub_ = node.create_publisher<mavros_msgs::msg::StatusText>(
+        "/mavros/statustext/send", 10);
+    status_timer_ = node.create_wall_timer(std::chrono::milliseconds(1000 / hz), [this](){
+        static uint8_t severity;
+        static std::string status;
+
+        std::lock_guard<std::mutex> lock(status_mtx_);
+        if (status_counter_<=0)
+        {
+            if (status_queue_.empty()) return;
+            auto [level, counter, text] = status_queue_.front();
+            severity = level;
+            status = text;
+            status_counter_ = counter;
+            // printf("Publishing status: severity=%d, count=%d, text=%s\n", severity, status_counter_, status.c_str());
+            status_queue_.pop();
+        }
+        if (status_counter_-- > 0)
+        {
+            // Publish status
+            auto msg = std::make_unique<mavros_msgs::msg::StatusText>();
+            msg->header.stamp = rclcpp::Clock().now();
+            msg->severity = severity; // mavros_msgs::msg::StatusText::WARNING;
+            msg->text= status;
+            status_pub_->publish(std::move(msg));
+        }
+    });
+}
+
+StatusPublisher::~StatusPublisher()
+{
+    if (status_timer_)
+        status_timer_->cancel();
+}
+
+bool StatusPublisher::publish(uint8_t severity, int count,const std::string& text, bool force)
+{
+    std::lock_guard<std::mutex> lock(status_mtx_);
+    if (!force && (status_counter_ > 0 || !status_queue_.empty()))
+        return false;
+    status_queue_.emplace(severity, count, text);
+    return true;
 }
 
 int main(int argc, char * argv[]) {
