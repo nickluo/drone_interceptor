@@ -28,7 +28,9 @@ InterceptorNodeQuaternion::InterceptorNodeQuaternion()
 
     ekf_ = std::make_unique<TargetEKF>(dt_, cam_focal_length_, target_physical_size_est_,
                                        bbox_pos_std_dev_, bbox_size_std_dev_);
-    output_filter_ = std::make_unique<EMAFilter>(static_cast<int>(RATE_TC_ * 2 / dt_), 4);
+    int filter_n = static_cast<int>(RATE_TC_ * 2.0 / dt_);
+    if (filter_n < 5) filter_n = 5;
+    output_filter_ = std::make_unique<EMAFilter>(filter_n, 4);
     
     // 初始化四元数状态
     x_warm_start_.resize(N_HORIZON_ + 1, VectorX::Zero());
@@ -110,6 +112,7 @@ void InterceptorNodeQuaternion::load_parameters()
     this->get_parameter("perception.target_physical_size_est", target_physical_size_est_);
     this->get_parameter("control.execution_delay", control_execution_delay_);
     this->get_parameter("control.rate_tc", RATE_TC_);
+    this->get_parameter("control.ctrl_coeff", ctrl_coeff_);
     double max_history_time_factor;
     this->get_parameter("control.max_history_time_factor", max_history_time_factor);
     max_history_time_ = control_execution_delay_ * max_history_time_factor;
@@ -515,9 +518,9 @@ void InterceptorNodeQuaternion::run_control_cycle(const Eigen::Vector3d &pos_est
     control_msg->control_mode = quadrotor_msgs::msg::ControlCommand::BODY_RATES;
     control_msg->armed = true;
     // Hack : 这里乘以一个时间常数来近似实现一阶低通滤波器的效果
-    control_msg->bodyrates.x = body_rates(0) * RATE_TC_; // body p rate
-    control_msg->bodyrates.y = body_rates(1) * RATE_TC_; // body q rate
-    control_msg->bodyrates.z = body_rates(2) * RATE_TC_; // body r rate
+    control_msg->bodyrates.x = body_rates(0) * ctrl_coeff_; // body p rate
+    control_msg->bodyrates.y = body_rates(1) * ctrl_coeff_; // body q rate
+    control_msg->bodyrates.z = body_rates(2) * ctrl_coeff_; // body r rate
     control_msg->collective_thrust = thrust_accel;
     // RCLCPP_INFO(this->get_logger(), "Publishing control: p: %.2f, q: %.2f, r: %.2f, thrust: %.2f", 
     //     body_rates(0), body_rates(1), body_rates(2), thrust_accel);

@@ -57,6 +57,7 @@ private:
 
         this->declare_parameter<double>("control.execution_delay", 0.05);
         this->declare_parameter<double>("control.rate_tc", 0.05);
+        this->declare_parameter<double>("control.ctrl_coeff", 0.1);
         this->declare_parameter<double>("control.max_history_time_factor", 2.0);
 
         this->declare_parameter<int>("camera.width_px", 640);
@@ -103,6 +104,7 @@ private:
     double target_physical_size_est_;
     double cam_focal_length_, max_angle_rad_, cam_width_px_;
     double control_execution_delay_;
+    double ctrl_coeff_;
     double att_limit_;
 
     // 延迟补偿相关变量
