@@ -23,7 +23,7 @@ ATT_LIMIT = np.pi/5 # 姿态角限制 (Roll & Pitch)
 
 # ======== MPC 控制器参数 (MPC Controller Parameters) ========
 CTRL_FREQ_HZ = 50    # 控制器频率 (Hz)
-TF = 1.0            # 预测时域总时长 (s)
+TF = 0.8            # 预测时域总时长 (s)
 N_HORIZON = int(TF * CTRL_FREQ_HZ) # 预测时域步数
 V_DESIRED = 20.0     # 期望接近速度 (m/s)
 
@@ -69,7 +69,7 @@ CAM_FOCAL_LENGTH = CAM_FOCAL_LENGTH_PHYSICAL * 1000 / CAM_PIXEL_SIZE # 焦距 (i
 # ======== 代价函数 (Cost Function) ========
 # --- 权重 ---
 W_LOS = 100.0             # 视线误差权重
-W_ALIGN = 1.0             # 速度对齐权重
+W_ALIGN = 0.1             # 速度对齐权重
 W_CLOSING_SPEED = 0.1     # 接近速度权重
 W_RATES = 0.000001        # 角速度控制量权重
 W_TILT = 0.000001         # 倾斜角误差权重

@@ -4,6 +4,9 @@
 #include <deque>
 #include <memory>
 #include <mutex>
+#include <queue>
+#include <tuple>
+#include <chrono>
 
 #include <rclcpp/rclcpp.hpp>
 #include <geometry_msgs/msg/vector3.hpp>

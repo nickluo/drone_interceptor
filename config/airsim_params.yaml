@@ -14,7 +14,7 @@ interceptor_node_quaternion:
     # MPC parameters
     mpc:
       ctrl_rate: 50
-      tf: 1.0
+      tf: 0.8
       v_desired: 15.0
       tracking_distance: 0.0   # Desired tracking distance, interception only if 0.0
     
