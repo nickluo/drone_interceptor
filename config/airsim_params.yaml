@@ -62,7 +62,7 @@ interceptor_node_quaternion:
       w_closing_speed: 0.1     # Closing speed error weight
       w_rates: 0.001           # Body rate control effort weight
       w_tilt: 0.000001         # Tilt angle error weight
-      w_u_alpha: 1.0           # Body rate change weight
+      w_u_alpha: 0.1           # Body rate change weight
       w_u_thrust: 0.0001       # Thrust control effort weight
 
 # W_LOS = 10.0               # 视线误差权重

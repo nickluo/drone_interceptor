@@ -48,7 +48,9 @@ InterceptorNodeQuaternion::InterceptorNodeQuaternion()
     control_pub_ = this->create_publisher<quadrotor_msgs::msg::ControlCommand>(
         "/fpv/control_command", 
         rclcpp::SensorDataQoS());
-    
+    mission_state_pub_ = this->create_publisher<std_msgs::msg::Bool>(
+        "/fpv/mission_state", 10);
+
     status_publisher_ = std::make_unique<StatusPublisher>(*this, 2);
 
     if (use_simulation_) {
@@ -77,11 +79,8 @@ InterceptorNodeQuaternion::InterceptorNodeQuaternion()
         bbox_sub_ = this->create_subscription<vision_msgs::msg::Detection2D>(
             "/fpv/target_bbox", rclcpp::QoS(rclcpp::KeepLast(10)).best_effort(), 
             std::bind(&InterceptorNodeQuaternion::bbox_callback, this, std::placeholders::_1), sub_options);
-        mission_complete_sub_ = this->create_subscription<std_msgs::msg::Bool>(
-            "/fpv/mission_complete", 10, 
-            std::bind(&InterceptorNodeQuaternion::mission_complete_callback, this, std::placeholders::_1));
-        mission_launch_sub_ = this->create_subscription<std_msgs::msg::Bool>(
-            "/fpv/mission_launch", 10, 
+        mission_launch_sub_ = this->create_subscription<std_msgs::msg::Header>(
+            "/fpv/tracker_trigger", 10, 
             std::bind(&InterceptorNodeQuaternion::mission_launch_callback, this, std::placeholders::_1));
     }
 }
@@ -176,22 +175,19 @@ void InterceptorNodeQuaternion::load_parameters()
     }
 }
 
-void InterceptorNodeQuaternion::mission_complete_callback(const std_msgs::msg::Bool::SharedPtr msg)
+void InterceptorNodeQuaternion::mission_launch_callback(const std_msgs::msg::Header::SharedPtr msg)
 {
-    if (!is_completed_ && msg->data) {
-        RCLCPP_INFO(this->get_logger(), "Mission complete! Stopping control...");
+    if (msg->frame_id == "OFF" && is_launched_ && !is_completed_) {
+        RCLCPP_INFO(this->get_logger(), "Mission abort received! Stopping control...");
         status_publisher_->publish(
-            mavros_msgs::msg::StatusText::INFO, 
-            1, "Mission complete. Stopping...", true); 
+            mavros_msgs::msg::StatusText::WARNING, 
+            1, "Mission aborted. Stopping...", true); 
         stop();
-    }
-}
-
-void InterceptorNodeQuaternion::mission_launch_callback(const std_msgs::msg::Bool::SharedPtr msg)
-{
-    if (is_launched_ || timer_) 
         return;
-    if (msg->data) {
+    }
+    if (is_launched_ || timer_)
+        return;
+    if (msg->frame_id == "MISSION") {
         RCLCPP_INFO(this->get_logger(), "Mission launch received! Starting control...");
         status_publisher_->publish(
             mavros_msgs::msg::StatusText::INFO, 
@@ -228,6 +224,7 @@ void InterceptorNodeQuaternion::mission_launch_callback(const std_msgs::msg::Boo
 
         is_completed_ = false;
         is_launched_ = true;
+        mission_state_pub_->publish(std::make_unique<std_msgs::msg::Bool>(std_msgs::msg::Bool().set__data(true)));
     }
 }
 
@@ -438,6 +435,7 @@ void InterceptorNodeQuaternion::stop()
     is_completed_ = true;
     is_launched_ = false;
     failsafe(true);
+    mission_state_pub_->publish(std::make_unique<std_msgs::msg::Bool>(std_msgs::msg::Bool().set__data(false)));
 }
 
 void InterceptorNodeQuaternion::run_control_cycle(const Eigen::Vector3d &pos_est, const Eigen::Vector3d &vel_est) 
@@ -569,11 +567,8 @@ void InterceptorNodeQuaternion::run_control_cycle(const Eigen::Vector3d &pos_est
     // 输出滤波
     Eigen::VectorXd u_filtered_dynamic = output_filter_->filter(u_optimal_raw);
     
-    if (timer_boot_count_ < N_HORIZON_ * 2)  // 前几次不发布控制，等待滤波器稳定
-    {
-        timer_boot_count_++;
+    if (timer_boot_count_++ < N_HORIZON_)  // 前几次不发布控制，等待滤波器稳定
         return;
-    }
 
     // 提取控制量
     double thrust_accel = u_filtered_dynamic(3);

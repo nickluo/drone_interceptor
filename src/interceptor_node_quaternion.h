@@ -11,6 +11,7 @@
 #include <sensor_msgs/msg/imu.hpp>
 #include <vision_msgs/msg/detection2_d.hpp>
 #include <std_msgs/msg/bool.hpp>
+#include <std_msgs/msg/header.hpp>
 #include <mavros_msgs/msg/status_text.hpp>
 
 #include "quadrotor_msgs/msg/control_command.hpp"
@@ -99,8 +100,7 @@ private:
     }
     void load_parameters();
 
-    void mission_complete_callback(const std_msgs::msg::Bool::SharedPtr msg);
-    void mission_launch_callback(const std_msgs::msg::Bool::SharedPtr msg);
+    void mission_launch_callback(const std_msgs::msg::Header::SharedPtr msg);
     void odom_callback(const nav_msgs::msg::Odometry::SharedPtr msg);
     void bbox_callback(const vision_msgs::msg::Detection2D::SharedPtr msg);
     void gimbal_callback(const sensor_msgs::msg::Imu::SharedPtr msg);
@@ -142,9 +142,9 @@ private:
     int timer_boot_count_ = 0;
 
     rclcpp::Publisher<quadrotor_msgs::msg::ControlCommand>::SharedPtr control_pub_;
+    rclcpp::Publisher<std_msgs::msg::Bool>::SharedPtr mission_state_pub_;
     rclcpp::Subscription<nav_msgs::msg::Odometry>::SharedPtr odom_sub_;
-    rclcpp::Subscription<std_msgs::msg::Bool>::SharedPtr mission_complete_sub_;
-    rclcpp::Subscription<std_msgs::msg::Bool>::SharedPtr mission_launch_sub_;
+    rclcpp::Subscription<std_msgs::msg::Header>::SharedPtr mission_launch_sub_;
     rclcpp::Subscription<vision_msgs::msg::Detection2D>::SharedPtr bbox_sub_;
     rclcpp::Subscription<sensor_msgs::msg::Imu>::SharedPtr gimbal_sub_;
     
