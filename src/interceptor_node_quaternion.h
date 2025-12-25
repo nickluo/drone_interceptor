@@ -125,7 +125,7 @@ private:
     bool validate_state(const VectorX& state, const char* context) const;
     bool validate_control(const VectorU& u) const;
     VectorU apply_control_limits(const VectorU& u_raw) const;
-    bool check_attitude_safety(const VectorX& state) const;
+    bool check_attitude_safety(const VectorX& state);
     void check_ekf_health();
     
     // 求解器故障恢复

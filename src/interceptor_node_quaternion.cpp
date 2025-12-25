@@ -834,7 +834,7 @@ VectorU InterceptorNodeQuaternion::apply_control_limits(const VectorU& u_raw) co
     return u_limited;
 }
 
-bool InterceptorNodeQuaternion::check_attitude_safety(const VectorX& state) const {
+bool InterceptorNodeQuaternion::check_attitude_safety(const VectorX& state) {
     Eigen::Vector4d quat = state.segment<4>(6);
     double qx = quat(1), qy = quat(2);
     
