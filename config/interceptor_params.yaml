@@ -9,7 +9,7 @@ interceptor_node_quaternion:
     
     # Control limits  
     limits:
-      att_limit: 0.785398       # pi/4 rad (45 degrees)
+      att_warning_deg: 45.0       # pi/4 rad (45 degrees)
     
     # MPC parameters
     mpc:
@@ -31,6 +31,7 @@ interceptor_node_quaternion:
       bbox_pos_std_dev: 3.0
       bbox_size_std_dev: 3.0
       target_physical_size_est: 1.0
+      perspective_compensation: 1.0  # 透视补偿因子 (0.5=半径理论值, 1.0=直径经验值)
     
     # Control execution delay compensation
     control:
@@ -42,6 +43,7 @@ interceptor_node_quaternion:
     # Camera parameters
     camera:
       width_px: 960
+      height_px: 960
 
       # For FOV based calculation
       # fov_deg: 30.0
@@ -58,7 +60,7 @@ interceptor_node_quaternion:
     # Cost function weights
     cost:
       w_los: 50.0              # Line-of-sight error weight
-      w_align: 2.0             # Velocity alignment weight
+      w_align: 1.0             # Velocity alignment weight
       w_closing_speed: 0.1     # Closing speed error weight
       w_rates: 0.001           # Body rate control effort weight
       w_tilt: 0.000001         # Tilt angle error weight

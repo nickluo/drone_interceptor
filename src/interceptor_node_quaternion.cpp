@@ -6,6 +6,15 @@
 
 #include "interceptor_node_quaternion.h"
 
+// Control limits constants
+// Refer to prototype/solver_flat_quaternion.py for corresponding limits
+namespace ControlLimits {
+    constexpr double ROLL_PITCH_RATE_MAX = 2.0 * M_PI;  // rad/s
+    constexpr double YAW_RATE_MAX = 0.5 * M_PI;         // rad/s
+    constexpr double THRUST_MIN = 1.0;                  // m/s^2
+    constexpr double THRUST_MAX = 20.0;                 // m/s^2
+};
+
 using namespace std::chrono_literals;
 
 InterceptorNodeQuaternion::InterceptorNodeQuaternion() 
@@ -27,17 +36,19 @@ InterceptorNodeQuaternion::InterceptorNodeQuaternion()
     nlp_out_ = drone_interceptor_mpc_quat_acados_get_nlp_out(acados_capsule_);
 
     ekf_ = std::make_unique<TargetEKF>(dt_, cam_focal_length_, target_physical_size_est_,
-                                       bbox_pos_std_dev_, bbox_size_std_dev_);
+                                       bbox_pos_std_dev_, bbox_size_std_dev_,
+                                       perspective_compensation_);
     int filter_n = static_cast<int>(RATE_TC_ * 2.0 / dt_);
     if (filter_n < 5) filter_n = 5;
     output_filter_ = std::make_unique<EMAFilter>(filter_n, 4);
     
-    // 初始化四元数状态
-    x_warm_start_.resize(N_HORIZON_ + 1, VectorX::Zero());
+    // 初始化四元数状态 - drone_state_ 已在声明时初始化有效四元数
+    drone_state_ = VectorX::Zero();
+    drone_state_(6) = 1.0;  // 四元数 w 分量初始化为1
+    x_warm_start_.resize(N_HORIZON_ + 1, drone_state_);  // 直接使用有效初始状态
     u_warm_start_.resize(N_HORIZON_, VectorU::Zero());
     
-    // 初始化状态设置
-    for (int i = 0; i <= N_HORIZON_; ++i) x_warm_start_[i] = drone_state_;
+    // 初始化控制输入为悬停状态
     for (int i = 0; i < N_HORIZON_; ++i) u_warm_start_[i] << 0, 0, 0, G_;
 
     sub_callback_group_ = this->create_callback_group(
@@ -64,8 +75,8 @@ InterceptorNodeQuaternion::InterceptorNodeQuaternion()
         timer_ = this->create_wall_timer(std::chrono::duration<double>(dt_), 
             std::bind(&InterceptorNodeQuaternion::simulation_loop, this),
             timer_callback_group_);
-        is_completed_ = false;
-        is_launched_ = true;
+        // 使用状态机管理任务状态
+        mission_state_.set(MissionState::INITIALIZING);
     } else {
         RCLCPP_INFO(this->get_logger(), "Running in REAL mode with QUATERNION dynamics.");
         rclcpp::SubscriptionOptions sub_options;
@@ -116,32 +127,36 @@ void InterceptorNodeQuaternion::load_parameters()
     this->get_parameter("perception.bbox_pos_std_dev", bbox_pos_std_dev_);
     this->get_parameter("perception.bbox_size_std_dev", bbox_size_std_dev_);
     this->get_parameter("perception.target_physical_size_est", target_physical_size_est_);
+    this->get_parameter("perception.perspective_compensation", perspective_compensation_);
     this->get_parameter("control.execution_delay", control_execution_delay_);
     this->get_parameter("control.rate_tc", RATE_TC_);
     this->get_parameter("control.ctrl_coeff", ctrl_coeff_);
     double max_history_time_factor;
     this->get_parameter("control.max_history_time_factor", max_history_time_factor);
     max_history_time_ = control_execution_delay_ * max_history_time_factor;
-    this->get_parameter("limits.att_limit", att_limit_);
+    this->get_parameter("limits.att_warning_deg", att_limit_);
     
-
     this->get_parameter("gimbal.rp_coeff", gimbal_rp_coeff_);
     this->get_parameter("gimbal.y_coeff", gimbal_y_coeff_);
 
     // 相机参数
     double cam_focal_mm, cam_pixel_um;
-    int cam_width_px;
+    int cam_width_px, cam_height_px;
     int native_width_px;
     double fov_deg;
     this->get_parameter("camera.fov_deg", fov_deg);
     this->get_parameter("camera.native_width_px", native_width_px);
     this->get_parameter("camera.width_px", cam_width_px);
+    this->get_parameter("camera.height_px", cam_height_px);
     this->get_parameter("camera.focal_length_mm", cam_focal_mm);
     this->get_parameter("camera.pixel_size_um", cam_pixel_um);
     if (fov_deg > 0.0) {
         cam_width_px_ = cam_width_px;
+        cam_height_px_ = cam_height_px;
         cam_focal_length_ = cam_width_px * 0.5 / tan(fov_deg * M_PI / 180.0 / 2.0);
     } else {
+        cam_width_px_ = cam_width_px;
+        cam_height_px_ = cam_height_px;
         double scale_factor = static_cast<double>(cam_width_px) / static_cast<double>(native_width_px);
         cam_focal_length_ = cam_focal_mm * 1000.0 / cam_pixel_um * scale_factor;
     }
@@ -177,16 +192,21 @@ void InterceptorNodeQuaternion::load_parameters()
 
 void InterceptorNodeQuaternion::mission_launch_callback(const std_msgs::msg::Header::SharedPtr msg)
 {
-    if (msg->frame_id == "OFF" && is_launched_ && !is_completed_) {
+    // 中止任务
+    if (msg->frame_id == "OFF" && mission_state_.is_active()) {
         RCLCPP_INFO(this->get_logger(), "Mission abort received! Stopping control...");
         status_publisher_->publish(
             mavros_msgs::msg::StatusText::WARNING, 
             1, "Mission aborted. Stopping...", true); 
+        transition_to_state(MissionState::ABORTED, "User abort command");
         stop();
         return;
     }
-    if (is_launched_ || timer_)
+    
+    // 任务已启动或定时器已运行，忽略
+    if (!mission_state_.is_terminated() || timer_)
         return;
+        
     if (msg->frame_id == "MISSION") {
         RCLCPP_INFO(this->get_logger(), "Mission launch received! Starting control...");
         status_publisher_->publish(
@@ -194,13 +214,15 @@ void InterceptorNodeQuaternion::mission_launch_callback(const std_msgs::msg::Hea
             1, "Mission launched. Starting...", true);
         // 重置状态
         {
-            std::lock_guard<std::mutex> lock(mtx_ekf_);
+            std::unique_lock<std::shared_mutex> lock(mtx_ekf_);  // 写入使用独占锁
             ekf_ = std::make_unique<TargetEKF>(dt_, cam_focal_length_, target_physical_size_est_,
-                                       bbox_pos_std_dev_, bbox_size_std_dev_);
+                                       bbox_pos_std_dev_, bbox_size_std_dev_,
+                                       perspective_compensation_);
         }
         {
-            std::lock_guard<std::mutex> lock(mtx_drone_state_);
+            std::unique_lock<std::shared_mutex> lock(mtx_drone_state_);  // 写入使用独占锁
             drone_state_.setZero();
+            drone_state_(6) = 1.0;  // 设置有效的单位四元数 w=1
         }
         {
             std::lock_guard<std::mutex> lock(mtx_bbox_);
@@ -217,28 +239,34 @@ void InterceptorNodeQuaternion::mission_launch_callback(const std_msgs::msg::Hea
         timer_boot_count_ = 0;
         target_lost_counter_ = 0;
         solver_failure_counter_ = 0;
+        consecutive_solver_failures_ = 0;
         
-        // 初始化状态设置
+        // 重置性能监控变量，确保每次任务启动行为一致
+        solve_count_ = 0;
+        avg_solve_time_us_ = 0.0;
+        ekf_health_check_counter_ = 0;
+        
+        // 初始化状态设置 - 使用有效四元数状态
         for (int i = 0; i <= N_HORIZON_; ++i) x_warm_start_[i] = drone_state_;
         for (int i = 0; i < N_HORIZON_; ++i) u_warm_start_[i] << 0, 0, 0, G_;
 
-        is_completed_ = false;
-        is_launched_ = true;
+        // 使用状态机设置状态
+        mission_state_.set(MissionState::INITIALIZING);
         mission_state_pub_->publish(std::make_unique<std_msgs::msg::Bool>(std_msgs::msg::Bool().set__data(true)));
     }
 }
 
 void InterceptorNodeQuaternion::gimbal_callback(const sensor_msgs::msg::Imu::SharedPtr msg) 
 {
-    if (!is_launched_) 
+    if (!mission_state_.is_active()) 
         return;
     gimbal_received_ = true;
     {
-        std::lock_guard<std::mutex> lock(mtx_gimbal_);
+        std::unique_lock<std::shared_mutex> lock(mtx_gimbal_);  // 写入使用独占锁
         current_gimbal_orientation_ = Eigen::Quaterniond(msg->orientation.w, msg->orientation.x, msg->orientation.y, msg->orientation.z);
     }
     {
-        std::lock_guard<std::mutex> lock(mtx_drone_state_);
+        std::unique_lock<std::shared_mutex> lock(mtx_drone_state_);  // 写入使用独占锁
         // 利用协方差字段存储欧拉角 (r, p, y)
         drone_state_.tail<3>() << Eigen::Vector3d(msg->orientation_covariance[0], msg->orientation_covariance[1], msg->orientation_covariance[2]);
     }
@@ -246,7 +274,7 @@ void InterceptorNodeQuaternion::gimbal_callback(const sensor_msgs::msg::Imu::Sha
     
 void InterceptorNodeQuaternion::odom_callback(const nav_msgs::msg::Odometry::SharedPtr msg) 
 {
-    if (!is_launched_) 
+    if (!mission_state_.is_active()) 
         return;
     Eigen::Quaterniond q(msg->pose.pose.orientation.w, msg->pose.pose.orientation.x,
                          msg->pose.pose.orientation.y, msg->pose.pose.orientation.z);
@@ -263,7 +291,7 @@ void InterceptorNodeQuaternion::odom_callback(const nav_msgs::msg::Odometry::Sha
     Eigen::Vector3d vel_body(msg->twist.twist.linear.x, msg->twist.twist.linear.y, msg->twist.twist.linear.z);
     Eigen::Vector3d vel_world = q * vel_body;
     {
-        std::lock_guard<std::mutex> lock(mtx_drone_state_);
+        std::unique_lock<std::shared_mutex> lock(mtx_drone_state_);  // 写入使用独占锁
         // 提取位置
         drone_state_.head<3>() << msg->pose.pose.position.x, msg->pose.pose.position.y, msg->pose.pose.position.z;
         // 提取速度
@@ -282,28 +310,19 @@ void InterceptorNodeQuaternion::odom_callback(const nav_msgs::msg::Odometry::Sha
     update_control_history(rclcpp::Time(msg->header.stamp).seconds(), Eigen::Vector3d(
         msg->twist.twist.angular.x, msg->twist.twist.angular.y, msg->twist.twist.angular.z));
 
-    if (is_completed_) 
+    if (mission_state_.is_terminated()) 
         return;
     
     // 检查极端姿态值
-    Eigen::Vector3d euler_angles = to_euler_angles(q); // 仅用于检查
-    if (std::abs(euler_angles(0)) > att_limit_ || std::abs(euler_angles(1)) > att_limit_) {
-        RCLCPP_WARN(this->get_logger(), "Large tilt angle detected!! Roll: %.2f°, Pitch: %.2f°", 
-                    euler_angles(0) * 180.0/M_PI, euler_angles(1) * 180.0/M_PI);
-    }
-
-    // double qx = q.x(), qy = q.y();
-    // double cos_tilt_angle = 1 - 2*(qx*qx + qy*qy);
-    // double tilt_angle = std::acos(std::clamp(cos_tilt_angle, -1.0, 1.0));
-    // if (tilt_angle > att_limit_) 
-    // {
-    //     printf("Large tilt angle detected! Tilt: %.2f°\n", tilt_angle * 180.0/M_PI);
+    // Eigen::Vector3d euler_angles = to_euler_angles(q); // 仅用于检查
+    // if (std::abs(euler_angles(0)) > att_limit_ * M_PI/180.0 || std::abs(euler_angles(1)) > att_limit_ * M_PI/180.0) {
+    //     RCLCPP_WARN(this->get_logger(), "Large tilt angle detected!! Roll: %.2f°, Pitch: %.2f°", 
+    //                 euler_angles(0) * 180.0/M_PI, euler_angles(1) * 180.0/M_PI);
     // }
-
     if (!odom_received_)
     {
         {
-            std::lock_guard<std::mutex> lock(mtx_drone_state_);
+            std::unique_lock<std::shared_mutex> lock(mtx_drone_state_);  // 写入使用独占锁
             for (int i = 0; i <= N_HORIZON_; ++i)
                 x_warm_start_[i] = drone_state_;
         }
@@ -315,7 +334,7 @@ void InterceptorNodeQuaternion::odom_callback(const nav_msgs::msg::Odometry::Sha
 
 void InterceptorNodeQuaternion::bbox_callback(const vision_msgs::msg::Detection2D::SharedPtr msg) 
 { 
-    if (!odom_received_ || !is_launched_)
+    if (!odom_received_ || !mission_state_.is_active())
         return;
     {
         std::lock_guard<std::mutex> lock(mtx_bbox_);
@@ -325,7 +344,7 @@ void InterceptorNodeQuaternion::bbox_callback(const vision_msgs::msg::Detection2
 
     VectorX curr_drone_state;
     {
-        std::lock_guard<std::mutex> lock(mtx_drone_state_);
+        std::shared_lock<std::shared_mutex> lock(mtx_drone_state_);  // 读取使用共享锁
         curr_drone_state = drone_state_;
     }
 
@@ -333,13 +352,13 @@ void InterceptorNodeQuaternion::bbox_callback(const vision_msgs::msg::Detection2
     {
         TargetEKF::Bbox bbox;
         bbox.u = msg->bbox.center.position.x - cam_width_px_ / 2.0;
-        bbox.v = msg->bbox.center.position.y - cam_width_px_ / 2.0;
+        bbox.v = msg->bbox.center.position.y - cam_height_px_ / 2.0;
         bbox.size = msg->bbox.size_x;
         
         Eigen::Quaterniond gimbal_orientation;
         if (gimbal_received_)
         {
-            std::lock_guard<std::mutex> lock(mtx_gimbal_);
+            std::shared_lock<std::shared_mutex> lock(mtx_gimbal_);  // 读取使用共享锁
             gimbal_orientation = current_gimbal_orientation_;
         }
         else
@@ -349,7 +368,7 @@ void InterceptorNodeQuaternion::bbox_callback(const vision_msgs::msg::Detection2
             gimbal_orientation = Eigen::Quaterniond(yaw_rot);
         }
 
-        std::lock_guard<std::mutex> lock(mtx_ekf_);
+        std::unique_lock<std::shared_mutex> lock(mtx_ekf_);  // 写入使用独占锁
         if (ekf_->is_initialized())
             ekf_->update(bbox, curr_drone_state.head<3>(), gimbal_orientation);
         else
@@ -359,11 +378,13 @@ void InterceptorNodeQuaternion::bbox_callback(const vision_msgs::msg::Detection2
         }
     }
     
-    if (!timer_ && msg->header.frame_id != "" && !is_completed_) {
+    if (!timer_ && msg->header.frame_id != "" && mission_state_.is_active()) {
         timer_boot_count_ = 0;
         timer_ = this->create_wall_timer(std::chrono::duration<double>(dt_), 
             std::bind(&InterceptorNodeQuaternion::real_loop, this),
             timer_callback_group_);
+        // 转换到跟踪状态
+        mission_state_.transition(MissionState::INITIALIZING, MissionState::TRACKING);
     }
 }
 
@@ -389,19 +410,31 @@ void InterceptorNodeQuaternion::failsafe(bool hover)
 void InterceptorNodeQuaternion::real_loop() {
     if (!odom_received_) {
         RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 5000, "Waiting for odometry...");
-        // printf("Waiting for odometry...\n");
         return;
     }
+    
+    // 定期检查EKF健康状态
+    check_ekf_health();
+    
     Eigen::Vector3d pos_est {0.0, 0.0, 0.0};
     Eigen::Vector3d vel_est {0.0, 0.0, 0.0};
     {
-        std::lock_guard<std::mutex> lock(mtx_ekf_);
+        std::unique_lock<std::shared_mutex> lock(mtx_ekf_);  // predict修改状态，使用独占锁
         if (ekf_->is_initialized())
         {
             ekf_->predict(dt_);
             const auto& ekf_state = ekf_->get_state();
             pos_est = ekf_state.head<3>();
             vel_est = ekf_state.tail<3>();
+            
+            // 检查EKF状态是否有效
+            if (ekf_state.hasNaN()) {
+                RCLCPP_ERROR(this->get_logger(), "NaN in EKF state, reinitializing...");
+                ekf_ = std::make_unique<TargetEKF>(dt_, cam_focal_length_, target_physical_size_est_,
+                                                   bbox_pos_std_dev_, bbox_size_std_dev_,
+                                                   perspective_compensation_);
+                return;
+            }
         }
         else
             return; // 等待初始化
@@ -413,15 +446,17 @@ void InterceptorNodeQuaternion::simulation_loop()
 {
     if (!odom_received_) {
         RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 5000, "Waiting for odometry...");
-        // printf("Waiting for odometry...\n");
         return;
     }
     run_control_cycle(target_pos_true_, target_vel_true_);
     target_pos_true_ += target_vel_true_ * dt_; // 仅用于测试
     double distance = (target_pos_true_ - drone_state_.head<3>()).norm();
-    RCLCPP_INFO(this->get_logger(), "Distance to target: %.2f m", distance);
+    // 节流日志，每500ms输出一次
+    RCLCPP_INFO_THROTTLE(this->get_logger(), *this->get_clock(), 500, 
+        "Distance to target: %.2f m", distance);
     if (distance < interception_dist_) {
         RCLCPP_INFO(this->get_logger(), "[SUCCESS] Target intercepted at distance %.2f m. Stopping simulation.", distance);
+        transition_to_state(MissionState::COMPLETED, "Target intercepted");
         stop();
     }
 }
@@ -432,8 +467,7 @@ void InterceptorNodeQuaternion::stop()
         timer_->cancel();
         timer_ = nullptr;
     }
-    is_completed_ = true;
-    is_launched_ = false;
+    // 状态机由调用者设置（COMPLETED 或 ABORTED）
     failsafe(true);
     mission_state_pub_->publish(std::make_unique<std_msgs::msg::Bool>(std_msgs::msg::Bool().set__data(false)));
 }
@@ -442,22 +476,30 @@ void InterceptorNodeQuaternion::run_control_cycle(const Eigen::Vector3d &pos_est
 {
     VectorX curr_drone_state;
     {
-        std::lock_guard<std::mutex> lock(mtx_drone_state_);
+        std::shared_lock<std::shared_mutex> lock(mtx_drone_state_);  // 读取使用共享锁
         curr_drone_state = drone_state_;
     }
 
     if (is_visible_) {
         target_lost_counter_ = 0;
+        // 从盲飞状态恢复到跟踪状态
+        mission_state_.transition(MissionState::BLIND_FLIGHT, MissionState::TRACKING);
     } 
     else 
     {
+        if (target_lost_counter_ == 0) {
+            // 进入盲飞状态
+            mission_state_.transition(MissionState::TRACKING, MissionState::BLIND_FLIGHT);
+        }
         if (target_lost_counter_ % 10 == 0) {
             status_publisher_->publish(
                 mavros_msgs::msg::StatusText::WARNING, 
                 1, "Target lost. Blind flight", false);
         }
         target_lost_counter_++;
-        RCLCPP_WARN(this->get_logger(), "Target lost! Blind flight count: %d/%d", target_lost_counter_, N_HORIZON_);
+        // 使用节流日志减少I/O开销
+        RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 500, 
+            "Target lost! Blind flight count: %d/%d", target_lost_counter_, N_HORIZON_);
     }
 
     if (target_lost_counter_ > N_HORIZON_ * 2) {
@@ -466,16 +508,37 @@ void InterceptorNodeQuaternion::run_control_cycle(const Eigen::Vector3d &pos_est
         status_publisher_->publish(
             mavros_msgs::msg::StatusText::ERROR, 
             1, "Target lost. Aborting.", true);
+        transition_to_state(MissionState::ABORTED, "Target lost too long");
         stop();
         return;
+    }
+
+    // 近距离调试日志：当距离小于5米时打印详细信息
+    // double dist_to_target = (pos_est - curr_drone_state.head<3>()).norm();
+    // Eigen::Vector3d pos_error = pos_est - curr_drone_state.head<3>();
+    // if (dist_to_target < 5.0) {
+    //     RCLCPP_INFO(this->get_logger(), 
+    //         "CLOSE: dist=%.2fm, z_err=%.2f, visible=%d, vz=%.2f",
+    //         dist_to_target, pos_error.z(), is_visible_ ? 1 : 0, 
+    //         curr_drone_state(5));  // vz = 垂直速度
+    // }
+    
+    // 验证当前状态
+    if (!validate_state(curr_drone_state, "current_state")) {
+        failsafe(false);
+        return;
+    }
+
+    // 检查姿态安全
+    if (!check_attitude_safety(curr_drone_state)) {
+        // 姿态接近极限，记录但继续（MPC会处理）
     }
     
     // 使用延迟补偿的预测状态设置初始条件约束
     VectorX predicted_state = predict_delayed_state(curr_drone_state, control_execution_delay_);
-    
-    // Check for NaNs in predicted state
-    if (predicted_state.hasNaN()) {
-        RCLCPP_ERROR(this->get_logger(), "NaN detected in predicted state! Resetting solver.");
+    // 验证预测状态
+    if (!validate_state(predicted_state, "predicted_state")) {
+        RCLCPP_ERROR(this->get_logger(), "Invalid predicted state! Resetting solver.");
         failsafe(false);
         output_filter_->reset();
         // Reset warm start
@@ -516,59 +579,86 @@ void InterceptorNodeQuaternion::run_control_cycle(const Eigen::Vector3d &pos_est
     auto t_start = std::chrono::high_resolution_clock::now();
     int status = drone_interceptor_mpc_quat_acados_solve(acados_capsule_);
     auto t_end = std::chrono::high_resolution_clock::now();
-    RCLCPP_INFO(this->get_logger(), "ACADOS solve time: %ld us", std::chrono::duration_cast<std::chrono::microseconds>(t_end - t_start).count());
-    // printf("ACADOS solve time: %ld us\n", std::chrono::duration_cast<std::chrono::microseconds>(t_end - t_start).count());
+    
+    // 性能监控：计算平均求解时间
+    double solve_time_us = static_cast<double>(std::chrono::duration_cast<std::chrono::microseconds>(t_end - t_start).count());
+    solve_count_++;
+    avg_solve_time_us_ = avg_solve_time_us_ + (solve_time_us - avg_solve_time_us_) / solve_count_;
+    
+    // 节流日志输出，每秒1次
+    RCLCPP_INFO_THROTTLE(this->get_logger(), *this->get_clock(), 1000, 
+        "ACADOS solve: %.0f us (avg: %.0f us)", solve_time_us, avg_solve_time_us_);
     
     if (status != ACADOS_SUCCESS)
     {
-        RCLCPP_WARN(this->get_logger(), "ACADOS solver returned status %d.", status);
-        // printf("ACADOS solver returned status %d.\n", status);
-
-        solver_failure_counter_++;
-        if (solver_failure_counter_ > N_HORIZON_ * 0.5) {
-            RCLCPP_ERROR(this->get_logger(),
-                "ACADOS solver failed for too many times. Aborting.");
-            status_publisher_->publish(
-                mavros_msgs::msg::StatusText::ERROR, 
-                1, "ACADOS solver failed. Aborting.", true);    
-            stop();
+        // 使用增强的故障恢复策略
+        SolverRecoveryAction action = handle_solver_failure(status);
+        
+        switch (action) {
+            case SolverRecoveryAction::CONTINUE:
+                // 使用上一次的解，继续执行
+                RCLCPP_DEBUG(this->get_logger(), "Solver failed, using previous solution");
+                break;
+                
+            case SolverRecoveryAction::RESET_WARM:
+                // 重置热启动并发送failsafe
+                reset_solver_warm_start(curr_drone_state);
+                failsafe(false);
+                output_filter_->reset();
+                return;
+                
+            case SolverRecoveryAction::FAILSAFE:
+                // 进入failsafe模式
+                transition_to_state(MissionState::FAILSAFE, "Solver failures");
+                failsafe(true);
+                output_filter_->reset();
+                return;
+                
+            case SolverRecoveryAction::ABORT:
+                // 终止任务
+                RCLCPP_ERROR(this->get_logger(), "ACADOS solver failed too many times. Aborting.");
+                status_publisher_->publish(
+                    mavros_msgs::msg::StatusText::ERROR, 
+                    1, "ACADOS solver failed. Aborting.", true);    
+                transition_to_state(MissionState::ABORTED, "Solver failed");
+                stop();
+                return;
         }
-        else {
-            // 保持控制
-            failsafe(false);
-            output_filter_->reset();
-            for (int i = 0; i < N_HORIZON_; ++i) {
-                x_warm_start_[i] = curr_drone_state;
-                u_warm_start_[i] = VectorU(0, 0, 0, G_);
-            }
-            x_warm_start_[N_HORIZON_] = x_warm_start_[N_HORIZON_ - 1];
-        }
-        return;
+    } else {
+        // 求解成功，重置失败计数
+        consecutive_solver_failures_ = 0;
     }
-
-    solver_failure_counter_ = 0;
 
     VectorU u_optimal_raw;
     ocp_nlp_out_get(nlp_config_, nlp_dims_, nlp_out_, 0, "u", u_optimal_raw.data());
+    
+    // 验证控制输出
+    if (!validate_control(u_optimal_raw)) {
+        RCLCPP_WARN(this->get_logger(), "Invalid control output from solver, applying limits");
+    }
+    // 应用控制限幅
+    VectorU u_optimal_limited = apply_control_limits(u_optimal_raw);
 
-    // Warm start update
+    // Warm start update - 修复四元数归一化bug
     for (int i = 0; i < N_HORIZON_ - 1; ++i) {
         ocp_nlp_out_get(nlp_config_, nlp_dims_, nlp_out_, i + 1, "x", x_warm_start_[i].data());
-        auto quat = x_warm_start_[i].segment<4>(6);
-        quat = normalize_quaternion(quat);
+        // 正确的四元数归一化方式
+        x_warm_start_[i].segment<4>(6) = normalize_quaternion(x_warm_start_[i].segment<4>(6));
         ocp_nlp_out_get(nlp_config_, nlp_dims_, nlp_out_, i + 1, "u", u_warm_start_[i].data());
     }
     ocp_nlp_out_get(nlp_config_, nlp_dims_, nlp_out_, N_HORIZON_, "x", x_warm_start_[N_HORIZON_ - 1].data());
-    auto quat = x_warm_start_[N_HORIZON_ - 1].segment<4>(6);
-    quat = normalize_quaternion(quat);
+    // 正确的四元数归一化方式
+    x_warm_start_[N_HORIZON_ - 1].segment<4>(6) = normalize_quaternion(x_warm_start_[N_HORIZON_ - 1].segment<4>(6));
     x_warm_start_[N_HORIZON_] = x_warm_start_[N_HORIZON_ - 1];
     ocp_nlp_out_get(nlp_config_, nlp_dims_, nlp_out_, N_HORIZON_ - 1, "u", u_warm_start_[N_HORIZON_ - 1].data());
 
-    // 输出滤波
-    Eigen::VectorXd u_filtered_dynamic = output_filter_->filter(u_optimal_raw);
+    // 输出滤波 - 使用限幅后的控制量
+    Eigen::VectorXd u_filtered_dynamic = output_filter_->filter(u_optimal_limited);
     
-    if (timer_boot_count_++ < N_HORIZON_)  // 前几次不发布控制，等待滤波器稳定
+    if (timer_boot_count_++ < N_HORIZON_ * 1) {  // 前几次发送悬停控制，等待滤波器稳定
+        failsafe(false);  // 发送悬停指令而非不发送任何控制
         return;
+    }
 
     // 提取控制量
     double thrust_accel = u_filtered_dynamic(3);
@@ -621,20 +711,25 @@ VectorX InterceptorNodeQuaternion::predict_delayed_state(const VectorX& current_
     double current_time = this->get_clock()->now().seconds();
     double prediction_start_time = current_time - delay_time;
     
-    // 使用简单的积分来预测状态变化
-    // 这里使用常数角速度假设进行积分
-
     Eigen::Vector3d average_body_rates = Eigen::Vector3d::Zero();
     int valid_samples = 0;
     
     // 计算延迟时间窗口内的平均角速度
+    // 优化：使用二分查找找到起始位置
     {
-        std::lock_guard<std::mutex> lg(mtx_drone_state_);
-        for (const auto& control_entry : control_history_) {
-            if (control_entry.first >= prediction_start_time) {
-                average_body_rates += control_entry.second;
-                valid_samples++;
-            }
+        std::shared_lock<std::shared_mutex> lg(mtx_drone_state_);  // 读取使用共享锁
+        
+        // 使用lower_bound进行二分查找
+        auto it = std::lower_bound(
+            control_history_.begin(), control_history_.end(),
+            prediction_start_time,
+            [](const auto& entry, double t) { return entry.first < t; }
+        );
+        
+        // 从找到的位置开始累加
+        for (; it != control_history_.end(); ++it) {
+            average_body_rates += it->second;
+            valid_samples++;
         }
     }
     
@@ -666,6 +761,187 @@ void InterceptorNodeQuaternion::update_control_history(double current_time, cons
         control_history_.pop_front();
     }
 }
+
+// ============================================================================
+// 状态验证和安全检查函数
+// ============================================================================
+
+bool InterceptorNodeQuaternion::validate_state(const VectorX& state, const char* context) const {
+    // 检查NaN
+    if (state.hasNaN()) {
+        RCLCPP_ERROR(this->get_logger(), "NaN detected in state (%s)", context);
+        return false;
+    }
+    
+    // 检查四元数范数
+    double quat_norm = state.segment<4>(6).norm();
+    if (std::abs(quat_norm - 1.0) > 0.1) {
+        RCLCPP_WARN(this->get_logger(), "Quaternion norm deviation: %.4f (%s)", quat_norm, context);
+        return false;
+    }
+    
+    // 检查位置合理性 (防止极端值)
+    if (state.head<3>().norm() > 10000.0) {
+        RCLCPP_ERROR(this->get_logger(), "Position out of range (%s)", context);
+        return false;
+    }
+    
+    // 检查速度合理性
+    if (state.segment<3>(3).norm() > 100.0) {
+        RCLCPP_WARN(this->get_logger(), "Velocity unusually high: %.2f m/s (%s)", 
+            state.segment<3>(3).norm(), context);
+    }
+    
+    return true;
+}
+
+bool InterceptorNodeQuaternion::validate_control(const VectorU& u) const {
+    // 检查NaN
+    if (u.hasNaN()) {
+        RCLCPP_ERROR(this->get_logger(), "NaN detected in control output");
+        return false;
+    }
+    
+    // 检查推力范围
+    if (u(3) < ControlLimits::THRUST_MIN * 0.5 || u(3) > ControlLimits::THRUST_MAX * 1.5) {
+        RCLCPP_WARN(this->get_logger(), "Thrust out of expected range: %.2f m/s^2", u(3));
+        return false;
+    }
+    
+    // 检查角速度范围
+    if (std::abs(u(0)) > ControlLimits::ROLL_PITCH_RATE_MAX * 1.5 ||
+        std::abs(u(1)) > ControlLimits::ROLL_PITCH_RATE_MAX * 1.5 ||
+        std::abs(u(2)) > ControlLimits::YAW_RATE_MAX * 1.5) {
+        RCLCPP_WARN(this->get_logger(), "Body rates out of expected range: [%.2f, %.2f, %.2f]",
+            u(0), u(1), u(2));
+        return false;
+    }
+    
+    return true;
+}
+
+VectorU InterceptorNodeQuaternion::apply_control_limits(const VectorU& u_raw) const {
+    VectorU u_limited = u_raw;
+    
+    // 角速度限幅
+    u_limited(0) = std::clamp(u_limited(0), -ControlLimits::ROLL_PITCH_RATE_MAX, ControlLimits::ROLL_PITCH_RATE_MAX);
+    u_limited(1) = std::clamp(u_limited(1), -ControlLimits::ROLL_PITCH_RATE_MAX, ControlLimits::ROLL_PITCH_RATE_MAX);
+    u_limited(2) = std::clamp(u_limited(2), -ControlLimits::YAW_RATE_MAX, ControlLimits::YAW_RATE_MAX);
+    
+    // 推力限幅
+    u_limited(3) = std::clamp(u_limited(3), ControlLimits::THRUST_MIN, ControlLimits::THRUST_MAX);
+    
+    return u_limited;
+}
+
+bool InterceptorNodeQuaternion::check_attitude_safety(const VectorX& state) const {
+    Eigen::Vector4d quat = state.segment<4>(6);
+    double qx = quat(1), qy = quat(2);
+    
+    // 使用四元数直接计算倾斜角（避免欧拉角奇异性）
+    double cos_tilt = 1 - 2*(qx*qx + qy*qy);
+    double tilt_angle = std::acos(std::clamp(cos_tilt, -1.0, 1.0)) * 180.0/M_PI;
+    
+    if (tilt_angle > att_limit_) {
+        RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 500,
+            "Tilt angle %.1f deg exceeds limit %.1f deg", 
+            tilt_angle, att_limit_);
+        return false;
+    }
+    return true;
+}
+
+void InterceptorNodeQuaternion::check_ekf_health() {
+    std::unique_lock<std::shared_mutex> lock(mtx_ekf_);  // 可能重置，使用独占锁
+    
+    if (!ekf_ || !ekf_->is_initialized()) return;
+    
+    // 定期检查EKF健康状态 (每50次循环检查一次)
+    if (++ekf_health_check_counter_ < 50) return;
+    ekf_health_check_counter_ = 0;
+    
+    if (!ekf_->check_covariance_health()) {
+        RCLCPP_WARN(this->get_logger(), "EKF covariance divergence detected, resetting...");
+        ekf_->reset_covariance();
+    }
+    
+    if (ekf_->get_consecutive_failures() > 10) {
+        RCLCPP_WARN(this->get_logger(), "EKF consecutive update failures: %d", 
+            ekf_->get_consecutive_failures());
+    }
+}
+
+// ============================================================================
+// 求解器故障恢复和状态机辅助函数
+// ============================================================================
+
+SolverRecoveryAction InterceptorNodeQuaternion::handle_solver_failure(int status) {
+    consecutive_solver_failures_++;
+    
+    RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 500,
+        "ACADOS solver failed with status %d (consecutive: %d)", 
+        status, consecutive_solver_failures_);
+    
+    // 根据连续失败次数决定恢复策略
+    if (consecutive_solver_failures_ <= MAX_SOLVER_FAILURES_WARN) {
+        // 轻微故障：使用上一次解继续
+        return SolverRecoveryAction::CONTINUE;
+    }
+    else if (consecutive_solver_failures_ <= MAX_SOLVER_FAILURES_FAILSAFE) {
+        // 中等故障：重置热启动
+        RCLCPP_WARN(this->get_logger(), 
+            "Solver failures reached %d, resetting warm start", 
+            consecutive_solver_failures_);
+        return SolverRecoveryAction::RESET_WARM;
+    }
+    else if (consecutive_solver_failures_ <= MAX_SOLVER_FAILURES_ABORT) {
+        // 严重故障：进入failsafe模式
+        RCLCPP_ERROR(this->get_logger(), 
+            "Solver failures reached %d, entering failsafe mode", 
+            consecutive_solver_failures_);
+        status_publisher_->publish(
+            mavros_msgs::msg::StatusText::WARNING, 
+            1, "Solver issues, failsafe mode", true);
+        return SolverRecoveryAction::FAILSAFE;
+    }
+    else {
+        // 致命故障：终止任务
+        return SolverRecoveryAction::ABORT;
+    }
+}
+
+void InterceptorNodeQuaternion::reset_solver_warm_start(const VectorX& current_state) {
+    RCLCPP_INFO(this->get_logger(), "Resetting solver warm start...");
+    
+    for (int i = 0; i <= N_HORIZON_; ++i) {
+        x_warm_start_[i] = current_state;
+        // 确保四元数归一化
+        x_warm_start_[i].segment<4>(6) = normalize_quaternion(x_warm_start_[i].segment<4>(6));
+    }
+    for (int i = 0; i < N_HORIZON_; ++i) {
+        u_warm_start_[i] << 0, 0, 0, G_;
+    }
+    
+    // 部分重置失败计数，给予恢复机会
+    consecutive_solver_failures_ = consecutive_solver_failures_ / 2;
+}
+
+void InterceptorNodeQuaternion::transition_to_state(MissionState new_state, const char* reason) {
+    MissionState old_state = mission_state_.get();
+    
+    if (old_state == new_state) return;
+    
+    mission_state_.set(new_state);
+    
+    RCLCPP_INFO(this->get_logger(), "Mission state: %s -> %s (%s)",
+        MissionStateMachine::state_name(old_state),
+        MissionStateMachine::state_name(new_state),
+        reason);
+}
+
+// ============================================================================
+// StatusPublisher Implementation
+// ============================================================================
 
 StatusPublisher::StatusPublisher(rclcpp::Node &node, int hz)
 {

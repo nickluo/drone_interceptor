@@ -4,6 +4,7 @@
 #include <deque>
 #include <memory>
 #include <mutex>
+#include <shared_mutex>
 #include <queue>
 #include <tuple>
 #include <chrono>
@@ -60,7 +61,7 @@ private:
 
         this->declare_parameter<double>("physics.g", 9.81);
         this->declare_parameter<double>("physics.drag_coeff", 0.1);
-        this->declare_parameter<double>("limits.att_limit", M_PI / 4.0);
+        this->declare_parameter<double>("limits.att_warning_deg", 45.0);
         this->declare_parameter<int>("mpc.ctrl_rate", 50);
         this->declare_parameter<double>("mpc.tf", 1.0);
         this->declare_parameter<double>("mpc.v_desired", 25.0);
@@ -74,6 +75,7 @@ private:
         this->declare_parameter<double>("perception.bbox_pos_std_dev", 2.0);
         this->declare_parameter<double>("perception.bbox_size_std_dev", 5.0);
         this->declare_parameter<double>("perception.target_physical_size_est", 1.0);
+        this->declare_parameter<double>("perception.perspective_compensation", 1.0);  // 透视补偿因子
 
         this->declare_parameter<double>("control.execution_delay", 0.05);
         this->declare_parameter<double>("control.rate_tc", 0.05);
@@ -81,6 +83,7 @@ private:
         this->declare_parameter<double>("control.max_history_time_factor", 2.0);
 
         this->declare_parameter<int>("camera.width_px", 640);
+        this->declare_parameter<int>("camera.height_px", 640);  // Camera height in pixels
 
         // For fov based calculation
         this->declare_parameter<double>("camera.fov_deg", -1.0);
@@ -117,13 +120,26 @@ private:
     void update_control_history(double current_time, const Eigen::Vector3d& body_rates);
     Eigen::Vector3d get_history_body_rates(const Eigen::Vector3d &current_body_rates, double delay_time);
     VectorX predict_delayed_state(const VectorX& current_state, double delay_time);
+    
+    // 状态验证和安全检查函数
+    bool validate_state(const VectorX& state, const char* context) const;
+    bool validate_control(const VectorU& u) const;
+    VectorU apply_control_limits(const VectorU& u_raw) const;
+    bool check_attitude_safety(const VectorX& state) const;
+    void check_ekf_health();
+    
+    // 求解器故障恢复
+    SolverRecoveryAction handle_solver_failure(int status);
+    void reset_solver_warm_start(const VectorX& current_state);
+    void transition_to_state(MissionState new_state, const char* reason);
 
     // Member Variables
     bool use_simulation_;
     double G_, DRAG_COEFF_, V_DESIRED_, RATE_TC_, TRACKING_DISTANCE_, TRACKING_GAIN_;
     double bbox_pos_std_dev_, bbox_size_std_dev_;
     double target_physical_size_est_;
-    double cam_focal_length_, max_angle_rad_, cam_width_px_;
+    double perspective_compensation_;  // 透视补偿因子
+    double cam_focal_length_, max_angle_rad_, cam_width_px_, cam_height_px_;
     double control_execution_delay_;
     double ctrl_coeff_;
     double att_limit_;
@@ -156,6 +172,11 @@ private:
     double interception_dist_;
     int target_lost_counter_ = 0;
     int solver_failure_counter_ = 0;
+    
+    // 性能监控变量
+    double avg_solve_time_us_ = 0.0;
+    int solve_count_ = 0;
+    int ekf_health_check_counter_ = 0;
 
     std::unique_ptr<TargetEKF> ekf_;
     std::unique_ptr<EMAFilter> output_filter_;
@@ -171,18 +192,28 @@ private:
     std::vector<VectorX> x_warm_start_;  // 四元数状态热启动
     std::vector<VectorU> u_warm_start_;
 
-    std::mutex mtx_drone_state_;
-    std::mutex mtx_ekf_;
-    std::mutex mtx_bbox_;
-    std::mutex mtx_gimbal_;
+    // 使用shared_mutex减少读写竞争
+    mutable std::shared_mutex mtx_drone_state_;  // 无人机状态，频繁读取
+    mutable std::shared_mutex mtx_ekf_;          // EKF状态，频繁读取
+    mutable std::shared_mutex mtx_gimbal_;       // 云台状态，频繁读取
+    std::mutex mtx_bbox_;                        // bbox更新不频繁，保持mutex
 
     Eigen::Quaterniond current_gimbal_orientation_;
 
     vision_msgs::msg::Detection2D current_bbox_;
     
     bool is_visible_ = false;
-    bool is_completed_ = false;
+    
+    // 线程安全状态机
+    MissionStateMachine mission_state_;
+    
+    // 传感器接收状态
     std::atomic_bool odom_received_ {false};
     std::atomic_bool gimbal_received_ {false};
-    std::atomic_bool is_launched_ {false};
+    
+    // 求解器连续失败计数（用于故障恢复策略）
+    int consecutive_solver_failures_ = 0;
+    static constexpr int MAX_SOLVER_FAILURES_WARN = 5;
+    static constexpr int MAX_SOLVER_FAILURES_FAILSAFE = 10;
+    static constexpr int MAX_SOLVER_FAILURES_ABORT = 20;
 };
