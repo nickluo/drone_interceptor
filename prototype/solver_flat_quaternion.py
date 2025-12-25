@@ -35,13 +35,13 @@ TRACKING_DISTANCE = 0.0 # 期望跟踪距离 (m)
 TRACKING_GAIN = 1.0 * np.sqrt(TRACKING_DISTANCE / V_DESIRED) # 距离保持控制增益
 
 # ======== 感知模型参数 (Perception Model Parameters) ========
-PERCEPTION_DELAY = 0.05  # 感知延迟 (s)
-BBOX_POS_STD_DEV = 5.0  # 检测框中心位置的测量噪声标准差 (pixels)
-BBOX_SIZE_STD_DEV = 5.0 # 检测框尺寸的测量噪声标准差 (pixels)
+PERCEPTION_DELAY = 0.08  # 感知延迟 (s)
+BBOX_POS_STD_DEV = 3.0  # 检测框中心位置的测量噪声标准差 (pixels)
+BBOX_SIZE_STD_DEV = 3.0 # 检测框尺寸的测量噪声标准差 (pixels)
 
 # ======== 控制执行延时参数 (Control Execution Delay Parameters) ========
 CONTROL_EXECUTION_DELAY = 0.05  # 角速度控制执行延时 (s)
-RATE_TC = 0.01  # 角速度一阶响应时间常数 (s)
+RATE_TC = 0.02  # 角速度一阶响应时间常数 (s)
 
 # ======== 初始条件 (Initial Conditions) ========
 DRONE_INITIAL_STATE = np.array([0.0, 0.0, 10.0,     # Position (p_x, p_y, p_z)
@@ -50,18 +50,18 @@ DRONE_INITIAL_STATE = np.array([0.0, 0.0, 10.0,     # Position (p_x, p_y, p_z)
                                 0.0, 0.0, 0.0,     # Omega (wx, wy, wz)
                                 0.0, 0.0, 0.0])    # Gimbal (r, p, y)
 TARGET_INITIAL_POS = np.array([100.0, 20.0, 15.0])
-TARGET_VELOCITY = np.array([-10.0, 10.0, 0.5]) # 目标做匀速直线运动
+TARGET_VELOCITY = np.array([-10.0, 5.0, 0.5]) # 目标做匀速直线运动
 # TARGET_INITIAL_POS = np.array([100.0, 20.0, 15.0])
 # TARGET_VELOCITY = np.array([0.0, 0.0, 0.0]) # 目标静止
 
 # ======== 目标与相机物理属性 (Target & Camera Properties) ========
 # --- 目标 ---
 TARGET_PHYSICAL_SIZE_TRUTH = 0.5  # 目标的真实物理尺寸 (m), 用于相机模型
-TARGET_PHYSICAL_SIZE_EST = 0.6    # 状态估计器使用的目标尺寸 (m), 可模拟估计误差
+TARGET_PHYSICAL_SIZE_EST = 0.7    # 状态估计器使用的目标尺寸 (m), 可模拟估计误差
 
 # --- 相机 ---
 CAM_FOV_DEG = 30.0  # 相机水平视场角 (degrees)
-CAM_FOCAL_LENGTH_PHYSICAL = 12.0 # 物理焦距 (mm)
+CAM_FOCAL_LENGTH_PHYSICAL = 16.0 # 物理焦距 (mm)
 CAM_PIXEL_SIZE = 3.45            # 像素尺寸 (um)
 # f(pixel) = f(mm) * 1000 / pixel_size(um)
 CAM_FOCAL_LENGTH = CAM_FOCAL_LENGTH_PHYSICAL * 1000 / CAM_PIXEL_SIZE # 焦距 (in pixels)
@@ -71,9 +71,9 @@ CAM_FOCAL_LENGTH = CAM_FOCAL_LENGTH_PHYSICAL * 1000 / CAM_PIXEL_SIZE # 焦距 (i
 W_LOS = 100.0             # 视线误差权重
 W_ALIGN = 0.1             # 速度对齐权重
 W_CLOSING_SPEED = 0.1     # 接近速度权重
-W_RATES = 0.000001        # 角速度控制量权重
+W_RATES = 0.00001        # 角速度控制量权重
 W_TILT = 0.000001         # 倾斜角误差权重
-W_U_ALPHA = 0.0001        # 角速度变化率权重
+W_U_ALPHA = 0.001        # 角速度变化率权重
 W_U_THRUST = 0.0001       # 油门控制量权重
 
 # ======== 云台参数 (Gimbal Parameters) ========

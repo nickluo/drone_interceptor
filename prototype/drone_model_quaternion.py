@@ -77,7 +77,10 @@ class DroneModelQuaternion:
             ca.horzcat(wx,  0,   wz, -wy),
             ca.horzcat(wy, -wz,  0,   wx),
             ca.horzcat(wz,  wy, -wx,  0))
-        quat_dot = 0.5 * omega_quat_matrix @ quat
+        # quat_dot = 0.5 * omega_quat_matrix @ quat
+        alpha_baumgarte = 1.0  # 稳定化系数
+        quat_norm_sq = quat.T @ quat
+        quat_dot = 0.5 * omega_quat_matrix @ quat - alpha_baumgarte * (quat_norm_sq - 1) * quat
 
         omega_dot = ca.vertcat(
             (u_wx - wx) / rate_tc, 
@@ -127,12 +130,23 @@ class DroneModelQuaternion:
             ca.horzcat(0, 0, 1)
         ) 
         los_C =  R_G_C @ R_W_G @ los_W
-        # los_error_y = ca.atan2(los_C[1], los_C[0]) / ca.pi
-        # los_error_z = ca.atan2(los_C[2], los_C[0]) / ca.pi
-        coeff = ca.tanh(los_C[0]*0.25)
-        los_error = W_los * coeff * ca.vertcat(
-            los_C[1]/los_C[0], 
-            los_C[2]/los_C[0])
+        # 处理los_C[0]可能为负值的情况（目标在相机后方）
+        # 使用平滑的绝对值函数: sqrt(x^2 + eps) 近似 |x|
+        los_C_x_safe = ca.fmax(ca.fabs(los_C[0]), 1.0)   # 防止除零，最小距离1.0m
+        
+        # 惩罚系数：基于预计到达时间(TTA)动态调整
+        # 当TTA < 2s时，惩罚系数从10开始指数增长
+        # 公式: z_coeff = 10 * (1 + exp(2 - TTA)) 当TTA<2时快速增大
+        dist_to_target = ca.sqrt(los_W.T @ los_W + 1e-6)
+        relative_vel_W = vel - target_vel
+        relative_vel_sq = relative_vel_W.T @ relative_vel_W
+        relative_vel = ca.sqrt(relative_vel_sq + 1e-6)
+        time_to_arrival = dist_to_target / relative_vel
+        penalty_coeff = 1.0 + 10.0 * ca.exp(2.0 - time_to_arrival)
+        
+        los_error = W_los * penalty_coeff * ca.vertcat(
+            los_C[1] / los_C_x_safe, 
+            los_C[2] / los_C_x_safe)
         
         # 2. 速度对齐误差 (Alignment Error)
         # drone_vel_W = vel
@@ -142,13 +156,9 @@ class DroneModelQuaternion:
         # dist = ca.sqrt(dist_sq + 1e-6)
         # v_norm = drone_vel_W / speed
         # los_norm = los_W / dist
-
-        relative_vel_W = vel - target_vel
-        relative_vel_sq = relative_vel_W.T @ relative_vel_W
-        vel = ca.sqrt(relative_vel_sq + 1e-6)
-        v_norm = relative_vel_W / vel
-        dist = ca.sqrt(los_W.T @ los_W + 1e-6)
-        los_norm = los_W / dist
+        
+        v_norm = relative_vel_W / relative_vel
+        los_norm = los_W / dist_to_target
 
         # coeff_align = ca.tanh(dist*0.25)
         # alignment_error = 1 - ca.dot(v_norm, los_norm)
@@ -174,7 +184,13 @@ class DroneModelQuaternion:
         # closing_speed_error = v_desired - closing_speed_cam_x
         # closing_speed_error = 1 - closing_speed_cam_x / v_desired
         # closing_speed_error = W_closing_speed * (1 - closing_speed_x / v_desired)
-        closing_speed_error = W_closing_speed * (v_desired - closing_speed_x)
+        
+        # 当接近速度超过期望速度时(差值为负)，增加惩罚系数
+        # 使用 1 + max(0, (closing_speed_x - v_desired) / v_desired) 作为超速惩罚
+        speed_diff = v_desired - closing_speed_x
+        # overspeed_penalty = 1.0 + 100.0 * ca.fmax(0, -speed_diff / v_desired)  # 超速时惩罚系数增大
+        overspeed_penalty = 1.0 + 10.0 / (1.0 + ca.exp(20.0 * speed_diff / v_desired))  # 使用平滑函数避免不连续
+        closing_speed_error = W_closing_speed * overspeed_penalty * speed_diff
         radial_speed_error = W_closing_speed * radial_speed_sq
         
 
@@ -213,32 +229,12 @@ class DroneModelQuaternion:
 
         # cos_tilt_angle = 1 - 2*(qx**2 + qy**2)  # 当前倾斜角的余弦值
         # tilt_error = W_tilt * ((1-cos_tilt_angle) / (1-cos_tilt_constraint))
-        tilt_error = W_tilt * 2*(qx**2 + qy**2) / (1-cos_tilt_constraint)
+        tilt_ratio = 2*(qx**2 + qy**2) / (1-cos_tilt_constraint)
+        # tilt_error = W_tilt * tilt_ratio      # Original linear penalty
+        # tilt_error = W_tilt * ca.fmax(0, tilt_ratio - 0.8) ** 2  # 只在接近边界时惩罚
+        # # 或
+        tilt_error = W_tilt * tilt_ratio * ca.exp(tilt_ratio - 1)  # 指数增长
 
-        # 软约束：当倾斜角超过限制时施加惩罚
-        # 由于cos是递减的，cos(θ) < cos(θ_max) 意味着 θ > θ_max
-        # tilt_error = ca.fmax(0, cos_tilt_constraint - cos_tilt_angle)  # 只有超过限制时才惩罚
-        # # tilt_error_ratio = 1 - cos_tilt_angle/cos_tilt_constraint
-        # tilt_error = ca.fmax(0, tilt_error_ratio)
-        # tilt_error = 0.5 * (tilt_error_ratio + ca.fabs(tilt_error_ratio))  # Relu形式
-        # # tilt_error = W_tilt * (tilt_error_ratio + ca.fabs(tilt_error_ratio))
-        
-        # --- 构造代价向量 y ---
-        # 非线性最小二乘代价: cost = y^T * W * y
-        # cost_expr_y = ca.vertcat(
-        #     W_los * los_error_y, 
-        #     W_los * los_error_z,
-        #     W_align * alignment_error, 
-        #     W_closing_speed * closing_speed_error,
-        #     W_tilt * tilt_error,  # 姿态约束权重
-        #     W_u_rates * wx_soft_constraint,  # 角速度软约束
-        #     W_u_rates * wy_soft_constraint,
-        #     W_u_rates * wz_soft_constraint,  # 偏航角速度软约束权重更高
-        #     W_u_rates_change * wx_change,  # 使用单独的权重惩罚角速度变化率
-        #     W_u_rates_change * wy_change,  # 使用单独的权重惩罚角速度变化率
-        #     W_u_rates_change * 2.0 * wz_change,  # 偏航角速度变化惩罚更重
-        #     W_u_thrust * thrust_accel_error
-        # )
 
         cost_expr_y = ca.vertcat(
             los_error, 
@@ -250,22 +246,7 @@ class DroneModelQuaternion:
             u_alpha,
             thrust_accel_error
         )
-        
-        # 终端代价 (Terminal Cost)，在最后一步权重更高
-        # cost_expr_y_e = ca.vertcat(
-        #     W_los * ca.sqrt(10) * los_error_y, 
-        #     W_los * ca.sqrt(10) * los_error_z,
-        #     W_align * ca.sqrt(5) * alignment_error, 
-        #     W_closing_speed * ca.sqrt(5) * closing_speed_error,
-        #     W_tilt *  ca.sqrt(10) * tilt_error  
-        # )
-        # cost_expr_y_e = ca.vertcat(
-        #     W_los * los_error_y, 
-        #     W_los * los_error_z,
-        #     W_align * alignment_error, 
-        #     W_closing_speed * closing_speed_error,
-        #     W_tilt * tilt_error
-        # )
+
         cost_expr_y_e = ca.vertcat(
             los_error, 
             alignment_error, 
@@ -349,7 +330,7 @@ class DroneModelQuaternion:
         ocp.solver_options.hessian_approx = 'GAUSS_NEWTON'
         ocp.solver_options.integrator_type = 'ERK'
         # ocp.solver_options.sim_method_num_stages = 2 # 减少积分级数以加速 (RK2)
-        ocp.solver_options.sim_method_num_steps = 1
+        # ocp.solver_options.sim_method_num_steps = 1  # 每个控制间隔仅一步积分
         ocp.solver_options.qp_solver_cond_N = 5 # 部分冷凝视界
         ocp.solver_options.nlp_solver_type = 'SQP_RTI'
         ocp.solver_options.N_horizon = self.constants['N_HORIZON']
@@ -357,6 +338,15 @@ class DroneModelQuaternion:
         ocp.solver_options.ext_fun_compile_flags = '-O3'
         ocp.solver_options.nlp_solver_max_iter = 1 # SQP_RTI 只需要1次迭代
         ocp.solver_options.print_level = 0
+
+        # 对于高频控制(50Hz+)，可以考虑：
+        ocp.solver_options.qp_solver_warm_start = 2  # 热启动级别
+        ocp.solver_options.regularize_method = 'PROJECT'  # QP正则化
+        ocp.solver_options.globalization = 'FIXED_STEP'  # RTI固定步长
+
+        # 如果四元数动力学需要更高精度：
+        ocp.solver_options.sim_method_num_stages = 4  # RK4
+        ocp.solver_options.sim_method_num_steps = 2   # 每步2次积分
         return ocp
 
     def generate_solver(self)->AcadosOcpSolver:
