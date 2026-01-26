@@ -4,6 +4,8 @@
 #include <atomic>
 #include <algorithm>
 #include <stdexcept>
+#include <deque>
+#include <array>
 #include <Eigen/Dense>
 
 // Define fixed-size vector/matrix types for performance
@@ -19,6 +21,7 @@ enum class MissionState : uint8_t {
     IDLE,           // 空闲状态，等待任务启动
     INITIALIZING,   // 初始化中，等待传感器数据
     TRACKING,       // 跟踪目标中
+    TERMINAL_GUIDANCE, // 末制导 (PN)
     BLIND_FLIGHT,   // 目标丢失，盲飞状态
     FAILSAFE,       // 故障安全模式
     COMPLETED,      // 任务完成
@@ -57,7 +60,7 @@ public:
     // 检查是否可以进行控制
     bool can_control() const {
         MissionState s = get();
-        return s == MissionState::TRACKING || s == MissionState::BLIND_FLIGHT;
+        return s == MissionState::TRACKING || s == MissionState::BLIND_FLIGHT || s == MissionState::TERMINAL_GUIDANCE;
     }
     
     // 检查任务是否活跃
@@ -65,7 +68,7 @@ public:
         MissionState s = get();
         return s == MissionState::INITIALIZING || 
                s == MissionState::TRACKING || 
-               s == MissionState::BLIND_FLIGHT;
+               s == MissionState::BLIND_FLIGHT || s == MissionState::TERMINAL_GUIDANCE;
     }
     
     // 检查是否已终止
@@ -82,6 +85,7 @@ public:
             case MissionState::IDLE: return "IDLE";
             case MissionState::INITIALIZING: return "INITIALIZING";
             case MissionState::TRACKING: return "TRACKING";
+            case MissionState::TERMINAL_GUIDANCE: return "TERMINAL_GUIDANCE";
             case MissionState::BLIND_FLIGHT: return "BLIND_FLIGHT";
             case MissionState::FAILSAFE: return "FAILSAFE";
             case MissionState::COMPLETED: return "COMPLETED";
@@ -95,7 +99,7 @@ private:
 };
 
 // ============================================================================
-// EMAFilter Class (from exp_filter.py)
+// EMAFilter Class (from exp_filter.py) - 向量版本
 // ============================================================================
 class EMAFilter {
 public:
@@ -136,7 +140,393 @@ private:
 };
 
 // ============================================================================
-// TargetEKF Class (from target_ekf.py)
+// EMAFilterTemplate - 模板版本，用于固定通道数的EMA滤波
+// ============================================================================
+template<std::uint32_t N = 1>
+class EMAFilterTemplate {
+public:
+    explicit EMAFilterTemplate(int n) : alpha_(2.0 / (n + 1)) {
+        reset();
+    }
+    
+    void reset() {
+        data_.fill(0);
+        initialized_.fill(false);
+    }
+    
+    double operator[](int index) const {
+        return data_[index];
+    }
+    
+    bool check(int index) const {
+        return initialized_[index];
+    }
+    
+    double filter(double val, int index = 0) {
+        if (!initialized_[index]) {
+            data_[index] = val;
+            initialized_[index] = true;
+        } else {
+            data_[index] = alpha_ * val + (1.0 - alpha_) * data_[index];
+        }
+        return data_[index];
+    }
+
+private:
+    double alpha_;
+    std::array<double, N> data_;
+    std::array<bool, N> initialized_;
+};
+
+// ============================================================================
+// 用于存储相机内参的结构体
+// ============================================================================
+struct CameraIntrinsics {
+    double fx, fy, px, py;
+};
+
+// ============================================================================
+// DroneEKF Class - 6-State CV Model in World Frame (Stable design)
+// State: [x, y, z, vx, vy, vz] (World Frame) - Same as TargetEKF
+// Measurement: [cx, cy, w, h] (Image Plane)
+// ============================================================================
+class DroneEKF {
+public:
+    using Vector6d = Eigen::Matrix<double, 6, 1>;
+    using Matrix6d = Eigen::Matrix<double, 6, 6>;
+    using Matrix4x6d = Eigen::Matrix<double, 4, 6>;
+    using Matrix6x4d = Eigen::Matrix<double, 6, 4>;
+
+    struct Bbox {
+        double cx, cy, w, h;
+    };
+
+    struct LOS {
+        double azimuth, elevation, azimuth_rate, elevation_rate;
+    };
+
+    struct StateHistory {
+        int64_t timestamp;
+        Vector6d state;
+        Matrix6d covariance;
+        Eigen::Vector3d imu_input;
+    };
+
+    /**
+     * @brief Constructor
+     */
+    DroneEKF(const CameraIntrinsics& intrinsics,
+             const Eigen::Vector2d& process_noise_std,
+             const Eigen::Vector2d& measurement_noise_std,
+             int imu_freq,
+             double estimated_detection_latency,
+             double target_size_est = 0.5,
+             double perspective_compensation = 1.0)
+        : intrinsics_(intrinsics),
+          max_buffer_size_(static_cast<size_t>(imu_freq * estimated_detection_latency * 2)),
+          dt_(1000000 / imu_freq),
+          ema_filter_(imu_freq / 10),
+          target_size_est_(target_size_est),
+          perspective_compensation_(perspective_compensation),
+          is_initialized_(false),
+          last_timestamp_(-1)
+    {
+        if (max_buffer_size_ < 10) max_buffer_size_ = 10;
+
+        x_.setZero();
+
+        // CV model: Use position and velocity noise only
+        double std_pos = process_noise_std(0);
+        double std_vel = process_noise_std(1);
+
+        Vector6d q_diag;
+        q_diag << std_pos*std_pos, std_pos*std_pos, std_pos*std_pos,
+                  std_vel*std_vel, std_vel*std_vel, std_vel*std_vel;
+        Q_base_ = q_diag.asDiagonal();
+        P_ = Q_base_ * 100.0;
+
+        double std_meas_pos = measurement_noise_std(0);
+        double std_meas_size = measurement_noise_std(1);
+        Eigen::Vector4d r_diag;
+        r_diag << std_meas_pos*std_meas_pos, std_meas_pos*std_meas_pos,
+                  std_meas_size*std_meas_size, std_meas_size*std_meas_size;
+        R_ = r_diag.asDiagonal();
+    }
+
+    /**
+     * @brief Predict step (World Frame CV Model)
+     */
+    void predict(int64_t current_time_us, const Eigen::Vector3d& imu_omega_flu) {
+        if (!is_initialized_) return;
+
+        if (current_time_us > 0) {
+            if (last_timestamp_ > 0) {
+                dt_ = current_time_us - last_timestamp_;
+            }
+            last_timestamp_ = current_time_us;
+        }
+
+        const double dt = dt_ * 1e-6;
+
+        // F matrix for CV model: x_{k+1} = F * x_k
+        Matrix6d F = Matrix6d::Identity();
+        F(0,3) = dt; F(1,4) = dt; F(2,5) = dt;
+
+        x_ = F * x_;
+        
+        // Discrete-time process noise (based on continuous white noise acceleration)
+        // Q = integral of F * G * Q_c * G^T * F^T
+        double dt2 = dt * dt;
+        double dt3 = dt2 * dt;
+        Matrix6d Q = Matrix6d::Zero();
+        
+        // Position variance contribution
+        Q(0,0) = dt3/3.0; Q(1,1) = dt3/3.0; Q(2,2) = dt3/3.0;
+        // Velocity variance contribution  
+        Q(3,3) = dt; Q(4,4) = dt; Q(5,5) = dt;
+        // Cross-correlation
+        Q(0,3) = dt2/2.0; Q(1,4) = dt2/2.0; Q(2,5) = dt2/2.0;
+        Q(3,0) = dt2/2.0; Q(4,1) = dt2/2.0; Q(5,2) = dt2/2.0;
+        
+        // Scale by base process noise
+        double q_scale = Q_base_(3,3); // velocity variance as scale
+        Q *= q_scale;
+        
+        P_ = F * P_ * F.transpose() + Q;
+
+        if (current_time_us > 0) {
+            history_buffer_.push_back({current_time_us, x_, P_, imu_omega_flu});
+            if (history_buffer_.size() > max_buffer_size_) {
+                history_buffer_.pop_front();
+            }
+        }
+    }
+
+    /**
+     * @brief Update step with 2D Bbox and 3D Drone State
+     */
+    void update(int64_t ts, const Bbox& measurement, 
+                const Eigen::Vector3d& drone_pos, 
+                const Eigen::Quaterniond& q_C_W) {
+        
+        last_drone_pos_ = drone_pos;
+        last_q_C_W_ = q_C_W;
+
+        if (!is_initialized_) {
+            initialize(measurement, drone_pos, q_C_W);
+            return;
+        }
+
+        auto it = std::min_element(history_buffer_.begin(), history_buffer_.end(),
+            [&](const StateHistory& a, const StateHistory& b) {
+                return std::abs(a.timestamp - ts) < std::abs(b.timestamp - ts);
+            });
+
+        if (it != history_buffer_.end()) {
+            // Rewind to closest historical state
+            x_ = it->state;
+            P_ = it->covariance;
+            
+            // Update with measurement
+            update_internal(measurement, drone_pos, q_C_W);
+
+            // Replay predictions from that point
+            for (auto replay_it = std::next(it); replay_it != history_buffer_.end(); ++replay_it) {
+                dt_ = replay_it->timestamp - std::prev(replay_it)->timestamp;
+                predict(-1.0, replay_it->imu_input);
+            }
+        } else {
+            update_internal(measurement, drone_pos, q_C_W);
+        }
+    }
+    
+    void update(int64_t ts, const Bbox& measurement) {
+        update(ts, measurement, last_drone_pos_, last_q_C_W_);
+    }
+
+    Bbox get_bbox() const {
+        return project_to_bbox(x_, last_drone_pos_, last_q_C_W_);
+    }
+    
+    Bbox project_to_bbox(const Vector6d& state, 
+                         const Eigen::Vector3d& drone_pos, 
+                         const Eigen::Quaterniond& q_C_W) const {
+        Bbox b;
+        Eigen::Vector3d P_W = state.head<3>();
+        Eigen::Vector3d P_rel_W = P_W - drone_pos;
+        Eigen::Vector3d P_C = q_C_W.inverse() * P_rel_W;
+        
+        if (P_C.x() < 0.1) P_C.x() = 0.1;
+
+        b.cx = intrinsics_.px - P_C.y() * intrinsics_.fx / P_C.x();
+        b.cy = intrinsics_.py - P_C.z() * intrinsics_.fy / P_C.x();
+        b.w = (intrinsics_.fx * target_size_est_) / P_C.x();
+        b.h = (intrinsics_.fy * target_size_est_) / P_C.x();
+        return b;
+    }
+
+    bool is_healthy() const {
+        return !x_.hasNaN() && P_.diagonal().maxCoeff() < 1e6;
+    }
+    
+    Vector6d get_state() const { return x_; }
+    
+    bool is_initialized() const { return is_initialized_; }
+    
+    void reset() {
+        is_initialized_ = false;
+        x_.setZero();
+        P_ = Q_base_ * 100;
+        history_buffer_.clear();
+        ema_filter_.reset();
+    }
+
+    struct WorldState {
+        Eigen::Vector3d pos;
+        Eigen::Vector3d vel;
+    };
+
+    WorldState get_est_world_state(const Eigen::Vector3d& drone_pos, 
+                                   const Eigen::Vector3d& drone_vel,
+                                   const Eigen::Quaterniond& q_C_W,
+                                   const Eigen::Vector3d& omega_body) const {
+        WorldState result;
+        result.pos = x_.head<3>();
+        result.vel = x_.tail<3>();
+        return result;
+    }
+    
+    LOS state_to_los(bool compensate_rotation = true) {
+        Eigen::Vector3d P_rel = x_.head<3>() - last_drone_pos_;
+        Eigen::Vector3d P_C = last_q_C_W_.inverse() * P_rel; 
+        
+        double norm_x = P_C.x();
+        double norm_y = P_C.y();
+        double norm_z = P_C.z();
+        LOS l;
+        l.azimuth = std::atan2(norm_y, norm_x);
+        l.elevation = std::atan2(norm_z, norm_x);
+        l.azimuth_rate = 0;
+        l.elevation_rate = 0;
+        return l;
+    }
+
+private:
+    void initialize(const Bbox& z, const Eigen::Vector3d& drone_pos, const Eigen::Quaterniond& q_C_W) {
+        Eigen::Vector3d P_W = noisy_bbox_to_pos_init(z, drone_pos, q_C_W);
+        x_.setZero();
+        x_.head<3>() = P_W;
+        // Initialize velocity to zero
+        x_.tail<3>().setZero();
+        is_initialized_ = true;
+        
+        last_drone_pos_ = drone_pos;
+        last_q_C_W_ = q_C_W;
+    }
+
+    void update_internal(const Bbox& z_meas, 
+                         const Eigen::Vector3d& drone_pos, 
+                         const Eigen::Quaterniond& q_C_W) {
+        
+        // 1. Predict Measurement z_pred
+        Eigen::Vector3d P_W = x_.head<3>();
+        Eigen::Vector3d P_rel_W = P_W - drone_pos;
+        Eigen::Matrix3d R_W_to_C = q_C_W.toRotationMatrix().transpose();
+        Eigen::Vector3d P_C = R_W_to_C * P_rel_W;
+        
+        double xc = P_C.x();
+        double yc = P_C.y();
+        double zc = P_C.z();
+        
+        if (xc < 0.1) return; // Behind camera
+
+        Eigen::Vector4d z_pred;
+        z_pred(0) = intrinsics_.px - yc * intrinsics_.fx / xc;
+        z_pred(1) = intrinsics_.py - zc * intrinsics_.fy / xc;
+        z_pred(2) = intrinsics_.fx * target_size_est_ / xc;
+        z_pred(3) = intrinsics_.fy * target_size_est_ / xc;
+
+        // 2. Jacobian H (4x6)
+        double xc2 = xc * xc;
+        
+        Eigen::Matrix<double, 4, 3> J_cam;
+        // du/dP_C
+        J_cam.row(0) << yc * intrinsics_.fx / xc2, -intrinsics_.fx / xc, 0.0;
+        // dv/dP_C
+        J_cam.row(1) << zc * intrinsics_.fy / xc2, 0.0, -intrinsics_.fy / xc;
+        // dw/dP_C
+        J_cam.row(2) << -intrinsics_.fx * target_size_est_ / xc2, 0.0, 0.0;
+        // dh/dP_C
+        J_cam.row(3) << -intrinsics_.fy * target_size_est_ / xc2, 0.0, 0.0;
+        
+        Matrix4x6d H = Matrix4x6d::Zero();
+        H.block<4,3>(0,0) = J_cam * R_W_to_C;
+        // Velocity states have zero Jacobian (not directly observed)
+        
+        // 3. Kalman Update
+        Eigen::Vector4d z_vec;
+        z_vec << z_meas.cx, z_meas.cy, z_meas.w, z_meas.h;
+        Eigen::Vector4d y = z_vec - z_pred;
+        
+        Eigen::Matrix4d S = H * P_ * H.transpose() + R_;
+        
+        // Use LLT decomposition for numerical stability
+        Eigen::LLT<Eigen::Matrix4d> llt_S(S);
+        if (llt_S.info() != Eigen::Success) {
+            return; // Skip update if S is not positive definite
+        }
+        
+        Matrix6x4d K = P_ * H.transpose() * llt_S.solve(Eigen::Matrix4d::Identity());
+        
+        x_ = x_ + K * y;
+        P_ = (Matrix6d::Identity() - K * H) * P_;
+        
+        // Ensure P stays symmetric
+        P_ = (P_ + P_.transpose()) * 0.5;
+    }
+    
+    Eigen::Vector3d noisy_bbox_to_pos_init(const Bbox& bbox, 
+                                           const Eigen::Vector3d& drone_pos, 
+                                           const Eigen::Quaterniond& q_C_W) const {
+        double bbox_size = std::max(bbox.w, bbox.h);
+        if (bbox_size < 1e-6) bbox_size = 1.0;
+        double depth = intrinsics_.fx * target_size_est_ / bbox_size;
+        
+        double u_rel = bbox.cx - intrinsics_.px;
+        double v_rel = bbox.cy - intrinsics_.py;
+        
+        double yc = -u_rel * depth / intrinsics_.fx;
+        double zc = -v_rel * depth / intrinsics_.fy;
+        double xc = depth;
+        
+        Eigen::Vector3d P_C(xc, yc, zc);
+        return drone_pos + q_C_W * P_C;
+    }
+
+    Vector6d x_;
+    Matrix6d P_;
+    Matrix6d Q_base_;
+    Eigen::Matrix4d R_;
+
+    CameraIntrinsics intrinsics_;
+    std::deque<StateHistory> history_buffer_;
+    size_t max_buffer_size_;
+
+    bool is_initialized_;
+    int64_t last_timestamp_;
+    int64_t dt_;
+
+    EMAFilterTemplate<2> ema_filter_;
+    
+    double target_size_est_;
+    double perspective_compensation_;
+    
+    Eigen::Vector3d last_drone_pos_;
+    Eigen::Quaterniond last_q_C_W_;
+};
+
+// ============================================================================
+// TargetEKF Class (保留用于兼容性，建议使用DroneEKF)
 // ============================================================================
 class TargetEKF {
 public:
@@ -189,61 +579,6 @@ public:
         // 预测协方差
         P_ = F_ * P_ * F_.transpose() + Q_;
     }
-
-    // void update(const Bbox& z, const Eigen::Vector3d& drone_pos, double psi) {
-    //     if (!is_initialized_) return;
-        
-    //     // --- 计算雅可比矩阵 H ---
-    //     Eigen::Vector3d p_target = x_.head<3>();
-    //     Eigen::Vector3d los_W = p_target - drone_pos;
-
-    //     double cpsi = std::cos(psi);
-    //     double spsi = std::sin(psi);
-    //     Eigen::Matrix3d R_W_C;
-    //     R_W_C <<  cpsi, spsi, 0,
-    //              -spsi, cpsi, 0,
-    //                  0,    0, 1;
-        
-    //     Eigen::Vector3d los_C = R_W_C * los_W;
-    //     double x_c = los_C(0), y_c = los_C(1), z_c = los_C(2);
-
-    //     if (x_c < 1e-3) return; // 避免除以零
-
-    //     // 预测的测量值
-    //     Eigen::Vector3d z_pred;
-    //     z_pred << focal_length_ * y_c / x_c,
-    //               focal_length_ * z_c / x_c,
-    //               focal_length_ * target_size_est_ / x_c;
-
-    //     // 计算雅可比矩阵 H (dh/d(p_target))
-    //     Eigen::Vector3d r1 = R_W_C.row(0);
-    //     Eigen::Vector3d r2 = R_W_C.row(1);
-    //     Eigen::Vector3d r3 = R_W_C.row(2);
-
-    //     Eigen::Vector3d dx_dp = r1;
-    //     Eigen::Vector3d dy_dp = r2;
-    //     Eigen::Vector3d dz_dp = r3;
-
-    //     Eigen::RowVector3d du_dp = (focal_length_ / x_c) * dy_dp.transpose() - (focal_length_ * y_c / (x_c * x_c)) * dx_dp.transpose();
-    //     Eigen::RowVector3d dv_dp = (focal_length_ / x_c) * dz_dp.transpose() - (focal_length_ * z_c / (x_c * x_c)) * dx_dp.transpose();
-    //     Eigen::RowVector3d dsize_dp = -(focal_length_ * target_size_est_ / (x_c * x_c)) * dx_dp.transpose();
-
-    //     Eigen::MatrixXd H = Eigen::MatrixXd::Zero(3, 6);
-    //     H.block<1,3>(0,0) = du_dp;
-    //     H.block<1,3>(1,0) = dv_dp;
-    //     H.block<1,3>(2,0) = dsize_dp;
-
-    //     // --- 卡尔曼增益、状态和协方差更新 ---
-    //     Eigen::Vector3d y_residual;
-    //     y_residual << -z.u, -z.v, z.size;
-    //     y_residual -= z_pred;
-
-    //     Eigen::Matrix3d S = H * P_ * H.transpose() + R_;
-    //     Eigen::MatrixXd K = P_ * H.transpose() * S.inverse();
-        
-    //     x_ = x_ + K * y_residual;
-    //     P_ = (Eigen::MatrixXd::Identity(6, 6) - K * H) * P_;
-    // }
 
     void update(const Bbox& z, const Eigen::Vector3d& drone_pos, Eigen::Quaterniond q_C_W) {
         if (!is_initialized_) return;

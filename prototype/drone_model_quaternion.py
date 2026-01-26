@@ -117,7 +117,7 @@ class DroneModelQuaternion:
         c3 = ca.cos(gimbal_p)
         s3 = ca.sin(gimbal_p)
         
-        # Gimbal(YPR Order in FLU)到Camera的旋转矩阵
+        # Gimbal(YRP Order in FLU)到Camera的旋转矩阵
         R_G_C = ca.vertcat(
             ca.horzcat( c1*c3-s1*s2*s3, s1*c3+c1*s2*s3, -c2*s3), 
             ca.horzcat(-s1*c2,          c1*c2,           s2), 

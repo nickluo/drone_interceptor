@@ -66,6 +66,11 @@ private:
         this->declare_parameter<double>("mpc.tf", 1.0);
         this->declare_parameter<double>("mpc.v_desired", 25.0);
         this->declare_parameter<double>("mpc.tracking_distance", 0.0);
+
+        this->declare_parameter<bool>("pn.enabled", true);
+        this->declare_parameter<double>("pn.nav_constant", 4.0);
+        this->declare_parameter<double>("pn.switch_dist", 15.0);
+        this->declare_parameter<double>("pn.fov_switch_deg", 15.0);
         
         // Simulation Only
         this->declare_parameter<double>("sim.interception_dist", 1.0);
@@ -76,11 +81,13 @@ private:
         this->declare_parameter<double>("perception.bbox_size_std_dev", 5.0);
         this->declare_parameter<double>("perception.target_physical_size_est", 1.0);
         this->declare_parameter<double>("perception.perspective_compensation", 1.0);  // 透视补偿因子
+        this->declare_parameter<double>("perception.detection_latency", 0.08);  // 检测延迟估计
 
         this->declare_parameter<double>("control.execution_delay", 0.05);
         this->declare_parameter<double>("control.rate_tc", 0.05);
-        this->declare_parameter<double>("control.ctrl_coeff", 0.1);
+        // this->declare_parameter<double>("control.ctrl_scale", 0.8);  // Scale factor for auto-calculated ctrl_coeff
         this->declare_parameter<double>("control.max_history_time_factor", 2.0);
+        this->declare_parameter<bool>("control.rate_control_enabled", false);
 
         this->declare_parameter<int>("camera.width_px", 640);
         this->declare_parameter<int>("camera.height_px", 640);  // Camera height in pixels
@@ -133,16 +140,30 @@ private:
     void reset_solver_warm_start(const VectorX& current_state);
     void transition_to_state(MissionState new_state, const char* reason);
 
+    // Image-based PN Guidance (直接使用检测框计算LOS)
+    VectorU calculate_pn_controls_image_based(const VectorX& drone_state);
+
     // Member Variables
     bool use_simulation_;
     double G_, DRAG_COEFF_, V_DESIRED_, RATE_TC_, TRACKING_DISTANCE_, TRACKING_GAIN_;
+    
+    // PN Parameters
+    bool pn_enabled_;
+    double pn_nav_constant_;
+    double pn_switch_dist_;
+    double pn_fov_switch_deg_;
+    bool pn_active_ {false}; // Latched state for PN
+    double pn_vc_initial_ {0.0}; // 切换到PN时body系x轴速度
+    
     double bbox_pos_std_dev_, bbox_size_std_dev_;
     double target_physical_size_est_;
     double perspective_compensation_;  // 透视补偿因子
+    double detection_latency_;  // 检测延迟估计
     double cam_focal_length_, max_angle_rad_, cam_width_px_, cam_height_px_;
     double control_execution_delay_;
     double ctrl_coeff_;
     double att_limit_;
+    bool rate_control_enabled_;
 
     // 延迟补偿相关变量
     std::deque<std::pair<double, Eigen::Vector3d>> control_history_;  // 时间戳和角速度指令历史
@@ -178,7 +199,8 @@ private:
     int solve_count_ = 0;
     int ekf_health_check_counter_ = 0;
 
-    std::unique_ptr<TargetEKF> ekf_;
+    std::unique_ptr<DroneEKF> ekf_;
+    std::unique_ptr<TargetEKF> ekf_legacy_;
     std::unique_ptr<EMAFilter> output_filter_;
     std::unique_ptr<StatusPublisher> status_publisher_;
     
@@ -203,6 +225,14 @@ private:
     vision_msgs::msg::Detection2D current_bbox_;
     
     bool is_visible_ = false;
+    
+    // 图像直接测量的LOS角度和角速率 (相机系)
+    mutable std::shared_mutex mtx_los_;
+    Eigen::Vector2d los_angles_ {0.0, 0.0};       // [azimuth, elevation] in camera frame (rad)
+    Eigen::Vector2d los_angles_prev_ {0.0, 0.0};  // 上一帧LOS角度
+    Eigen::Vector2d los_rates_ {0.0, 0.0};        // LOS角速率 (rad/s)
+    double los_measurement_time_ {0.0};           // 上次测量时间戳
+    bool los_initialized_ {false};                // LOS是否已初始化
     
     // 线程安全状态机
     MissionStateMachine mission_state_;

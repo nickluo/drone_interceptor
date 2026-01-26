@@ -15,8 +15,15 @@ interceptor_node_quaternion:
     mpc:
       ctrl_rate: 50
       tf: 0.8
-      v_desired: 15.0
+      v_desired: 10.0
       tracking_distance: 0.0   # Desired tracking distance, interception only if 0.0
+
+    # Proportional Navigation (PN) Terminal Guidance
+    pn:
+      enabled: true
+      switch_dist: 20.0       # Distance to switch to PN (meters)
+      fov_switch_deg: 30.0    # Switch only if target within this FOV (degrees)
+      nav_gain: 3.0           # Navigation Constant (N) usually 3-5
     
     # Simulation parameters
     sim:
@@ -31,14 +38,15 @@ interceptor_node_quaternion:
       bbox_pos_std_dev: 3.0
       bbox_size_std_dev: 3.0
       target_physical_size_est: 0.8
-      perspective_compensation: 1.0  # 透视补偿因子 (0.5-1.0)
+      perspective_compensation: 0.0  # 透视补偿因子 (0.5-1.0)
     
     # Control execution delay compensation
     control:
-      execution_delay: 0.05  # 0.05 seconds (50ms) delay compensation for real flight
-      rate_tc: 0.02           # First-order response time constant for body rates (Increased for stability)
-      ctrl_coeff: 0.5         # Control coefficient for body rates
+      execution_delay: 0.01  # 0.01 seconds (10ms) delay compensation for real flight
+      rate_tc: 0.02           # First-order response time constant for body rates
+      # ctrl_scale: 0.63         # Scale factor for ctrl_coeff = scale * (1-exp(-dt/rate_tc))
       max_history_time_factor: 2.0  # History buffer size as multiple of execution_delay
+      rate_control_enabled: true  # Enable rate control compensation
     
     # Camera parameters
     camera:
@@ -60,7 +68,7 @@ interceptor_node_quaternion:
     # Cost function weights
     cost:
       w_los: 50.0              # Line-of-sight error weight
-      w_align: 1.0             # Velocity alignment weight
+      w_align: 5.0             # Velocity alignment weight
       w_closing_speed: 0.1     # Closing speed error weight
       w_rates: 0.001           # Body rate control effort weight
       w_tilt: 0.000001         # Tilt angle error weight

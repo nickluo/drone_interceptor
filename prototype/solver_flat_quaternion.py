@@ -18,7 +18,7 @@ A_MAX = 20.0        # 最大加速度 (m/s^2)
 A_MIN = 1.0         # 最小加速度 (m/s^2)
 DRAG_COEFF = 0.1625    # 线性空气阻力系数
 ROLL_PITCH_RATE_MAX = 2.0 * np.pi # 最大欧拉角速率 (rad/s)
-YAW_RATE_MAX = 0.5 * np.pi # 最大欧拉角速率 (rad/s)
+YAW_RATE_MAX = 1.0 * np.pi # 最大欧拉角速率 (rad/s)
 ATT_LIMIT = np.pi/5 # 姿态角限制 (Roll & Pitch)
 
 # ======== MPC 控制器参数 (MPC Controller Parameters) ========
@@ -57,7 +57,7 @@ TARGET_VELOCITY = np.array([-10.0, 5.0, 0.5]) # 目标做匀速直线运动
 # ======== 目标与相机物理属性 (Target & Camera Properties) ========
 # --- 目标 ---
 TARGET_PHYSICAL_SIZE_TRUTH = 0.5  # 目标的真实物理尺寸 (m), 用于相机模型
-TARGET_PHYSICAL_SIZE_EST = 0.7    # 状态估计器使用的目标尺寸 (m), 可模拟估计误差
+TARGET_PHYSICAL_SIZE_EST = 0.9    # 状态估计器使用的目标尺寸 (m), 可模拟估计误差
 
 # --- 相机 ---
 CAM_FOV_DEG = 30.0  # 相机水平视场角 (degrees)
@@ -76,10 +76,17 @@ W_TILT = 0.000001         # 倾斜角误差权重
 W_U_ALPHA = 0.001        # 角速度变化率权重
 W_U_THRUST = 0.0001       # 油门控制量权重
 
+# ======== 3D PN 导引律参数 (3D PN Guidance Parameters) ========
+PN_ENABLED = True
+PN_NAV_CONSTANT = 4.0       # 导航比 (N)
+PN_SWITCH_DIST = 15.0       # 切换距离阈值 (m)
+PN_FOV_SWITCH_DEG = 15.0    # 切换FOV阈值 (deg, 偏离光轴的角度)
+PN_MIN_TIME_GO = 2.0        # 剩余时间阈值 (s)
+
 # ======== 云台参数 (Gimbal Parameters) ========
 GIMBAL_RP_COEFF = 12.0
 GIMBAL_Y_COEFF = 10.0
-GIMBAL_DISTURBANCE_COEFF = 0.1 # 模拟无人机旋转对云台的影响
+GIMBAL_DISTURBANCE_COEFF = 0.5 # 模拟无人机旋转对云台的影响
 
 def convert_euler_to_quaternion_state(euler_state):
     """将欧拉角状态转换为四元数状态"""
@@ -102,6 +109,124 @@ def convert_quaternion_to_euler_state(quat_state):
     gimbal = quat_state[13:16]
     euler_angles = DroneModelQuaternion.quaternion_to_euler(quat)
     return np.hstack([pos_vel, euler_angles, omega, gimbal])
+
+def calculate_pn_controls(drone_state, target_pos, target_vel, dt):
+    """
+    计算基于三维比例导引(3D Proportional Navigation)的控制指令
+    
+    Args:
+        drone_state: [px, py, pz, vx, vy, vz, qw, qx, qy, qz, wx, wy, wz, gr, gp, gy]
+        target_pos: [tx, ty, tz]
+        target_vel: [tvx, tvy, tvz]
+        dt: 时间步长
+    
+    Returns:
+        u_pn: [wx, wy, wz, thrust_accel]
+    """
+    # 提取状态
+    pos = drone_state[0:3]
+    vel = drone_state[3:6]
+    quat = drone_state[6:10] # qw, qx, qy, qz
+    
+    # 1. 计算相对运动状态
+    r_vec = target_pos - pos
+    v_vec = target_vel - vel
+    dist = np.linalg.norm(r_vec) + 1e-6
+    r_unit = r_vec / dist
+    
+    # 2. 计算视线转动速率向量 (LOS Rate Vector)
+    # Omega = (r x v) / (r . r)
+    omega_los = np.cross(r_vec, v_vec) / (dist * dist)
+    
+    # 3. 计算接近速度 (Closing Speed)
+    # Vc = - (r . v) / |r| (标量)
+    vc = -np.dot(r_vec, v_vec) / dist
+    
+    # 4. 计算PN加速度指令 (TPN Acceleration Command)
+    # TPN Vector Form: a_cmd = N * Vc * (Omega x r_unit)
+    # 方向: 垂直于视线和旋转速率矢量，即在视线转动的平面内，垂直于视线指向修正方向
+    # 另一种常用形式: a_cmd = N * (v_rel x Omega) ? 
+    # 标准形式推导: a_perp = N * Vc * Omega_scalar. 
+    # 矢量方向: Omega x r_unit 是垂直于LOS且在转动平面内的矢量。
+    a_pn = PN_NAV_CONSTANT * vc * np.cross(omega_los, r_unit)
+    
+    # 5. 重力补偿
+    # 总期望加速度 = PN指令 + 重力抵消
+    a_des = a_pn + np.array([0.0, 0.0, G])
+    
+    # 6. 计算期望推力方向 (Body Z axis)
+    thrust_accel = np.linalg.norm(a_des)
+    
+    if thrust_accel < 1e-6:
+        z_b_des = np.array([0, 0, 1])
+    else:
+        z_b_des = a_des / thrust_accel
+        
+    # 限制推力 (可选)
+    thrust_accel = np.clip(thrust_accel, A_MIN, A_MAX)
+    
+    # 7. 计算期望姿态 (Rotation Matrix)
+    # 手动计算当前旋转矩阵 R_curr
+    qw, qx, qy, qz = quat
+    R_curr = np.array([
+        [1-2*(qy**2+qz**2), 2*(qx*qy-qw*qz), 2*(qx*qz+qw*qy)],
+        [2*(qx*qy+qw*qz), 1-2*(qx**2+qz**2), 2*(qy*qz-qw*qx)],
+        [2*(qx*qz-qw*qy), 2*(qy*qz+qw*qx), 1-2*(qx**2+qy**2)]
+    ])
+
+    # 我们不仅需要对齐Z轴(推力方向)，还需要确定X轴(偏航方向)
+    # 为了减少LOS Azimuth Error (水平视线误差)，我们应主动将机头指向目标
+    
+    # 计算LOS水平投影方向
+    r_vec_horiz_norm = np.linalg.norm(r_vec[0:2])
+    if r_vec_horiz_norm > 0.1:
+        # 目标在水平面上投影长度足够，使用视线方向作为期望Heading
+        los_yaw = np.arctan2(r_vec[1], r_vec[0])
+        x_c = np.array([np.cos(los_yaw), np.sin(los_yaw), 0.0])
+    else:
+        # 如果距离太近或垂直头顶，维持当前偏航
+        qw, qx, qy, qz = quat
+        curr_yaw = np.arctan2(2*(qw*qz + qx*qy), 1 - 2*(qy**2 + qz**2))
+        x_c = np.array([np.cos(curr_yaw), np.sin(curr_yaw), 0.0])
+    
+    y_b_des = np.cross(z_b_des, x_c)
+    if np.linalg.norm(y_b_des) < 1e-4: # 奇点: z_b_des 与 x_c 平行 (垂直向下或向上)
+        y_b_des = np.cross(z_b_des, np.array([1, 0, 0])) # 换个参考
+    y_b_des /= np.linalg.norm(y_b_des)
+    
+    x_b_des = np.cross(y_b_des, z_b_des)
+    
+    R_des = np.column_stack((x_b_des, y_b_des, z_b_des))
+    
+    # 8. 姿态控制 (Attitude Control) - 计算角速度指令
+    # R_err = R_curr^T * R_des
+    R_err = R_curr.T @ R_des
+    
+    # 将旋转矩阵误差转换为轴角 (Axis-Angle)
+    # trace(R) = 1 + 2*cos(theta)
+    tr = np.trace(R_err)
+    theta = np.arccos(np.clip((tr - 1) / 2, -1.0, 1.0))
+    
+    if abs(theta) < 1e-6:
+        omega_cmd = np.zeros(3)
+    else:
+        # axis = 1/(2*sin(theta)) * [R(3,2)-R(2,3); R(1,3)-R(3,1); R(2,1)-R(1,2)]
+        axis = (1 / (2 * np.sin(theta))) * np.array([
+            R_err[2, 1] - R_err[1, 2],
+            R_err[0, 2] - R_err[2, 0],
+            R_err[1, 0] - R_err[0, 1]
+        ])
+        # P控制器 + 前馈: omega = Kp * theta * axis + R^T * omega_los
+        # 增加前馈项以补偿视线旋转，提高跟踪精度
+        omega_ff = R_curr.T @ omega_los
+        omega_cmd = 25.0 * theta * axis + omega_ff # Gain Kp=25.0
+        
+    # 限制角速度
+    omega_cmd = np.clip(omega_cmd, 
+                        [-ROLL_PITCH_RATE_MAX, -ROLL_PITCH_RATE_MAX, -YAW_RATE_MAX], 
+                        [ROLL_PITCH_RATE_MAX, ROLL_PITCH_RATE_MAX, YAW_RATE_MAX])
+                        
+    return np.hstack([omega_cmd, thrust_accel])
 
 MODEL_CONSTANTS = {
     'G' : G,
@@ -173,6 +298,7 @@ def main():
         acados_solver.set(k, 'u', u_warm_start[k,:])
     acados_solver.set(N_HORIZON, 'x', x_warm_start[N_HORIZON,:])
 
+    active_controller = "MPC"
     print("\n[INFO] 开始仿真 (使用四元数+EKF, 考虑感知延迟与噪声)...")
     i = 0
     solve_time_avg = 0.0
@@ -223,65 +349,175 @@ def main():
             pos_est = estimator.x[0:3]
             vel_est = estimator.x[3:6]
             
-            acados_solver.set(0, "lbx", x_current_quat)
-            acados_solver.set(0, "ubx", x_current_quat)
+            # --- 检测是否满足切换到 PN 的条件 ---
+            use_pn = False
+            if PN_ENABLED:
+                # 状态机逻辑: 如果已经处于PN模式，则保持PN (Latched)
+                if active_controller == "PN":
+                    use_pn = True
+                else: 
+                    # 计算距离
+                    dist_to_target = np.linalg.norm(pos_est - x_current_quat[0:3])
+                    
+                    # 计算目标是否在视场中心附近 (FOV Check)
+                    # 修正: 使用当前的系统状态估计(包含云台姿态)来判断，而不是延迟的测量值
+                    # 这与C++代码中的逻辑保持一致 (transform to camera frame)
+                    target_in_fov_center = False
+                    
+                    # 1. 计算相对位置矢量 (World Frame)
+                    r_W = pos_est - x_current_quat[0:3]
+                    dist_est = np.linalg.norm(r_W)
+                    
+                    if dist_est > 0.1:
+                        # 2. 转换到机体坐标系 (Body Frame)
+                        qw, qx, qy, qz = x_current_quat[6:10]
+                        # R_WB: Body to World
+                        R_WB = np.array([
+                            [1-2*(qy**2+qz**2), 2*(qx*qy-qw*qz), 2*(qx*qz+qw*qy)],
+                            [2*(qx*qy+qw*qz), 1-2*(qx**2+qz**2), 2*(qy*qz-qw*qx)],
+                            [2*(qx*qz-qw*qy), 2*(qy*qz+qw*qx), 1-2*(qx**2+qy**2)]
+                        ])
+                        r_B = R_WB.T @ r_W
+                        
+                        # 3. 转换到相机/云台坐标系 (Camera Frame)
+                        # 假设云台按照 standard aerospace sequence (Yaw->Pitch->Roll) 相对于机体旋转
+                        # 或者简单的 3-2-1 欧拉角. 
+                        gr, gp, gy = x_current_quat[13:16]
+                        cgr, sgr = np.cos(gr), np.sin(gr)
+                        cgp, sgp = np.cos(gp), np.sin(gp)
+                        cgy, sgy = np.cos(gy), np.sin(gy)
+                        
+                        # R_BG: Gimbal to Body (Rotation Matrix from Gimbal Frame to Body Frame)
+                        # R_z(yaw) * R_y(pitch) * R_x(roll)
+                        R_z = np.array([[cgy, -sgy, 0], [sgy, cgy, 0], [0, 0, 1]])
+                        R_y = np.array([[cgp, 0, sgp], [0, 1, 0], [-sgp, 0, cgp]])
+                        R_x = np.array([[1, 0, 0], [0, cgr, -sgr], [0, sgr, cgr]])
+                        R_BG = R_z @ R_y @ R_x
+                        
+                        r_C = R_BG.T @ r_B
+                        
+                        # 4. 检查是否在 FOV 中心区域
+                        # 假设相机光轴为 Camera Frame 的 X 轴 (Alignment with Body X at zero angles)
+                        # 计算视线向量与 X 轴的夹角
+                        cos_theta = r_C[0] / np.linalg.norm(r_C)
+                        theta_deg = np.rad2deg(np.arccos(np.clip(cos_theta, -1.0, 1.0)))
+                        
+                        if theta_deg < PN_FOV_SWITCH_DEG:
+                            target_in_fov_center = True
+                            
+                    # 组合条件: 距离足够近 且 目标在中心区域
+                    if (dist_to_target < PN_SWITCH_DIST) and target_in_fov_center:
+                        use_pn = True
             
-            for k in range(N_HORIZON + 1):
-                t_k = k * dt
-                predicted_target_pos_est = pos_est + t_k * vel_est
-                if (TRACKING_DISTANCE > 0.001):
-                    # --- 计算期望接近速度 (Tracking Logic) ---
-                    x_k = acados_solver.get(k, "x")
-                    current_drone_pos = x_k[0:3]
-                    dist_to_target = np.linalg.norm(predicted_target_pos_est - current_drone_pos)
-                    dist_error = (dist_to_target - TRACKING_DISTANCE) / TRACKING_DISTANCE
-                    tracking_coeff = 2.0/(1.0 + np.exp(-TRACKING_GAIN * dist_error)) - 1.0
-                    v_exp = tracking_coeff * V_DESIRED
-                else:
-                    v_exp = V_DESIRED
-                acados_solver.set(k, "p", np.hstack([predicted_target_pos_est, vel_est, DRAG_COEFF, v_exp, RATE_TC, W_COST, GIMBAL_RP_COEFF, GIMBAL_Y_COEFF]))
-
-            t0 = time.time()
-            status = acados_solver.solve()
-            if status != 0: 
-                print(f'[WARNING] ACADOS求解器在第 {i} 步返回状态 {status}。')
-                break
-            print(f'acados_solver.solve() {int((time.time()-t0)*1000000)} us')
-            solve_time_avg = solve_time_avg * ((i-1.0)/i) + (time.time()-t0)*1000000/i
+            if use_pn:
+                if active_controller == "MPC":
+                    print(f"\n[SWITCH] Dist={dist_to_target:.1f}m, Switching to PROPORTIONAL NAVIGATION")
+                    active_controller = "PN"
+                    
+                u_optimal_raw = calculate_pn_controls(x_current_quat, pos_est, vel_est, dt)
+                
+                # 更新 x_current_quat 用于下一步预测 (简单的 Euler 积分模拟)
+                # 注意: 这只是为了闭环仿真的连续性, 实际中 x_current_quat 会在下一帧通过感知更新
+                # 这里我们模拟动力学步进
+                # 提取
+                d_pos = x_current_quat[0:3]
+                d_vel = x_current_quat[3:6]
+                d_quat = x_current_quat[6:10]
+                d_omega = u_optimal_raw[0:3] # 假设角速度完美跟踪
+                
+                # 位置更新
+                d_pos_new = d_pos + d_vel * dt
+                
+                # 速度更新 (a = R * [0,0,T] - drag - g)
+                qw, qx, qy, qz = d_quat
+                R_mat = np.array([
+                    [1-2*(qy**2+qz**2), 2*(qx*qy-qw*qz), 2*(qx*qz+qw*qy)],
+                    [2*(qx*qy+qw*qz), 1-2*(qx**2+qz**2), 2*(qy*qz-qw*qx)],
+                    [2*(qx*qz-qw*qy), 2*(qy*qz+qw*qx), 1-2*(qx**2+qy**2)]
+                ])
+                thrust_vec = R_mat @ np.array([0, 0, u_optimal_raw[3]])
+                drag_vec = DRAG_COEFF * d_vel
+                acc_world = thrust_vec - drag_vec - np.array([0, 0, G])
+                d_vel_new = d_vel + acc_world * dt
+                
+                # 四元数更新 dq = 0.5 * q * omega
+                omega_q = np.array([0, d_omega[0], d_omega[1], d_omega[2]])
+                # q_dot = 0.5 * q_mult(d_quat, omega_q) 
+                # 这里简化: Convert to R, R_new = R * Exp(w*dt), convert back
+                # 或者简单的 Euler integration + normalize
+                wx, wy, wz = d_omega
+                omega_mat = np.array([
+                    [0, -wx, -wy, -wz],
+                    [wx, 0, wz, -wy],
+                    [wy, -wz, 0, wx],
+                    [wz, wy, -wx, 0]
+                ])
+                d_quat_dot = 0.5 * omega_mat @ d_quat
+                d_quat_new = d_quat + d_quat_dot * dt
+                d_quat_new = DroneModelQuaternion.normalize_quaternion(d_quat_new)
+                
+                # Gimbal update (Dummy)
+                dx_gimbal_new = x_current_quat[13:16] # 保持不变
+                
+                x_current_quat = np.hstack([d_pos_new, d_vel_new, d_quat_new, d_omega, dx_gimbal_new])
+                
+            else:
+                # MPC Logic
+                acados_solver.set(0, "lbx", x_current_quat)
+                acados_solver.set(0, "ubx", x_current_quat)
             
-            u_optimal_raw = acados_solver.get(0, "u")
-            x_current_quat = acados_solver.get(1, "x")
+                for k in range(N_HORIZON + 1):
+                    t_k = k * dt
+                    predicted_target_pos_est = pos_est + t_k * vel_est
+                    if (TRACKING_DISTANCE > 0.001):
+                        # --- 计算期望接近速度 (Tracking Logic) ---
+                        x_k = acados_solver.get(k, "x")
+                        current_drone_pos = x_k[0:3]
+                        dist_to_target = np.linalg.norm(predicted_target_pos_est - current_drone_pos)
+                        dist_error = (dist_to_target - TRACKING_DISTANCE) / TRACKING_DISTANCE
+                        tracking_coeff = 2.0/(1.0 + np.exp(-TRACKING_GAIN * dist_error)) - 1.0
+                        v_exp = tracking_coeff * V_DESIRED
+                    else:
+                        v_exp = V_DESIRED
+                    acados_solver.set(k, "p", np.hstack([predicted_target_pos_est, vel_est, DRAG_COEFF, v_exp, RATE_TC, W_COST, GIMBAL_RP_COEFF, GIMBAL_Y_COEFF]))
 
-            # 确保四元数归一化
-            x_current_quat[6:10] = DroneModelQuaternion.normalize_quaternion(x_current_quat[6:10])
+                t0 = time.time()
+                status = acados_solver.solve()
+                if status != 0: 
+                    print(f'[WARNING] ACADOS求解器在第 {i} 步返回状态 {status}。')
+                    break
+                print(f'[INFO] 步骤 {i} acados_solver.solve() {int((time.time()-t0)*1000000)} us')
+                solve_time_avg = solve_time_avg * ((i-1.0)/i) + (time.time()-t0)*1000000/i
+                
+                u_optimal_raw = acados_solver.get(0, "u")
+                x_current_quat = acados_solver.get(1, "x")
 
-            # --- 模拟云台受无人机机动影响 ---
-            # 简单的干扰模型：云台角速度受到机体角速度的干扰
-            wx, wy, wz = x_current_quat[10], x_current_quat[11], x_current_quat[12]
-            x_current_quat[13] += GIMBAL_DISTURBANCE_COEFF * wx * dt
-            x_current_quat[14] += GIMBAL_DISTURBANCE_COEFF * wy * dt
-            x_current_quat[15] += GIMBAL_DISTURBANCE_COEFF * wz * dt
+                # 确保四元数归一化
+                x_current_quat[6:10] = DroneModelQuaternion.normalize_quaternion(x_current_quat[6:10])
 
-            # --- 性能改进: 为下一次迭代准备热启动数据 ---
-            for k in range(N_HORIZON-1):
-                x_next = acados_solver.get(k+1, "x")
+                # --- 模拟云台受无人机机动影响 ---
+                # 简单的干扰模型：云台角速度受到机体角速度的干扰
+                wx, wy, wz = x_current_quat[10], x_current_quat[11], x_current_quat[12]
+                x_current_quat[13] += GIMBAL_DISTURBANCE_COEFF * wx * dt
+                x_current_quat[14] += GIMBAL_DISTURBANCE_COEFF * wy * dt
+                x_current_quat[15] += GIMBAL_DISTURBANCE_COEFF * wz * dt
+
+                # --- 性能改进: 为下一次迭代准备热启动数据 ---
+                for k in range(N_HORIZON-1):
+                    x_next = acados_solver.get(k+1, "x")
+                    x_next[6:10] = DroneModelQuaternion.normalize_quaternion(x_next[6:10])
+                    u_next = acados_solver.get(k+1, "u")
+                    acados_solver.set(k, "x", x_next)
+                    acados_solver.set(k, "u", u_next)
+                acados_solver.set(N_HORIZON-1, "u", u_next)  # 末尾复制
+                x_next = acados_solver.get(N_HORIZON, "x")
                 x_next[6:10] = DroneModelQuaternion.normalize_quaternion(x_next[6:10])
-                u_next = acados_solver.get(k+1, "u")
-                acados_solver.set(k, "x", x_next)
-                acados_solver.set(k, "u", u_next)
-            acados_solver.set(N_HORIZON-1, "u", u_next)  # 末尾复制
-            x_next = acados_solver.get(N_HORIZON, "x")
-            x_next[6:10] = DroneModelQuaternion.normalize_quaternion(x_next[6:10])
-            acados_solver.set(N_HORIZON-1, "x", x_next)
-            acados_solver.set(N_HORIZON, "x", x_next)  # 末尾复制
-
-        # ------------------- 5. 执行 (Act) & 记录 -------------------
-        u_optimal_filtered = output_filter.filter_array(u_optimal_raw)
-        
-        # 对于四元数版本，u_optimal_filtered直接就是机体角速度 + 推力加速度
-        # [wx, wy, wz, az]
-        body_rates = u_optimal_filtered[0:3]
-        thrust_accel = u_optimal_filtered[3]
+                acados_solver.set(N_HORIZON-1, "x", x_next)
+            
+            # Common control output processing
+            u_optimal_filtered = u_optimal_raw
+            body_rates = u_optimal_filtered[0:3]
+            thrust_accel = u_optimal_filtered[3]
         
         # 应用姿态安全限制防止危险机动
         # body_rates = apply_attitude_safety_limit_quat(x_current_quat, body_rates, ATT_LIMIT)
