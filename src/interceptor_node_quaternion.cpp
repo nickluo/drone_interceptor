@@ -35,18 +35,26 @@ InterceptorNodeQuaternion::InterceptorNodeQuaternion()
     nlp_in_ = drone_interceptor_mpc_quat_acados_get_nlp_in(acados_capsule_);
     nlp_out_ = drone_interceptor_mpc_quat_acados_get_nlp_out(acados_capsule_);
 
-    // 创建DroneEKF - 使用图像坐标系的12维CA模型
+    // 创建DroneEKF - 使用图像坐标系的12维CA模型 + 3D位置估计
     CameraIntrinsics cam_intrinsics;
     cam_intrinsics.fx = cam_focal_length_;
     cam_intrinsics.fy = cam_focal_length_;
     cam_intrinsics.px = cam_width_px_ / 2.0;
     cam_intrinsics.py = cam_height_px_ / 2.0;
     
-    Eigen::Vector2d process_noise;
-    process_noise << bbox_pos_std_dev_ * 0.1,   // std_pos
-                     bbox_pos_std_dev_ * 0.5;   // std_vel
-    Eigen::Vector2d measurement_noise;
-    measurement_noise << bbox_pos_std_dev_, bbox_size_std_dev_;
+    // 8维过程噪声: [std_pos_img, std_vel_img, std_accel_img, std_size, std_size_vel, std_accel_size, std_pos_3d, std_vel_3d]
+    Eigen::Matrix<double, 8, 1> process_noise;
+    process_noise << bbox_pos_std_dev_ * 0.1,   // std_pos_img
+                     bbox_pos_std_dev_ * 0.5,   // std_vel_img
+                     bbox_pos_std_dev_ * 0.25,  // std_accel_img
+                     bbox_size_std_dev_ * 0.1,  // std_size
+                     bbox_size_std_dev_ * 0.5,  // std_size_vel
+                     bbox_size_std_dev_ * 0.25, // std_accel_size
+                     0.5,                       // std_pos_3d (米)
+                     1.0;                       // std_vel_3d (米/秒)
+    // 3维测量噪声: [std_meas_pos, std_meas_size, std_meas_3d]
+    Eigen::Vector3d measurement_noise;
+    measurement_noise << bbox_pos_std_dev_, bbox_size_std_dev_, bbox_pos_std_dev_ * 0.1;
     
     const int predicted_imu_freq = 100;
     ekf_ = std::make_unique<DroneEKF>(cam_intrinsics, process_noise, measurement_noise,
@@ -149,13 +157,7 @@ void InterceptorNodeQuaternion::load_parameters()
     this->get_parameter("control.rate_tc", RATE_TC_);
     this->get_parameter("control.rate_control_enabled", rate_control_enabled_);
     // 自适应计算 ctrl_coeff_: 一阶系统在采样周期 dt_ 内的响应比例
-    // 公式: ctrl_coeff = ctrl_scale * (1 - exp(-dt / rate_tc))
-    // ctrl_scale 用于补偿实际飞控与理想一阶模型的差异
-    // this->get_parameter("control.ctrl_scale", ctrl_scale);
     ctrl_coeff_ = 1.0 - std::exp(-dt_ / RATE_TC_);
-    // ctrl_coeff_ = ctrl_scale * ctrl_coeff_base;
-    // RCLCPP_INFO(this->get_logger(), "ctrl_coeff: %.4f (base=%.4f, scale=%.2f, dt=%.4f, rate_tc=%.4f)", 
-    //             ctrl_coeff_, ctrl_coeff_base, ctrl_scale, dt_, RATE_TC_);
     double max_history_time_factor;
     this->get_parameter("control.max_history_time_factor", max_history_time_factor);
     max_history_time_ = control_execution_delay_ * max_history_time_factor;
@@ -246,19 +248,26 @@ void InterceptorNodeQuaternion::mission_launch_callback(const std_msgs::msg::Hea
         // 重置状态
         {
             std::unique_lock<std::shared_mutex> lock(mtx_ekf_);  // 写入使用独占锁
-            // 创建DroneEKF - 使用图像坐标系的12维CA模型
+            // 创建DroneEKF - 使用图像坐标系的12维CA模型 + 3D位置估计
             CameraIntrinsics cam_intrinsics;
             cam_intrinsics.fx = cam_focal_length_;
             cam_intrinsics.fy = cam_focal_length_;
             cam_intrinsics.px = cam_width_px_ / 2.0;
             cam_intrinsics.py = cam_height_px_ / 2.0;
             
-            // 6-State CV Model: only need position and velocity noise
-            Eigen::Vector2d process_noise;
-            process_noise << bbox_pos_std_dev_ * 0.1,   // std_pos
-                             bbox_pos_std_dev_ * 0.5;   // std_vel
-            Eigen::Vector2d measurement_noise;
-            measurement_noise << bbox_pos_std_dev_, bbox_size_std_dev_;
+            // 8维过程噪声: [std_pos_img, std_vel_img, std_accel_img, std_size, std_size_vel, std_accel_size, std_pos_3d, std_vel_3d]
+            Eigen::Matrix<double, 8, 1> process_noise;
+            process_noise << bbox_pos_std_dev_ * 0.1,   // std_pos_img
+                             bbox_pos_std_dev_ * 0.5,   // std_vel_img
+                             bbox_pos_std_dev_ * 0.25,  // std_accel_img
+                             bbox_size_std_dev_ * 0.1,  // std_size
+                             bbox_size_std_dev_ * 0.5,  // std_size_vel
+                             bbox_size_std_dev_ * 0.25, // std_accel_size
+                             0.5,                       // std_pos_3d (米)
+                             1.0;                       // std_vel_3d (米/秒)
+            // 3维测量噪声: [std_meas_pos, std_meas_size, std_meas_3d]
+            Eigen::Vector3d measurement_noise;
+            measurement_noise << bbox_pos_std_dev_, bbox_size_std_dev_, bbox_pos_std_dev_ * 0.1;
             
             const int predicted_imu_freq = 100;
             ekf_ = std::make_unique<DroneEKF>(cam_intrinsics, process_noise, measurement_noise,

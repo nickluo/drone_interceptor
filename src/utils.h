@@ -186,116 +186,227 @@ struct CameraIntrinsics {
 };
 
 // ============================================================================
-// DroneEKF Class - 6-State CV Model in World Frame (Stable design)
-// State: [x, y, z, vx, vy, vz] (World Frame) - Same as TargetEKF
-// Measurement: [cx, cy, w, h] (Image Plane)
+// DroneEKF Class - 结合图像空间跟踪和3D位置估计的EKF
+// 状态向量 (18维): 
+//   图像空间: [cx, cy, w, h, vx_img, vy_img, vw, vh, ax_img, ay_img, aw, ah]
+//   3D空间:   [px, py, pz, vx_3d, vy_3d, vz_3d]
 // ============================================================================
 class DroneEKF {
 public:
-    using Vector6d = Eigen::Matrix<double, 6, 1>;
-    using Matrix6d = Eigen::Matrix<double, 6, 6>;
-    using Matrix4x6d = Eigen::Matrix<double, 4, 6>;
-    using Matrix6x4d = Eigen::Matrix<double, 6, 4>;
+    // 固定大小类型定义
+    using Vector18d = Eigen::Matrix<double, 18, 1>;
+    using Matrix18d = Eigen::Matrix<double, 18, 18>;
+    using Matrix7x18d = Eigen::Matrix<double, 7, 18>;
+    using Vector7d = Eigen::Matrix<double, 7, 1>;
+    using Matrix7d = Eigen::Matrix<double, 7, 7>;
 
+    // 检测框结构体
     struct Bbox {
         double cx, cy, w, h;
     };
 
-    struct LOS {
-        double azimuth, elevation, azimuth_rate, elevation_rate;
-    };
-
+    // ============================================================================
+    // 用于存储历史状态的结构体 (用于延迟测量处理)
+    // ============================================================================
     struct StateHistory {
         int64_t timestamp;
-        Vector6d state;
-        Matrix6d covariance;
+        Vector18d state;
+        Matrix18d covariance;
         Eigen::Vector3d imu_input;
     };
 
     /**
-     * @brief Constructor
+     * @brief 构造函数
+     * @param intrinsics 相机内参
+     * @param process_noise_std 过程噪声标准差 [std_pos_img, std_vel_img, std_accel_img, std_size, std_size_vel, std_accel_size, std_pos_3d, std_vel_3d]
+     * @param measurement_noise_std 测量噪声标准差 [std_meas_pos, std_meas_size, std_meas_3d]
+     * @param estimated_imu_freq 估计的IMU数据频率 (Hz)
+     * @param estimated_detection_latency 估计的检测延迟 (秒)
+     * @param target_size_est 目标估计尺寸 (米)
      */
     DroneEKF(const CameraIntrinsics& intrinsics,
-             const Eigen::Vector2d& process_noise_std,
-             const Eigen::Vector2d& measurement_noise_std,
-             int imu_freq,
+             const Eigen::Matrix<double, 8, 1>& process_noise_std,
+             const Eigen::Vector3d& measurement_noise_std,
+             int estimated_imu_freq,
              double estimated_detection_latency,
              double target_size_est = 0.5,
              double perspective_compensation = 1.0)
         : intrinsics_(intrinsics),
-          max_buffer_size_(static_cast<size_t>(imu_freq * estimated_detection_latency * 2)),
-          dt_(1000000 / imu_freq),
-          ema_filter_(imu_freq / 10),
+          max_buffer_size_(static_cast<size_t>(estimated_imu_freq * estimated_detection_latency * 2)),
+          dt_(1.0 / estimated_imu_freq),
           target_size_est_(target_size_est),
           perspective_compensation_(perspective_compensation),
+          ema_filter_(estimated_imu_freq / 10),
           is_initialized_(false),
-          last_timestamp_(-1)
+          last_timestamp_(-1.0)
     {
-        if (max_buffer_size_ < 10) max_buffer_size_ = 10;
-
-        x_.setZero();
-
-        // CV model: Use position and velocity noise only
-        double std_pos = process_noise_std(0);
-        double std_vel = process_noise_std(1);
-
-        Vector6d q_diag;
-        q_diag << std_pos*std_pos, std_pos*std_pos, std_pos*std_pos,
-                  std_vel*std_vel, std_vel*std_vel, std_vel*std_vel;
-        Q_base_ = q_diag.asDiagonal();
-        P_ = Q_base_ * 100.0;
-
-        double std_meas_pos = measurement_noise_std(0);
-        double std_meas_size = measurement_noise_std(1);
-        Eigen::Vector4d r_diag;
-        r_diag << std_meas_pos*std_meas_pos, std_meas_pos*std_meas_pos,
-                  std_meas_size*std_meas_size, std_meas_size*std_meas_size;
-        R_ = r_diag.asDiagonal();
-    }
-
-    /**
-     * @brief Predict step (World Frame CV Model)
-     */
-    void predict(int64_t current_time_us, const Eigen::Vector3d& imu_omega_flu) {
-        if (!is_initialized_) return;
-
-        if (current_time_us > 0) {
-            if (last_timestamp_ > 0) {
-                dt_ = current_time_us - last_timestamp_;
-            }
-            last_timestamp_ = current_time_us;
+        if (max_buffer_size_ < 10) {
+            max_buffer_size_ = 10;
         }
 
-        const double dt = dt_ * 1e-6;
+        x_.setZero();
+        v_imu_cache_.setZero();
 
-        // F matrix for CV model: x_{k+1} = F * x_k
-        Matrix6d F = Matrix6d::Identity();
-        F(0,3) = dt; F(1,4) = dt; F(2,5) = dt;
+        // 解析过程噪声
+        double std_pos_img = process_noise_std(0);
+        double std_vel_img = process_noise_std(1);
+        double std_accel_img = process_noise_std(2);
+        double std_size = process_noise_std(3);
+        double std_size_vel = process_noise_std(4);
+        double std_accel_size = process_noise_std(5);
+        double std_pos_3d = process_noise_std(6);
+        double std_vel_3d = process_noise_std(7);
 
-        x_ = F * x_;
-        
-        // Discrete-time process noise (based on continuous white noise acceleration)
-        // Q = integral of F * G * Q_c * G^T * F^T
-        double dt2 = dt * dt;
-        double dt3 = dt2 * dt;
-        Matrix6d Q = Matrix6d::Zero();
-        
-        // Position variance contribution
-        Q(0,0) = dt3/3.0; Q(1,1) = dt3/3.0; Q(2,2) = dt3/3.0;
-        // Velocity variance contribution  
-        Q(3,3) = dt; Q(4,4) = dt; Q(5,5) = dt;
-        // Cross-correlation
-        Q(0,3) = dt2/2.0; Q(1,4) = dt2/2.0; Q(2,5) = dt2/2.0;
-        Q(3,0) = dt2/2.0; Q(4,1) = dt2/2.0; Q(5,2) = dt2/2.0;
-        
-        // Scale by base process noise
-        double q_scale = Q_base_(3,3); // velocity variance as scale
-        Q *= q_scale;
-        
-        P_ = F * P_ * F.transpose() + Q;
+        // 构建过程噪声协方差矩阵 Q (18x18)
+        Vector18d q_diag;
+        // 图像空间 (12维)
+        q_diag << std_pos_img*std_pos_img, std_pos_img*std_pos_img,           // cx, cy
+                  std_size*std_size, std_size*std_size,                        // w, h
+                  std_vel_img*std_vel_img, std_vel_img*std_vel_img,            // vx_img, vy_img
+                  std_size_vel*std_size_vel, std_size_vel*std_size_vel,        // vw, vh
+                  std_accel_img*std_accel_img, std_accel_img*std_accel_img,    // ax_img, ay_img
+                  std_accel_size*std_accel_size, std_accel_size*std_accel_size,// aw, ah
+        // 3D空间 (6维)
+                  std_pos_3d*std_pos_3d, std_pos_3d*std_pos_3d, std_pos_3d*std_pos_3d,  // px, py, pz
+                  std_vel_3d*std_vel_3d, std_vel_3d*std_vel_3d, std_vel_3d*std_vel_3d;  // vx, vy, vz
+        Q_ = q_diag.asDiagonal();
 
-        if (current_time_us > 0) {
-            history_buffer_.push_back({current_time_us, x_, P_, imu_omega_flu});
+        // 初始协方差
+        P_ = Q_ * 10.0;
+
+        // 测量噪声协方差 R (7x7): [cx, cy, w, h, u, v, size]
+        double std_meas_pos = measurement_noise_std(0);
+        double std_meas_size = measurement_noise_std(1);
+        double std_meas_3d = measurement_noise_std(2);
+        Vector7d r_diag;
+        r_diag << std_meas_pos*std_meas_pos, std_meas_pos*std_meas_pos,
+                  std_meas_size*std_meas_size, std_meas_size*std_meas_size,
+                  std_meas_3d*std_meas_3d, std_meas_3d*std_meas_3d, std_meas_3d*std_meas_3d;
+        R_ = r_diag.asDiagonal();
+
+        // 测量矩阵 H (7x18): 直接观测 [cx, cy, w, h] 和通过投影观测3D位置
+        H_.setZero();
+        H_(0, 0) = 1.0; // cx
+        H_(1, 1) = 1.0; // cy
+        H_(2, 2) = 1.0; // w
+        H_(3, 3) = 1.0; // h
+        // H(4:6, 12:17) 在update中动态计算 (非线性)
+    }
+
+
+    /**
+     * @brief EKF预测步骤
+     * @param current_time 当前时间戳 (微秒)
+     * @param imu_omega 相机角速度 [omega_x, omega_y, omega_z]
+     */
+    void predict(int64_t current_time, const Eigen::Vector3d& imu_omega) {
+        if (!is_initialized_) return;
+
+        if (current_time > 0) {
+            if (last_timestamp_ > 0) {
+                dt_ = current_time - last_timestamp_;
+            }
+            last_timestamp_ = current_time;
+        }
+
+        // 确保dt有效
+        const double dt = dt_ / 1e6; // 转换为秒
+        const double dt2 = 0.5 * dt * dt;
+        const Vector18d x_prev = x_;
+        
+        // 检查输入有效性
+        if (imu_omega.hasNaN() || x_prev.hasNaN()) {
+            return;
+        }
+
+        Vector18d x_pred;
+        
+        // --- 图像空间 CA 模型预测 (12维) ---
+        // 位置: p = p0 + v*dt + 0.5*a*dt²
+        x_pred(0) = x_prev(0) + x_prev(4) * dt + x_prev(8) * dt2;   // cx
+        x_pred(1) = x_prev(1) + x_prev(5) * dt + x_prev(9) * dt2;   // cy
+        x_pred(2) = x_prev(2) + x_prev(6) * dt + x_prev(10) * dt2;  // w
+        x_pred(3) = x_prev(3) + x_prev(7) * dt + x_prev(11) * dt2;  // h
+
+        // 速度: v = v0 + a*dt
+        x_pred(4) = x_prev(4) + x_prev(8) * dt;   // vx_img
+        x_pred(5) = x_prev(5) + x_prev(9) * dt;   // vy_img
+        x_pred(6) = x_prev(6) + x_prev(10) * dt;  // vw
+        x_pred(7) = x_prev(7) + x_prev(11) * dt;  // vh
+
+        // 加速度: a = a0
+        x_pred.segment<4>(8) = x_prev.segment<4>(8);
+
+        // --- IMU运动补偿 ---
+        double omega_x = imu_omega(0);
+        double omega_y = imu_omega(1);
+        double omega_z = imu_omega(2);
+        double cx = x_prev(0);
+        double cy = x_prev(1);
+        double px = intrinsics_.px;
+        double py = intrinsics_.py;
+        double fx = intrinsics_.fx;
+        double fy = intrinsics_.fy;
+
+        double v_imu_cx = (1.0/fy)*(cx-px)*(cy-py)*omega_x 
+                        - (fx + (1.0/fx)*(cx-px)*(cx-px))*omega_y 
+                        + (fx/fy)*(cy-py)*omega_z;
+        double v_imu_cy = (fy + (1.0/fy)*(cy-py)*(cy-py))*omega_x 
+                        - (1.0/fx)*(cx-px)*(cy-py)*omega_y 
+                        - (fy/fx)*(cx-px)*omega_z;
+
+        v_imu_cache_ << v_imu_cx, v_imu_cy;
+        
+        x_pred(0) += v_imu_cx * dt;
+        x_pred(1) += v_imu_cy * dt;
+
+        // --- 3D空间 CV 模型预测 (6维) ---
+        // 位置: p = p0 + v*dt
+        x_pred(12) = x_prev(12) + x_prev(15) * dt;  // px
+        x_pred(13) = x_prev(13) + x_prev(16) * dt;  // py
+        x_pred(14) = x_prev(14) + x_prev(17) * dt;  // pz
+
+        // 速度: v = v0
+        x_pred.segment<3>(15) = x_prev.segment<3>(15);
+
+        // --- 计算雅可比矩阵 F (18x18) ---
+        Matrix18d F = Matrix18d::Identity();
+        
+        // 图像空间 CA 模型
+        F(0, 4) = dt;  F(0, 8) = dt2;
+        F(1, 5) = dt;  F(1, 9) = dt2;
+        F(2, 6) = dt;  F(2, 10) = dt2;
+        F(3, 7) = dt;  F(3, 11) = dt2;
+        F(4, 8) = dt;
+        F(5, 9) = dt;
+        F(6, 10) = dt;
+        F(7, 11) = dt;
+
+        // IMU补偿的雅可比
+        double d_vcx_dcx = (1.0/fy)*(cy-py)*omega_x - (2.0/fx)*(cx-px)*omega_y;
+        double d_vcx_dcy = (1.0/fy)*(cx-px)*omega_x + (fx/fy)*omega_z;
+        double d_vcy_dcx = -(1.0/fx)*(cy-py)*omega_y - (fy/fx)*omega_z;
+        double d_vcy_dcy = (2.0/fy)*(cy-py)*omega_x - (1.0/fx)*(cx-px)*omega_y;
+
+        F(0, 0) += d_vcx_dcx * dt;
+        F(0, 1) += d_vcx_dcy * dt;
+        F(1, 0) += d_vcy_dcx * dt;
+        F(1, 1) += d_vcy_dcy * dt;
+
+        // 3D空间 CV 模型
+        F(12, 15) = dt;
+        F(13, 16) = dt;
+        F(14, 17) = dt;
+
+        // --- 更新状态和协方差 ---
+        x_ = x_pred;
+        P_ = F * P_ * F.transpose() + Q_;
+        
+        // 强制对称性
+        P_ = 0.5 * (P_ + P_.transpose());
+
+        if (current_time > 0) {
+            history_buffer_.push_back({current_time, x_, P_, imu_omega});
             if (history_buffer_.size() > max_buffer_size_) {
                 history_buffer_.pop_front();
             }
@@ -303,226 +414,363 @@ public:
     }
 
     /**
-     * @brief Update step with 2D Bbox and 3D Drone State
+     * @brief EKF更新步骤 (使用Bbox结构体)
+     * @param current_time 当前时间戳
+     * @param bbox 检测框 {cx, cy, w, h}
+     * @param drone_pos 无人机位置
+     * @param q_C_W 相机到世界的四元数
      */
-    void update(int64_t ts, const Bbox& measurement, 
-                const Eigen::Vector3d& drone_pos, 
+    void update(int64_t current_time,
+                const Bbox& bbox,
+                const Eigen::Vector3d& drone_pos,
                 const Eigen::Quaterniond& q_C_W) {
-        
-        last_drone_pos_ = drone_pos;
-        last_q_C_W_ = q_C_W;
+        Eigen::Vector4d bbox_vec;
+        bbox_vec << bbox.cx, bbox.cy, bbox.w, bbox.h;
+        update(current_time, current_time, bbox_vec, drone_pos, q_C_W);
+    }
 
+    /**
+     * @brief EKF更新步骤
+     * @param current_time 当前时间戳
+     * @param ts 测量时间戳
+     * @param bbox [cx, cy, w, h]
+     * @param drone_pos 无人机位置
+     * @param q_C_W 相机到世界的四元数
+     */
+    void update(int64_t current_time, int64_t ts,
+                const Eigen::Vector4d& bbox,
+                const Eigen::Vector3d& drone_pos,
+                const Eigen::Quaterniond& q_C_W) {
         if (!is_initialized_) {
-            initialize(measurement, drone_pos, q_C_W);
+            initialize(bbox, drone_pos, q_C_W);
             return;
         }
 
+        // 查找历史状态
         auto it = std::min_element(history_buffer_.begin(), history_buffer_.end(),
             [&](const StateHistory& a, const StateHistory& b) {
                 return std::abs(a.timestamp - ts) < std::abs(b.timestamp - ts);
             });
 
         if (it != history_buffer_.end()) {
-            // Rewind to closest historical state
             x_ = it->state;
             P_ = it->covariance;
-            
-            // Update with measurement
-            update_internal(measurement, drone_pos, q_C_W);
+            update_internal(bbox, drone_pos, q_C_W);
 
-            // Replay predictions from that point
+            // 重放后续IMU输入
             for (auto replay_it = std::next(it); replay_it != history_buffer_.end(); ++replay_it) {
                 dt_ = replay_it->timestamp - std::prev(replay_it)->timestamp;
                 predict(-1.0, replay_it->imu_input);
             }
         } else {
-            update_internal(measurement, drone_pos, q_C_W);
+            update_internal(bbox, drone_pos, q_C_W);
         }
     }
-    
-    void update(int64_t ts, const Bbox& measurement) {
-        update(ts, measurement, last_drone_pos_, last_q_C_W_);
+
+    /** @brief 获取图像空间状态 [cx, cy, w, h] */
+    Eigen::Vector4d getImageState() const {
+        return x_.head<4>();
     }
 
-    Bbox get_bbox() const {
-        return project_to_bbox(x_, last_drone_pos_, last_q_C_W_);
-    }
-    
-    Bbox project_to_bbox(const Vector6d& state, 
-                         const Eigen::Vector3d& drone_pos, 
-                         const Eigen::Quaterniond& q_C_W) const {
-        Bbox b;
-        Eigen::Vector3d P_W = state.head<3>();
-        Eigen::Vector3d P_rel_W = P_W - drone_pos;
-        Eigen::Vector3d P_C = q_C_W.inverse() * P_rel_W;
-        
-        if (P_C.x() < 0.1) P_C.x() = 0.1;
-
-        b.cx = intrinsics_.px - P_C.y() * intrinsics_.fx / P_C.x();
-        b.cy = intrinsics_.py - P_C.z() * intrinsics_.fy / P_C.x();
-        b.w = (intrinsics_.fx * target_size_est_) / P_C.x();
-        b.h = (intrinsics_.fy * target_size_est_) / P_C.x();
-        return b;
+    /** @brief 获取3D位置状态 [px, py, pz] */
+    Eigen::Vector3d get3DPosition() const {
+        return x_.segment<3>(12);
     }
 
-    bool is_healthy() const {
-        return !x_.hasNaN() && P_.diagonal().maxCoeff() < 1e6;
+    /** @brief 获取3D速度状态 [vx, vy, vz] */
+    Eigen::Vector3d get3DVelocity() const {
+        return x_.segment<3>(15);
+    }
+
+    /** @brief 获取完整6D状态 [px, py, pz, vx, vy, vz] */
+    Vector6d get3DState() const {
+        Vector6d state;
+        state.head<3>() = x_.segment<3>(12);
+        state.tail<3>() = x_.segment<3>(15);
+        return state;
+    }
+
+    /** @brief 获取完整18D状态向量 */
+    const Vector18d& getFullState() const {
+        return x_;
+    }
+
+    /**
+     * @brief 将状态转换为视线角和角速度
+     * @param compensate_rotation 是否补偿相机自转
+     * @return [azimuth, elevation, azimuth_rate, elevation_rate] (弧度, 弧度/秒)
+     */
+    Eigen::Vector4d stateToLosAngles(bool compensate_rotation = false) {
+        double cx = x_(0);
+        double cy = x_(1);
+        double vx_target = x_(4);
+        double vy_target = x_(5);
+
+        if (!compensate_rotation) {
+            vx_target += v_imu_cache_(0);
+            vy_target += v_imu_cache_(1);
+        }
+
+        double norm_x = (cx - intrinsics_.px) / intrinsics_.fx;
+        double norm_y = (cy - intrinsics_.py) / intrinsics_.fy;
+
+        double azimuth = std::atan(norm_x);
+        double elevation = std::atan(norm_y);
+
+        double azimuth_rate = (vx_target / intrinsics_.fx) / (1.0 + norm_x * norm_x);
+        double elevation_rate = (vy_target / intrinsics_.fy) / (1.0 + norm_y * norm_y);
+
+        azimuth_rate = ema_filter_.filter(azimuth_rate, 0);
+        elevation_rate = ema_filter_.filter(elevation_rate, 1);
+
+        Eigen::Vector4d result;
+        result << azimuth, elevation, azimuth_rate, elevation_rate;
+        return result;
     }
     
-    Vector6d get_state() const { return x_; }
-    
+    /** @brief 兼容性接口：检查滤波器是否已初始化 */
     bool is_initialized() const { return is_initialized_; }
     
+    /** @brief 检查EKF状态是否健康 (无NaN) */
+    bool is_healthy() const {
+        if (x_.hasNaN() || P_.hasNaN()) return false;
+        return checkCovarianceHealth();
+    }
+    
+    /** @brief 获取6D状态 [px, py, pz, vx, vy, vz] - 兼容TargetEKF接口 */
+    Vector6d get_state() const {
+        return get3DState();
+    }
+
+    /** @brief 重置滤波器 */
     void reset() {
         is_initialized_ = false;
         x_.setZero();
-        P_ = Q_base_ * 100;
+        P_ = Q_ * 10.0;
         history_buffer_.clear();
         ema_filter_.reset();
     }
 
-    struct WorldState {
-        Eigen::Vector3d pos;
-        Eigen::Vector3d vel;
-    };
-
-    WorldState get_est_world_state(const Eigen::Vector3d& drone_pos, 
-                                   const Eigen::Vector3d& drone_vel,
-                                   const Eigen::Quaterniond& q_C_W,
-                                   const Eigen::Vector3d& omega_body) const {
-        WorldState result;
-        result.pos = x_.head<3>();
-        result.vel = x_.tail<3>();
-        return result;
-    }
-    
-    LOS state_to_los(bool compensate_rotation = true) {
-        Eigen::Vector3d P_rel = x_.head<3>() - last_drone_pos_;
-        Eigen::Vector3d P_C = last_q_C_W_.inverse() * P_rel; 
-        
-        double norm_x = P_C.x();
-        double norm_y = P_C.y();
-        double norm_z = P_C.z();
-        LOS l;
-        l.azimuth = std::atan2(norm_y, norm_x);
-        l.elevation = std::atan2(norm_z, norm_x);
-        l.azimuth_rate = 0;
-        l.elevation_rate = 0;
-        return l;
+    /** @brief 检查协方差矩阵健康状态 */
+    bool checkCovarianceHealth() const {
+        double max_var = P_.diagonal().maxCoeff();
+        if (max_var > 1e6) return false;
+        Eigen::SelfAdjointEigenSolver<Matrix18d> solver(P_, Eigen::EigenvaluesOnly);
+        return solver.eigenvalues().minCoeff() >= 0;
     }
 
 private:
-    void initialize(const Bbox& z, const Eigen::Vector3d& drone_pos, const Eigen::Quaterniond& q_C_W) {
-        Eigen::Vector3d P_W = noisy_bbox_to_pos_init(z, drone_pos, q_C_W);
+    /**
+     * @brief 使用第一个测量值初始化滤波器
+     * @param bbox_measurement [cx, cy, w, h]
+     * @param drone_pos 无人机位置 (世界坐标系)
+     * @param q_C_W 相机到世界的四元数
+     */
+    void initialize(const Eigen::Vector4d& bbox_measurement,
+                    const Eigen::Vector3d& drone_pos,
+                    const Eigen::Quaterniond& q_C_W) {
         x_.setZero();
-        x_.head<3>() = P_W;
-        // Initialize velocity to zero
-        x_.tail<3>().setZero();
-        is_initialized_ = true;
         
-        last_drone_pos_ = drone_pos;
-        last_q_C_W_ = q_C_W;
-    }
-
-    void update_internal(const Bbox& z_meas, 
-                         const Eigen::Vector3d& drone_pos, 
-                         const Eigen::Quaterniond& q_C_W) {
-        
-        // 1. Predict Measurement z_pred
-        Eigen::Vector3d P_W = x_.head<3>();
-        Eigen::Vector3d P_rel_W = P_W - drone_pos;
-        Eigen::Matrix3d R_W_to_C = q_C_W.toRotationMatrix().transpose();
-        Eigen::Vector3d P_C = R_W_to_C * P_rel_W;
-        
-        double xc = P_C.x();
-        double yc = P_C.y();
-        double zc = P_C.z();
-        
-        if (xc < 0.1) return; // Behind camera
-
-        Eigen::Vector4d z_pred;
-        z_pred(0) = intrinsics_.px - yc * intrinsics_.fx / xc;
-        z_pred(1) = intrinsics_.py - zc * intrinsics_.fy / xc;
-        z_pred(2) = intrinsics_.fx * target_size_est_ / xc;
-        z_pred(3) = intrinsics_.fy * target_size_est_ / xc;
-
-        // 2. Jacobian H (4x6)
-        double xc2 = xc * xc;
-        
-        Eigen::Matrix<double, 4, 3> J_cam;
-        // du/dP_C
-        J_cam.row(0) << yc * intrinsics_.fx / xc2, -intrinsics_.fx / xc, 0.0;
-        // dv/dP_C
-        J_cam.row(1) << zc * intrinsics_.fy / xc2, 0.0, -intrinsics_.fy / xc;
-        // dw/dP_C
-        J_cam.row(2) << -intrinsics_.fx * target_size_est_ / xc2, 0.0, 0.0;
-        // dh/dP_C
-        J_cam.row(3) << -intrinsics_.fy * target_size_est_ / xc2, 0.0, 0.0;
-        
-        Matrix4x6d H = Matrix4x6d::Zero();
-        H.block<4,3>(0,0) = J_cam * R_W_to_C;
-        // Velocity states have zero Jacobian (not directly observed)
-        
-        // 3. Kalman Update
-        Eigen::Vector4d z_vec;
-        z_vec << z_meas.cx, z_meas.cy, z_meas.w, z_meas.h;
-        Eigen::Vector4d y = z_vec - z_pred;
-        
-        Eigen::Matrix4d S = H * P_ * H.transpose() + R_;
-        
-        // Use LLT decomposition for numerical stability
-        Eigen::LLT<Eigen::Matrix4d> llt_S(S);
-        if (llt_S.info() != Eigen::Success) {
-            return; // Skip update if S is not positive definite
+        // 检查bbox有效性
+        double bbox_w = bbox_measurement(2);
+        double bbox_h = bbox_measurement(3);
+        if (bbox_w < 1.0 || bbox_h < 1.0 || std::isnan(bbox_w) || std::isnan(bbox_h)) {
+            // 无效的bbox，不初始化
+            return;
         }
         
-        Matrix6x4d K = P_ * H.transpose() * llt_S.solve(Eigen::Matrix4d::Identity());
+        // 图像空间初始化
+        x_.head<4>() = bbox_measurement;
+        
+        // 3D位置初始化 - 从bbox估计 (使用较大的边)
+        // 使用与TargetEKF相同的相机坐标系约定:
+        // 相机坐标系: X前, Y右, Z下
+        // 图像坐标系: u = bbox.cx - px (正=右), v = bbox.cy - py (正=下)
+        double bbox_size = std::max(bbox_w, bbox_h);
+        double est_dist_cam_x = intrinsics_.fx * target_size_est_ / bbox_size;
+        
+        // 限制估计距离在合理范围
+        est_dist_cam_x = std::clamp(est_dist_cam_x, 1.0, 1000.0);
+        
+        // 计算图像偏移 (相对主点)
+        double u = bbox_measurement(0) - intrinsics_.px;  // 水平偏移
+        double v = bbox_measurement(1) - intrinsics_.py;  // 垂直偏移
+        
+        // 透视补偿 (与TargetEKF相同)
+        double v_sq = v * v;
+        double f_sq = intrinsics_.fx * intrinsics_.fx;
+        double v_compensated = v - perspective_compensation_ * target_size_est_ * v * intrinsics_.fx / (f_sq + v_sq) / (intrinsics_.fx * target_size_est_ / bbox_size);
+        
+        // 相机系LOS向量 (注意负号 - 与TargetEKF一致)
+        double est_los_C_y = -u * est_dist_cam_x / intrinsics_.fx;
+        double est_los_C_z = -v_compensated * est_dist_cam_x / intrinsics_.fy;
+        Eigen::Vector3d los_C(est_dist_cam_x, est_los_C_y, est_los_C_z);
+        
+        Eigen::Matrix3d R_C_W = q_C_W.toRotationMatrix();
+        Eigen::Vector3d target_pos_W = drone_pos + R_C_W * los_C;
+        
+        // 检查结果有效性
+        if (target_pos_W.hasNaN()) {
+            return;
+        }
+        
+        x_.segment<3>(12) = target_pos_W;
+        
+        // 重置协方差
+        P_ = Q_ * 10.0;
+        
+        is_initialized_ = true;
+        last_timestamp_ = -1.0;
+        history_buffer_.clear();
+    }
+
+    /**
+     * @brief 内部更新函数
+     * @param bbox 测量边界框 [cx, cy, w, h]
+     * @param drone_pos 无人机位置
+     * @param q_C_W 相机到世界的四元数
+     */
+    void update_internal(const Eigen::Vector4d& bbox,
+                         const Eigen::Vector3d& drone_pos,
+                         const Eigen::Quaterniond& q_C_W) {
+        // 检查输入有效性
+        if (bbox.hasNaN() || drone_pos.hasNaN() || x_.hasNaN()) {
+            return;
+        }
+        
+        // 检查bbox尺寸有效性
+        if (bbox(2) < 1.0 || bbox(3) < 1.0) {
+            return;
+        }
+        
+        // --- 计算3D投影测量和雅可比 ---
+        Eigen::Vector3d p_target = x_.segment<3>(12);
+        Eigen::Vector3d los_W = p_target - drone_pos;
+        Eigen::Matrix3d R_W_C = q_C_W.toRotationMatrix().transpose();
+        Eigen::Vector3d los_C = R_W_C * los_W;
+        
+        double x_c = los_C(0), y_c = los_C(1), z_c = los_C(2);
+
+        if (x_c < 0.1) return; // 避免除零，目标必须在相机前方
+
+        // 预测的3D投影测量 (u, v, size_proj)
+        // 相机坐标系: X前, Y右, Z下
+        // 投影: u = -fx * y/x (负号因为y正=右但u正=左时目标在右边图像偏右)
+        // 实际上与TargetEKF一致: 预测值使用相同公式
+        double u_pred = intrinsics_.fx * y_c / x_c;  // 不带负号，残差计算时处理
+        double v_pred = intrinsics_.fy * z_c / x_c;
+        double size_pred = intrinsics_.fx * target_size_est_ / x_c;
+
+        // 从bbox计算实际测量的u,v (相对主点，带负号与TargetEKF一致)
+        double u_meas = -(bbox(0) - intrinsics_.px);  // 负号匹配TargetEKF
+        double v_meas_raw = -(bbox(1) - intrinsics_.py);  // 负号匹配TargetEKF
+        double size_meas = std::max(bbox(2), bbox(3));
+        
+        // 透视补偿 (与TargetEKF相同)
+        double v_raw = bbox(1) - intrinsics_.py;
+        double v_sq = v_raw * v_raw;
+        double f_sq = intrinsics_.fx * intrinsics_.fx;
+        double v_meas = v_meas_raw + perspective_compensation_ * target_size_est_ * v_raw * intrinsics_.fx / (f_sq + v_sq) / (intrinsics_.fx * target_size_est_ / size_meas);
+
+        // 构建完整测量向量 [cx, cy, w, h, u, v, size]
+        Vector7d z_full;
+        z_full << bbox(0), bbox(1), bbox(2), bbox(3),
+                  u_meas, v_meas, size_meas;
+
+        // 预测测量
+        Vector7d z_pred;
+        z_pred << x_(0), x_(1), x_(2), x_(3),
+                  u_pred, v_pred, size_pred;
+
+        // 计算雅可比 H (7x18)
+        Matrix7x18d H = Matrix7x18d::Zero();
+        H(0, 0) = 1.0; H(1, 1) = 1.0; H(2, 2) = 1.0; H(3, 3) = 1.0;
+
+        // 3D投影雅可比 (d[u,v,size]/d[px,py,pz])
+        Eigen::Vector3d r1 = R_W_C.row(0);
+        Eigen::Vector3d r2 = R_W_C.row(1);
+        Eigen::Vector3d r3 = R_W_C.row(2);
+        double x_c_sq = x_c * x_c;
+
+        Eigen::RowVector3d du_dp = (intrinsics_.fx / x_c) * r2.transpose() 
+                                 - (intrinsics_.fx * y_c / x_c_sq) * r1.transpose();
+        Eigen::RowVector3d dv_dp = (intrinsics_.fy / x_c) * r3.transpose() 
+                                 - (intrinsics_.fy * z_c / x_c_sq) * r1.transpose();
+        Eigen::RowVector3d dsize_dp = -(intrinsics_.fx * target_size_est_ / x_c_sq) * r1.transpose();
+
+        H.block<1, 3>(4, 12) = du_dp;
+        H.block<1, 3>(5, 12) = dv_dp;
+        H.block<1, 3>(6, 12) = dsize_dp;
+
+        // --- 卡尔曼更新 ---
+        Vector7d y = z_full - z_pred;
+        
+        // 限制残差大小防止发散
+        for (int i = 0; i < 7; ++i) {
+            y(i) = std::clamp(y(i), -500.0, 500.0);
+        }
+        
+        Eigen::Matrix<double, 18, 7> PH_T = P_ * H.transpose();
+        Matrix7d S = H * PH_T + R_;
+
+        // 使用LLT分解替代行列式检查
+        Eigen::LLT<Matrix7d> llt_S(S);
+        if (llt_S.info() != Eigen::Success) {
+            return; // S矩阵不正定
+        }
+
+        Eigen::Matrix<double, 18, 7> K = PH_T * llt_S.solve(Matrix7d::Identity());
+        
+        // 检查K是否有效
+        if (K.hasNaN()) {
+            return;
+        }
         
         x_ = x_ + K * y;
-        P_ = (Matrix6d::Identity() - K * H) * P_;
+
+        // Joseph形式协方差更新
+        static const Matrix18d I = Matrix18d::Identity();
+        Matrix18d I_KH = I - K * H;
+        P_ = I_KH * P_ * I_KH.transpose() + K * R_ * K.transpose();
+        P_ = 0.5 * (P_ + P_.transpose());
         
-        // Ensure P stays symmetric
-        P_ = (P_ + P_.transpose()) * 0.5;
-    }
-    
-    Eigen::Vector3d noisy_bbox_to_pos_init(const Bbox& bbox, 
-                                           const Eigen::Vector3d& drone_pos, 
-                                           const Eigen::Quaterniond& q_C_W) const {
-        double bbox_size = std::max(bbox.w, bbox.h);
-        if (bbox_size < 1e-6) bbox_size = 1.0;
-        double depth = intrinsics_.fx * target_size_est_ / bbox_size;
-        
-        double u_rel = bbox.cx - intrinsics_.px;
-        double v_rel = bbox.cy - intrinsics_.py;
-        
-        double yc = -u_rel * depth / intrinsics_.fx;
-        double zc = -v_rel * depth / intrinsics_.fy;
-        double xc = depth;
-        
-        Eigen::Vector3d P_C(xc, yc, zc);
-        return drone_pos + q_C_W * P_C;
+        // 最终NaN检查
+        if (x_.hasNaN() || P_.hasNaN()) {
+            // 恢复到更新前状态并重置
+            reset();
+        }
     }
 
-    Vector6d x_;
-    Matrix6d P_;
-    Matrix6d Q_base_;
-    Eigen::Matrix4d R_;
+    // 状态向量 (18维)
+    Vector18d x_;
+    // 协方差矩阵
+    Matrix18d P_;
+    // 过程噪声协方差
+    Matrix18d Q_;
+    // 测量噪声协方差
+    Matrix7d R_;
+    // 测量矩阵
+    Matrix7x18d H_;
 
+    // 相机参数
     CameraIntrinsics intrinsics_;
+    double target_size_est_;
+    double perspective_compensation_;
+
+    // 历史缓冲区
     std::deque<StateHistory> history_buffer_;
     size_t max_buffer_size_;
 
+    // 状态标志
     bool is_initialized_;
     int64_t last_timestamp_;
     int64_t dt_;
 
+    // IMU缓存
+    Eigen::Vector2d v_imu_cache_;
+
+    // EMA滤波器
     EMAFilterTemplate<2> ema_filter_;
-    
-    double target_size_est_;
-    double perspective_compensation_;
-    
-    Eigen::Vector3d last_drone_pos_;
-    Eigen::Quaterniond last_q_C_W_;
 };
 
 // ============================================================================
