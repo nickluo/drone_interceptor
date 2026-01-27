@@ -112,7 +112,8 @@ private:
         this->declare_parameter<double>("cost.w_u_thrust", 0.1);
     }
     void load_parameters();
-
+    void setup_ekf();
+    
     void mission_launch_callback(const std_msgs::msg::Header::SharedPtr msg);
     void odom_callback(const nav_msgs::msg::Odometry::SharedPtr msg);
     void bbox_callback(const vision_msgs::msg::Detection2D::SharedPtr msg);
@@ -140,8 +141,8 @@ private:
     void reset_solver_warm_start(const VectorX& current_state);
     void transition_to_state(MissionState new_state, const char* reason);
 
-    // Image-based PN Guidance (直接使用检测框计算LOS)
-    VectorU calculate_pn_controls_image_based(const VectorX& drone_state);
+    // Image-based PN Guidance
+    VectorU calculate_pn_controls_image_based(const VectorX& drone_state, const Eigen::Vector3d &pos_est, const Eigen::Vector3d &vel_est);
 
     // Member Variables
     bool use_simulation_;
@@ -154,6 +155,12 @@ private:
     double pn_fov_switch_deg_;
     bool pn_active_ {false}; // Latched state for PN
     double pn_vc_initial_ {0.0}; // 切换到PN时body系x轴速度
+    double pn_last_thrust_ {0.0}; // 上一次PN推力指令 (用于变化率限制)
+    
+    // 自适应推力效率估计 (MPC阶段学习)
+    double thrust_efficiency_ {1.0};  // 推力效率系数 (T_actual = efficiency * T_cmd)
+    Eigen::Vector3d last_accel_world_ {0.0, 0.0, 0.0};  // 上一周期世界系加速度
+    double last_thrust_cmd_ {0.0};  // 上一周期推力指令
     
     double bbox_pos_std_dev_, bbox_size_std_dev_;
     double target_physical_size_est_;

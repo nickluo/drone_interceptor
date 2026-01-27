@@ -42,26 +42,9 @@ InterceptorNodeQuaternion::InterceptorNodeQuaternion()
     cam_intrinsics.px = cam_width_px_ / 2.0;
     cam_intrinsics.py = cam_height_px_ / 2.0;
     
-    // 8维过程噪声: [std_pos_img, std_vel_img, std_accel_img, std_size, std_size_vel, std_accel_size, std_pos_3d, std_vel_3d]
-    Eigen::Matrix<double, 8, 1> process_noise;
-    process_noise << bbox_pos_std_dev_ * 0.1,   // std_pos_img
-                     bbox_pos_std_dev_ * 0.5,   // std_vel_img
-                     bbox_pos_std_dev_ * 0.25,  // std_accel_img
-                     bbox_size_std_dev_ * 0.1,  // std_size
-                     bbox_size_std_dev_ * 0.5,  // std_size_vel
-                     bbox_size_std_dev_ * 0.25, // std_accel_size
-                     0.5,                       // std_pos_3d (米)
-                     1.0;                       // std_vel_3d (米/秒)
-    // 3维测量噪声: [std_meas_pos, std_meas_size, std_meas_3d]
-    Eigen::Vector3d measurement_noise;
-    measurement_noise << bbox_pos_std_dev_, bbox_size_std_dev_, bbox_pos_std_dev_ * 0.1;
-    
-    const int predicted_imu_freq = 100;
-    ekf_ = std::make_unique<DroneEKF>(cam_intrinsics, process_noise, measurement_noise,
-                                       predicted_imu_freq, detection_latency_,
-                                       target_physical_size_est_, perspective_compensation_);
-    ekf_legacy_ = std::make_unique<TargetEKF>(dt_, cam_focal_length_, target_physical_size_est_, 
-                                              bbox_pos_std_dev_, bbox_size_std_dev_, perspective_compensation_);
+    setup_ekf();
+    // ekf_legacy_ = std::make_unique<TargetEKF>(dt_, cam_focal_length_, target_physical_size_est_, 
+    //                                           bbox_pos_std_dev_, bbox_size_std_dev_, perspective_compensation_);
     int filter_n = static_cast<int>(RATE_TC_ * 2.0 / dt_);
     if (filter_n < 5) filter_n = 5;
     output_filter_ = std::make_unique<EMAFilter>(filter_n, 4);
@@ -223,6 +206,35 @@ void InterceptorNodeQuaternion::load_parameters()
     this->get_parameter("pn.fov_switch_deg", pn_fov_switch_deg_);
 }
 
+void InterceptorNodeQuaternion::setup_ekf()
+{
+    // 创建DroneEKF - 使用图像坐标系的12维CA模型 + 3D位置估计
+    CameraIntrinsics cam_intrinsics;
+    cam_intrinsics.fx = cam_focal_length_;
+    cam_intrinsics.fy = cam_focal_length_;
+    cam_intrinsics.px = cam_width_px_ / 2.0;
+    cam_intrinsics.py = cam_height_px_ / 2.0;
+    
+    // 8维过程噪声: [std_pos_img, std_vel_img, std_accel_img, std_size, std_size_vel, std_accel_size, std_pos_3d, std_vel_3d]
+    Eigen::Matrix<double, 8, 1> process_noise;
+    process_noise << bbox_pos_std_dev_ * 0.1,   // std_pos_img
+                    bbox_pos_std_dev_ * 0.5,   // std_vel_img
+                    bbox_pos_std_dev_ * 0.25,  // std_accel_img
+                    bbox_size_std_dev_ * 0.1,  // std_size
+                    bbox_size_std_dev_ * 0.5,  // std_size_vel
+                    bbox_size_std_dev_ * 0.25, // std_accel_size
+                    target_physical_size_est_,         // std_pos_3d (米)
+                    target_physical_size_est_ * 2.0;   // std_vel_3d (米/秒)
+    // 3维测量噪声: [std_meas_pos, std_meas_size, std_meas_3d]
+    Eigen::Vector3d measurement_noise;
+    measurement_noise << bbox_pos_std_dev_, bbox_size_std_dev_, target_physical_size_est_;
+    
+    const int predicted_imu_freq = 100;
+    ekf_ = std::make_unique<DroneEKF>(cam_intrinsics, process_noise, measurement_noise,
+                                        predicted_imu_freq, detection_latency_,
+                                        target_physical_size_est_, perspective_compensation_);
+}
+
 void InterceptorNodeQuaternion::mission_launch_callback(const std_msgs::msg::Header::SharedPtr msg)
 {
     // 中止任务
@@ -248,33 +260,9 @@ void InterceptorNodeQuaternion::mission_launch_callback(const std_msgs::msg::Hea
         // 重置状态
         {
             std::unique_lock<std::shared_mutex> lock(mtx_ekf_);  // 写入使用独占锁
-            // 创建DroneEKF - 使用图像坐标系的12维CA模型 + 3D位置估计
-            CameraIntrinsics cam_intrinsics;
-            cam_intrinsics.fx = cam_focal_length_;
-            cam_intrinsics.fy = cam_focal_length_;
-            cam_intrinsics.px = cam_width_px_ / 2.0;
-            cam_intrinsics.py = cam_height_px_ / 2.0;
-            
-            // 8维过程噪声: [std_pos_img, std_vel_img, std_accel_img, std_size, std_size_vel, std_accel_size, std_pos_3d, std_vel_3d]
-            Eigen::Matrix<double, 8, 1> process_noise;
-            process_noise << bbox_pos_std_dev_ * 0.1,   // std_pos_img
-                             bbox_pos_std_dev_ * 0.5,   // std_vel_img
-                             bbox_pos_std_dev_ * 0.25,  // std_accel_img
-                             bbox_size_std_dev_ * 0.1,  // std_size
-                             bbox_size_std_dev_ * 0.5,  // std_size_vel
-                             bbox_size_std_dev_ * 0.25, // std_accel_size
-                             0.5,                       // std_pos_3d (米)
-                             1.0;                       // std_vel_3d (米/秒)
-            // 3维测量噪声: [std_meas_pos, std_meas_size, std_meas_3d]
-            Eigen::Vector3d measurement_noise;
-            measurement_noise << bbox_pos_std_dev_, bbox_size_std_dev_, bbox_pos_std_dev_ * 0.1;
-            
-            const int predicted_imu_freq = 100;
-            ekf_ = std::make_unique<DroneEKF>(cam_intrinsics, process_noise, measurement_noise,
-                                               predicted_imu_freq, detection_latency_,
-                                               target_physical_size_est_, perspective_compensation_);
-            ekf_legacy_ = std::make_unique<TargetEKF>(dt_, cam_focal_length_, target_physical_size_est_, 
-                                                  bbox_pos_std_dev_, bbox_size_std_dev_, perspective_compensation_);
+            setup_ekf();
+            // ekf_legacy_ = std::make_unique<TargetEKF>(dt_, cam_focal_length_, target_physical_size_est_, 
+            //                                       bbox_pos_std_dev_, bbox_size_std_dev_, perspective_compensation_);
         }
         {
             std::unique_lock<std::shared_mutex> lock(mtx_drone_state_);  // 写入使用独占锁
@@ -479,12 +467,12 @@ void InterceptorNodeQuaternion::bbox_callback(const vision_msgs::msg::Detection2
         // 注意：旧TargetEKF使用的是Body-to-World的Quaternion（如果相机固定）
         // 如果使用current_gimbal_orientation_，需要确保它是World-to-Camera还是Body-to-Camera
         // 假设这里我们使用机体姿态（无独立云台）
-         if (!ekf_legacy_->is_initialized()) {
-            Eigen::Vector3d init_pos = ekf_legacy_->noisy_bbox_to_pos(legacy_bbox, curr_drone_state_for_ekf.head<3>(), q_C_W);
-            ekf_legacy_->initialize(init_pos);
-        } else {
-            ekf_legacy_->update(legacy_bbox, curr_drone_state_for_ekf.head<3>(), q_C_W);
-        }
+        //  if (!ekf_legacy_->is_initialized()) {
+        //     Eigen::Vector3d init_pos = ekf_legacy_->noisy_bbox_to_pos(legacy_bbox, curr_drone_state_for_ekf.head<3>(), q_C_W);
+        //     ekf_legacy_->initialize(init_pos);
+        // } else {
+        //     ekf_legacy_->update(legacy_bbox, curr_drone_state_for_ekf.head<3>(), q_C_W);
+        // }
     }
     
     if (!timer_ && msg->header.frame_id != "" && mission_state_.is_active()) {
@@ -663,30 +651,30 @@ void InterceptorNodeQuaternion::run_control_cycle(const Eigen::Vector3d &pos_est
     }
 
     // --- Compare EKF Outputs ---
-    if (ekf_legacy_ && ekf_legacy_->is_initialized()) {
-         ekf_legacy_->predict(dt_);
-         Eigen::VectorXd legacy_state = ekf_legacy_->get_state();
-         Eigen::Vector3d pos_legacy = legacy_state.head<3>();
-         Eigen::Vector3d vel_legacy = legacy_state.tail<3>();
+    // if (ekf_legacy_ && ekf_legacy_->is_initialized()) {
+    //      ekf_legacy_->predict(dt_);
+    //      Eigen::VectorXd legacy_state = ekf_legacy_->get_state();
+    //      Eigen::Vector3d pos_legacy = legacy_state.head<3>();
+    //      Eigen::Vector3d vel_legacy = legacy_state.tail<3>();
          
-         double pos_diff = (pos_est - pos_legacy).norm();
-         double vel_diff = (vel_est - vel_legacy).norm();
+    //      double pos_diff = (pos_est - pos_legacy).norm();
+    //      double vel_diff = (vel_est - vel_legacy).norm();
          
-         // 节流打印比较日志
-        //  RCLCPP_INFO_THROTTLE(this->get_logger(), *this->get_clock(), 500,
-         RCLCPP_INFO(this->get_logger(),
-             "EKF Comparison:\n"
-             "  DroneEKF Pos: [%.2f, %.2f, %.2f], Vel: [%.2f, %.2f, %.2f]\n"
-             "  TargetEKF Pos: [%.2f, %.2f, %.2f], Vel: [%.2f, %.2f, %.2f]\n"
-             "  Diff Pos: %.2f m, Vel: %.2f m/s",
-             pos_est.x(), pos_est.y(), pos_est.z(), vel_est.x(), vel_est.y(), vel_est.z(),
-             pos_legacy.x(), pos_legacy.y(), pos_legacy.z(), vel_legacy.x(), vel_legacy.y(), vel_legacy.z(),
-             pos_diff, vel_diff);
+    //      // 节流打印比较日志
+    //     //  RCLCPP_INFO_THROTTLE(this->get_logger(), *this->get_clock(), 500,
+    //      RCLCPP_INFO(this->get_logger(),
+    //          "EKF Comparison:\n"
+    //          "  DroneEKF Pos: [%.2f, %.2f, %.2f], Vel: [%.2f, %.2f, %.2f]\n"
+    //          "  TargetEKF Pos: [%.2f, %.2f, %.2f], Vel: [%.2f, %.2f, %.2f]\n"
+    //          "  Diff Pos: %.2f m, Vel: %.2f m/s",
+    //          pos_est.x(), pos_est.y(), pos_est.z(), vel_est.x(), vel_est.y(), vel_est.z(),
+    //          pos_legacy.x(), pos_legacy.y(), pos_legacy.z(), vel_legacy.x(), vel_legacy.y(), vel_legacy.z(),
+    //          pos_diff, vel_diff);
          
-         // 可以在这里根据情况选择使用原来的EKF
-         // pos_est = pos_legacy;
-         // vel_est = vel_legacy;
-    }
+    //      // 可以在这里根据情况选择使用原来的EKF
+    //      // pos_est = pos_legacy;
+    //      // vel_est = vel_legacy;
+    // }
 
     // 检查姿态安全
     if (!check_attitude_safety(curr_drone_state)) {
@@ -725,25 +713,26 @@ void InterceptorNodeQuaternion::run_control_cycle(const Eigen::Vector3d &pos_est
         if (pn_active_) {
             should_use_pn = true;
         } else {
-            // 使用图像直接测量的LOS角度判断是否切换到PN
-            Eigen::Vector2d current_los_angles;
+            // 使用DroneEKF的stateToLosAngles获取LOS角度判断是否切换到PN
             bool los_valid = false;
+            double azimuth = 0.0, elevation = 0.0;
             {
-                std::shared_lock<std::shared_mutex> lock(mtx_los_);
-                if (los_initialized_ && is_visible_) {
-                    current_los_angles = los_angles_;
-                    los_valid = true;
+                std::shared_lock<std::shared_mutex> lock(mtx_ekf_);
+                if (ekf_ && ekf_->is_initialized() && is_visible_) {
+                    Eigen::Vector4d los_state = ekf_->stateToLosAngles(true);
+                    azimuth = los_state(0);
+                    elevation = los_state(1);
+                    los_valid = !std::isnan(azimuth) && !std::isnan(elevation);
                 }
             }
             
             if (los_valid) {
                 // 计算LOS偏离视轴角度 (相机系)
-                double angle_off_boresight = std::sqrt(current_los_angles(0)*current_los_angles(0) + 
-                                                        current_los_angles(1)*current_los_angles(1));
-                bool target_in_fov_center = (std::abs(angle_off_boresight) < pn_fov_switch_deg_ * M_PI / 180.0);
+                double angle_off_boresight = std::sqrt(azimuth * azimuth + elevation * elevation);
+                bool target_in_fov_center = (angle_off_boresight < pn_fov_switch_deg_ * M_PI / 180.0);
                 
                 RCLCPP_INFO(this->get_logger(), "LOS angles (az,el): [%.2f, %.2f] deg, Off-boresight: %.2f deg, In FOV: %d", 
-                    current_los_angles(0) * 180.0 / M_PI, current_los_angles(1) * 180.0 / M_PI,
+                    azimuth * 180.0 / M_PI, elevation * 180.0 / M_PI,
                     angle_off_boresight * 180.0 / M_PI, target_in_fov_center ? 1 : 0);
                 RCLCPP_INFO(this->get_logger(), "Distance to target: %.2f m, Closing speed: %.2f m/s", 
                     dist_to_target, closing_speed_est);
@@ -756,11 +745,17 @@ void InterceptorNodeQuaternion::run_control_cycle(const Eigen::Vector3d &pos_est
                         Eigen::Quaterniond q(curr_drone_state(6), curr_drone_state(7), curr_drone_state(8), curr_drone_state(9));  // w,x,y,z
                         Eigen::Matrix3d R_body = q.toRotationMatrix();
                         Eigen::Vector3d vel_body = R_body.transpose() * vel_world;
-                        pn_vc_initial_ = std::max(vel_body(0) * 1.5, V_DESIRED_);
+                        // pn_vc_initial_ = std::max(vel_body(0) * 1.5, V_DESIRED_);
+                        pn_vc_initial_ = vel_body(0);
                         RCLCPP_INFO(this->get_logger(), "PN Initial Vc_body: %.2f m/s", pn_vc_initial_);
+                        
+                        // 重置PN推力状态，使用当前MPC的推力作为起点
+                        pn_last_thrust_ = G_;  // 从悬停推力开始
                     }
                     pn_active_ = true;
-                    RCLCPP_INFO(this->get_logger(), "Switching to IMAGE-BASED PROPORTIONAL NAVIGATION (Latch Active)");
+                    RCLCPP_INFO(this->get_logger(), 
+                        "Switching to IMAGE-BASED PN (Latch Active), Thrust Efficiency: %.3f", 
+                        thrust_efficiency_);
                 }
             }
         }
@@ -770,7 +765,7 @@ void InterceptorNodeQuaternion::run_control_cycle(const Eigen::Vector3d &pos_est
 
     if (should_use_pn) {
         // Use Image-Based PN Guidance (直接使用检测框计算的LOS角速率)
-        u_optimal_raw = calculate_pn_controls_image_based(curr_drone_state);
+        u_optimal_raw = calculate_pn_controls_image_based(curr_drone_state, pos_est, vel_est);
         // Reset solver failure counter as we are not relying on it
         consecutive_solver_failures_ = 0;
     } else {
@@ -855,6 +850,36 @@ void InterceptorNodeQuaternion::run_control_cycle(const Eigen::Vector3d &pos_est
         } else {
             // 求解成功，重置失败计数
             consecutive_solver_failures_ = 0;
+            
+            // ================================================================
+            // 自适应推力效率学习 (在MPC阶段收集数据)
+            // 通过比较指令推力和实际加速度来估计推力效率
+            // ================================================================
+            if (last_thrust_cmd_ > 1.0) {
+                // 计算期望的垂直加速度 (假设完美推力效率)
+                Eigen::Quaterniond q_curr(curr_drone_state(6), curr_drone_state(7), 
+                                          curr_drone_state(8), curr_drone_state(9));
+                Eigen::Matrix3d R_B_W_curr = q_curr.toRotationMatrix();
+                Eigen::Vector3d thrust_dir_world = R_B_W_curr.col(2);  // 机体Z轴在世界系中的方向
+                Eigen::Vector3d expected_accel = thrust_dir_world * last_thrust_cmd_ - Eigen::Vector3d(0, 0, G_);
+                
+                // 计算实际加速度 (通过速度差分)
+                Eigen::Vector3d current_vel = curr_drone_state.segment<3>(3);
+                Eigen::Vector3d accel_measured = (current_vel - last_accel_world_) / dt_;
+                last_accel_world_ = current_vel;  // 保存当前速度用于下次计算
+                
+                // 只在非极端机动时更新估计 (避免噪声干扰)
+                double expected_accel_z = expected_accel.z();
+                double actual_accel_z = accel_measured.z();
+                if (std::abs(expected_accel_z) > 0.5 && std::abs(actual_accel_z) > 0.1) {
+                    double efficiency_sample = actual_accel_z / expected_accel_z;
+                    // 限制合理范围
+                    efficiency_sample = std::clamp(efficiency_sample, 0.5, 1.5);
+                    // 指数移动平均更新
+                    thrust_efficiency_ = 0.9 * thrust_efficiency_ + 0.1 * efficiency_sample;
+                }
+            }
+            last_thrust_cmd_ = u_optimal_raw(3);
         }
 
         ocp_nlp_out_get(nlp_config_, nlp_dims_, nlp_out_, 0, "u", u_optimal_raw.data());
@@ -930,10 +955,329 @@ void InterceptorNodeQuaternion::run_control_cycle(const Eigen::Vector3d &pos_est
 
 // ============================================================================
 // Image-Based PN Guidance Implementation (直接使用检测框计算的LOS角速率)
+// 
+// 比例导引法 (Proportional Navigation, PN) 原理:
+// 要求侧向加速度与LOS角速率成正比: a_cmd = N * Vc * LOS_rate
+// 其中 N = 导航常数 (通常3-5), Vc = 接近速度
+//
+// 坐标系约定:
+// - 相机系: X前, Y右, Z下 (标准相机坐标系)
+// - 机体系 (FLU): X前, Y左, Z上  
+// - 世界系 (ENU): X东, Y北, Z上
+//
+// LOS角度约定 (相机系):
+// - azimuth > 0: 目标在相机右边
+// - elevation > 0: 目标在相机下方
+// - azimuth_rate > 0: 目标向右移动
+// - elevation_rate > 0: 目标向下移动
+//
+// 机体系FLU下的四旋翼动力学 (右手定则):
+// - 正roll (绕X轴正向旋转) = 右翼下压/左翼抬起 = 向右倾斜 = 产生向右加速度 (负Y方向)
+// - 正pitch (绕Y轴正向旋转) = 机头下压/机尾抬起 = 向前倾斜 = 产生向前加速度 (正X方向)
+// - 负pitch = 机头抬起 = 向后倾斜 = 产生向后加速度 (负X方向)
+// - 推力沿机体Z轴正向 (向上)
 // ============================================================================
-VectorU InterceptorNodeQuaternion::calculate_pn_controls_image_based(const VectorX& drone_state)
+VectorU InterceptorNodeQuaternion::calculate_pn_controls_image_based(const VectorX& drone_state, 
+    const Eigen::Vector3d &pos_est, const Eigen::Vector3d &vel_est)
 {
-    return {0.0, 0.0, 0.0, G_}; // 占位符，实际实现略
+    VectorU u_pn;
+    u_pn << 0.0, 0.0, 0.0, G_;  // 默认悬停
+    
+    // 从EKF获取LOS角度和角速率
+    Eigen::Vector4d los_state;
+    {
+        std::shared_lock<std::shared_mutex> lock(mtx_ekf_);
+        if (!ekf_ || !ekf_->is_initialized()) {
+            RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 100, 
+                "PN: EKF not initialized, returning hover");
+            return u_pn;
+        }
+        // stateToLosAngles返回 [azimuth, elevation, azimuth_rate, elevation_rate] (弧度, 弧度/秒)
+        // compensate_rotation = true: 补偿相机自转，获取惯性系下的LOS角速率
+        los_state = ekf_->stateToLosAngles(true);
+    }
+    
+    double azimuth = los_state(0);       // 方位角 (弧度), 正=目标在相机右边
+    double elevation = los_state(1);     // 俯仰角 (弧度), 正=目标在相机下方
+    double azimuth_rate = los_state(2);  // 方位角速率 (弧度/秒)
+    double elevation_rate = los_state(3); // 俯仰角速率 (弧度/秒)
+    
+    // 检查有效性
+    if (std::isnan(azimuth_rate) || std::isnan(elevation_rate)) {
+        RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 100, 
+            "PN: Invalid LOS rates (NaN), returning hover");
+        return u_pn;
+    }
+
+    Eigen::Vector3d rel_pos = pos_est - drone_state.head<3>();
+    Eigen::Vector3d rel_vel = vel_est - drone_state.segment<3>(3);
+    double dist_to_target = rel_pos.norm();
+    double closing_speed_est = pn_vc_initial_;
+    if (dist_to_target > 1e-3) {
+        closing_speed_est = -rel_pos.dot(rel_vel) / dist_to_target;
+    }
+
+    // 使用初始记录的接近速度 (在PN激活时锁定)
+    double Vc = closing_speed_est;
+    if (Vc < V_DESIRED_ * 0.5) {
+        Vc = V_DESIRED_;  // 最小接近速度
+    }
+    
+    // ============================================================================
+    // 自适应增益PD控制器
+    // 
+    // 设计原则:
+    // 1. 使用二阶系统理论设计增益: ωn (自然频率) 和 ζ (阻尼比)
+    // 2. K_p = ωn², K_d = 2*ζ*ωn
+    // 3. 自然频率根据估计的接近时间(TTI)自适应调整
+    // 4. 保持阻尼比 ζ ≈ 0.7-1.0 确保稳定性
+    //
+    // TTI估计: 使用目标尺寸变化率
+    // 如果目标变大，说明在接近; 变化率越大，越接近
+    // ============================================================================
+    
+    
+    // 估计接近时间 (TTI)
+    double tti_from_dist = dist_to_target / closing_speed_est;
+    double tti = std::clamp(tti_from_dist, 0.3, 5.0);  // 限制在0.3-5秒范围
+    
+    // ============================================================================
+    // 自适应自然频率设计
+    // 
+    // 原则: 控制器带宽应该随TTI减小而增加
+    // 但带宽不能太高，否则会放大噪声和延迟
+    //
+    // ωn = base_freq / sqrt(tti)  (TTI越小，频率越高)
+    // 限制 ωn 在 [1, 4] rad/s 范围内
+    // ============================================================================
+    double base_omega = 2.0;  // 基础自然频率
+    double omega_n = base_omega / std::sqrt(tti);
+    omega_n = std::clamp(omega_n, 1.0, 4.0);  // 限制频率范围
+    
+    // 阻尼比: 略欠阻尼以获得快速响应，但不能太小避免振荡
+    double zeta = 0.8;  // 阻尼比
+    
+    // PD增益计算 (单位: rad/s² per rad, rad/s² per rad/s)
+    // 转换为加速度增益需要乘以一个尺度因子
+    // 对于小角度: a ≈ distance * ω² * θ
+    // 使用 Vc 作为距离代理 (典型末端距离 ≈ Vc * 1秒)
+    double gain_scale = Vc;  // 将角度误差转换为加速度的尺度
+    
+    double K_p_adaptive = omega_n * omega_n * gain_scale;
+    double K_d_adaptive = 2.0 * zeta * omega_n * gain_scale;
+    
+    // 限制增益范围，防止过激
+    K_p_adaptive = std::clamp(K_p_adaptive, 10.0, 100.0);
+    K_d_adaptive = std::clamp(K_d_adaptive, 5.0, 50.0);
+    
+    // 水平和垂直可以使用不同增益 (垂直响应通常较慢)
+    double K_p_az = K_p_adaptive;
+    double K_d_az = K_d_adaptive;
+    double K_p_el = K_p_adaptive * 1.2;  // 垂直略高，因为推力响应慢
+    double K_d_el = K_d_adaptive * 0.8;  // 垂直阻尼略低
+    
+    // ============================================================================
+    // PD控制加速度计算
+    // ============================================================================
+    double a_cam_y = K_p_az * azimuth + K_d_az * azimuth_rate;
+    double a_cam_z = K_p_el * elevation + K_d_el * elevation_rate;
+    
+    // 限制加速度指令 (允许更大的垂直机动)
+    const double max_accel_h = G_ * 1.0;   // 水平方向限制 (~10 m/s²)
+    const double max_accel_v = G_ * 1.0;   // 垂直方向限制 (~10 m/s²)
+    a_cam_y = std::clamp(a_cam_y, -max_accel_h, max_accel_h);
+    a_cam_z = std::clamp(a_cam_z, -max_accel_v, max_accel_v);
+    
+    // ============================================================================
+    // 获取云台姿态和机体姿态
+    // ============================================================================
+    Eigen::Quaterniond q_drone(drone_state(6), drone_state(7), drone_state(8), drone_state(9));
+    Eigen::Matrix3d R_B_W = q_drone.toRotationMatrix();  // Body to World rotation
+    
+    // 获取云台姿态 (相机相对于世界系的姿态)
+    // 注意: 需要包含从相机FRD到世界ENU的完整变换
+    Eigen::Matrix3d R_C_W;  // Camera to World rotation
+    bool has_independent_gimbal = gimbal_received_;
+    
+    if (has_independent_gimbal) {
+        // 独立云台: 使用接收的云台姿态
+        // 假设云台姿态已经是相机系(FRD)到世界系(ENU)的完整变换
+        std::shared_lock<std::shared_mutex> lock(mtx_gimbal_);
+        R_C_W = current_gimbal_orientation_.toRotationMatrix();
+    } else {
+        // 水平云台: 相机只跟随机体的yaw，保持水平
+        // 需要两步变换:
+        // 1. 相机FRD到"标准"相机系 (在yaw=0时与ENU对齐，但Y/Z翻转)
+        // 2. 应用yaw旋转
+        
+        double yaw = std::atan2(R_B_W(1, 0), R_B_W(0, 0));
+        
+        // 基础变换: 相机FRD到世界ENU (yaw=0时)
+        // Camera X (前) -> World X (东)
+        // Camera Y (右) -> World -Y (南, 因为面向东时右边是南)
+        // Camera Z (下) -> World -Z (下, ENU中Z向上)
+        Eigen::Matrix3d R_FRD_to_ENU;
+        R_FRD_to_ENU << 1,  0,  0,
+                        0, -1,  0,
+                        0,  0, -1;
+        
+        // Yaw旋转矩阵 (绕世界Z轴)
+        Eigen::Matrix3d R_yaw;
+        double c = std::cos(yaw);
+        double s = std::sin(yaw);
+        R_yaw << c, -s, 0,
+                 s,  c, 0,
+                 0,  0, 1;
+        
+        // 组合: 先FRD到ENU，再绕Z轴旋转yaw
+        R_C_W = R_yaw * R_FRD_to_ENU;
+    }
+    
+    // ============================================================================
+    // 将相机系加速度转换到世界系，再转换到机体系
+    // 
+    // 相机系 (FRD): X前, Y右, Z下
+    // 机体系 (FLU): X前, Y左, Z上
+    // 世界系 (ENU): X东, Y北, Z上
+    // ============================================================================
+    
+    // 相机系加速度向量 (X前方向不需要加速度，由推力和俯仰提供)
+    Eigen::Vector3d a_cam(0.0, a_cam_y, a_cam_z);
+    
+    // 转换到世界系: a_world = R_C_W * a_cam
+    Eigen::Vector3d a_world = R_C_W * a_cam;
+    
+    // 转换到机体系: a_body = R_W_B * a_world = R_B_W^T * a_world
+    Eigen::Vector3d a_body = R_B_W.transpose() * a_world;
+    
+    // 相机系到机体系的坐标变换 (FRD -> FLU): y_flu = -y_frd, z_flu = -z_frd
+    // 但由于我们通过世界系转换，已经正确处理了坐标变换
+    
+    // ============================================================================
+    // 计算所需姿态角 (机体系FLU)
+    // 
+    // FLU系下 (右手定则):
+    // - 向右加速 (a_body_y < 0, 因为Y轴向左) 需要正roll (向右倾斜)
+    // - 向前加速 (a_body_x > 0) 需要正pitch (机头下压)
+    // - 向上加速 (a_body_z > 0) 需要增加推力
+    //
+    // 小角度近似:
+    // a_body_y ≈ -g * roll  =>  roll ≈ -a_body_y / g
+    // a_body_x ≈ g * pitch  =>  pitch ≈ a_body_x / g
+    // ============================================================================
+    
+    // 计算所需滚转角: 需要产生 a_body_y 的加速度
+    // 在FLU系中，正roll产生负Y加速度（向右），所以 roll = -a_body_y / g
+    double roll_desired = -std::atan2(a_body(1), G_);
+    
+    // 计算所需俯仰角调整
+    // 当前俯仰角 + 垂直加速度补偿
+    // 在FLU系中，正pitch产生负X加速度（减速），所以向前加速需要负pitch
+    // 对于垂直方向 (Z轴向上)，a_body_z > 0 表示向上加速，需要增加推力
+    // a_body_z < 0 表示向下加速，可以通过减小推力或正pitch来实现
+    
+    // 提取当前欧拉角 (ZYX顺序: yaw-pitch-roll) for FLU
+    double roll_current = std::atan2(R_B_W(2, 1), R_B_W(2, 2));
+    double pitch_current = -std::asin(std::clamp(R_B_W(2, 0), -1.0, 1.0));
+    double yaw_current = std::atan2(R_B_W(1, 0), R_B_W(0, 0));
+    
+    // 俯仰角: 基于当前俯仰 + 补偿项
+    // a_body_x 正表示向前加速需求，需要正pitch (机头下压)
+    // 保守处理，减小增益
+    double pitch_desired = pitch_current + std::atan2(a_body(0), G_) * 0.3;
+    
+    // 限制姿态角 (使用自适应限制：远距离时限制更严格)
+    // TTI大时使用较小倾斜，TTI小时允许更大倾斜
+    double tilt_scale = std::clamp(1.0 / tti, 0.3, 1.0);  // TTI=3s -> 0.33, TTI=0.5s -> 1.0
+    const double max_tilt_base = att_limit_ * M_PI / 180.0;
+    const double max_tilt = max_tilt_base * tilt_scale;
+    roll_desired = std::clamp(roll_desired, -max_tilt, max_tilt);
+    pitch_desired = std::clamp(pitch_desired, -max_tilt, max_tilt);
+    
+    // ============================================================================
+    // 角速率计算 (比例控制 + 变化率限制)
+    // ============================================================================
+    double rate_gain = 2.5;  // 角度误差到角速率的增益 (降低以减少振荡)
+    double roll_rate = rate_gain * (roll_desired - roll_current);
+    double pitch_rate = rate_gain * (pitch_desired - pitch_current);
+    
+    // Yaw控制: 保持相机对准目标
+    // 需要将相机系的azimuth误差转换到机体系的yaw误差
+    double yaw_error;
+    if (has_independent_gimbal) {
+        // 独立云台: 机体yaw不需要跟踪目标
+        yaw_error = 0.0;
+    } else {
+        // 水平云台: 相机yaw跟随机体，需要机体转向目标
+        // azimuth > 0 表示目标在右边，需要向右转 (FLU中负yaw rate)
+        // 注意: FLU中正yaw是绕Z轴正向 (向上)，即逆时针 (向左转)
+        yaw_error = -azimuth;  // 取负使得目标在右边时向右转
+    }
+    double yaw_rate = rate_gain * yaw_error * gimbal_y_coeff_;
+    (void)yaw_current;
+    
+    // 限制角速率
+    roll_rate = std::clamp(roll_rate, -ControlLimits::ROLL_PITCH_RATE_MAX * 0.5, ControlLimits::ROLL_PITCH_RATE_MAX * 0.5);
+    pitch_rate = std::clamp(pitch_rate, -ControlLimits::ROLL_PITCH_RATE_MAX * 0.5, ControlLimits::ROLL_PITCH_RATE_MAX * 0.5);
+    yaw_rate = std::clamp(yaw_rate, -ControlLimits::YAW_RATE_MAX * 0.5, ControlLimits::YAW_RATE_MAX * 0.5);
+    
+    // ============================================================================
+    // 推力计算 (FLU系: Z轴向上)
+    // 
+    // 需要的垂直加速度 a_body_z (向上为正):
+    // thrust = g + a_body_z (在无倾斜时)
+    // 考虑倾斜补偿: thrust = (g + a_body_z) / cos(tilt)
+    //
+    // 注意: PN末端导引需要快速响应，不能有太多增益衰减
+    // ============================================================================
+    double tilt_angle = std::sqrt(roll_desired * roll_desired + pitch_desired * pitch_desired);
+    double cos_tilt = std::cos(std::min(tilt_angle, max_tilt));
+    
+    // 注意: 推力效率 > 1 表示实际加速度比预期大
+    // 但为了稳定性，暂时不使用自适应效率，直接使用1.0
+    // double eff = std::clamp(thrust_efficiency_, 0.8, 1.2);
+    double eff = 1.0;
+    
+    // 基础推力补偿重力和倾斜
+    double thrust_base = G_ / cos_tilt;
+    
+    // 垂直加速度补偿 - 直接使用计算的加速度，不衰减
+    // a_body(2) > 0 = 向上加速需求 -> 增加推力
+    // a_body(2) < 0 = 向下加速需求 -> 减小推力
+    double thrust_accel = a_body(2);  // 直接使用，不衰减
+    
+    double thrust_cmd = (thrust_base + thrust_accel) / eff;
+    
+    // 限制推力变化率 (PN模式需要更快响应)
+    // 20 m/s²/s 的变化率，允许在0.25秒内从悬停到最大倾斜
+    const double max_thrust_rate = ControlLimits::THRUST_MAX * dt_;
+    if (pn_last_thrust_ < 0.1) pn_last_thrust_ = G_;  // 初始化
+    double thrust_delta = thrust_cmd - pn_last_thrust_;
+    thrust_delta = std::clamp(thrust_delta, -max_thrust_rate, max_thrust_rate);
+    double thrust = pn_last_thrust_ + thrust_delta;
+    
+    thrust = std::clamp(thrust, ControlLimits::THRUST_MIN, ControlLimits::THRUST_MAX);
+    pn_last_thrust_ = thrust;
+    
+    // 组装控制输出 [roll_rate, pitch_rate, yaw_rate, thrust]
+    u_pn << roll_rate, pitch_rate, yaw_rate, thrust;
+    
+    // 调试日志 (包含自适应增益信息)
+    RCLCPP_INFO_THROTTLE(this->get_logger(), *this->get_clock(), 100,
+    // RCLCPP_INFO(this->get_logger(),
+        "PN: LOS[az=%.1f°, el=%.1f°] Rate[%.1f, %.1f]°/s, "
+        "TTI=%.2fs, Kp=%.1f, Kd=%.1f, "
+        "a_body[%.1f, %.1f, %.1f], Att[r=%.1f°, p=%.1f°]->[%.1f°, %.1f°], "
+        "Cmd[p=%.2f, q=%.2f, r=%.2f, T=%.1f]",
+        azimuth * 180.0/M_PI, elevation * 180.0/M_PI,
+        azimuth_rate * 180.0/M_PI, elevation_rate * 180.0/M_PI,
+        tti, K_p_az, K_d_az,
+        a_body(0), a_body(1), a_body(2),
+        roll_current * 180.0/M_PI, pitch_current * 180.0/M_PI,
+        roll_desired * 180.0/M_PI, pitch_desired * 180.0/M_PI,
+        roll_rate, pitch_rate, yaw_rate, thrust);
+    
+    return u_pn;
 }
 
 Eigen::Vector3d InterceptorNodeQuaternion::get_history_body_rates(const Eigen::Vector3d &current_body_rates, double delay_time) 

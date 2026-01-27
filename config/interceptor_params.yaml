@@ -22,8 +22,7 @@ interceptor_node_quaternion:
     pn:
       enabled: false
       switch_dist: 15.0       # Distance to switch to PN (meters)
-      fov_switch_deg: 20.0    # Switch only if target within this FOV (degrees)
-      nav_gain: 3.0           # Navigation Constant (N) usually 3-5
+      fov_switch_deg: 2.0    # Switch only if target within this FOV (degrees)
     
     # Simulation parameters
     sim:
