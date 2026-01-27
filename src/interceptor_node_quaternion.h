@@ -166,11 +166,12 @@ private:
     double target_physical_size_est_;
     double perspective_compensation_;  // 透视补偿因子
     double detection_latency_;  // 检测延迟估计
-    double cam_focal_length_, max_angle_rad_, cam_width_px_, cam_height_px_;
     double control_execution_delay_;
     double ctrl_coeff_;
     double att_limit_;
     bool rate_control_enabled_;
+
+    CameraIntrinsics cam_intrinsics_;
 
     // 延迟补偿相关变量
     std::deque<std::pair<double, Eigen::Vector3d>> control_history_;  // 时间戳和角速度指令历史

@@ -150,16 +150,17 @@ void InterceptorNodeQuaternion::load_parameters()
     this->get_parameter("camera.height_px", cam_height_px);
     this->get_parameter("camera.focal_length_mm", cam_focal_mm);
     this->get_parameter("camera.pixel_size_um", cam_pixel_um);
+    double cam_focal_length;
     if (fov_deg > 0.0) {
-        cam_width_px_ = cam_width_px;
-        cam_height_px_ = cam_height_px;
-        cam_focal_length_ = cam_width_px * 0.5 / tan(fov_deg * M_PI / 180.0 / 2.0);
+        cam_focal_length = cam_width_px * 0.5 / tan(fov_deg * M_PI / 180.0 / 2.0);
     } else {
-        cam_width_px_ = cam_width_px;
-        cam_height_px_ = cam_height_px;
         double scale_factor = static_cast<double>(cam_width_px) / static_cast<double>(native_width_px);
-        cam_focal_length_ = cam_focal_mm * 1000.0 / cam_pixel_um * scale_factor;
+        cam_focal_length = cam_focal_mm * 1000.0 / cam_pixel_um * scale_factor;
     }
+    cam_intrinsics_.fx = cam_focal_length;
+    cam_intrinsics_.fy = cam_focal_length;
+    cam_intrinsics_.px = cam_width_px / 2.0;
+    cam_intrinsics_.py = cam_height_px / 2.0;
 
     if (use_simulation_)
     {
@@ -199,11 +200,6 @@ void InterceptorNodeQuaternion::load_parameters()
 void InterceptorNodeQuaternion::setup_ekf()
 {
     // 创建DroneEKF - 使用图像坐标系的12维CA模型 + 3D位置估计
-    CameraIntrinsics cam_intrinsics;
-    cam_intrinsics.fx = cam_focal_length_;
-    cam_intrinsics.fy = cam_focal_length_;
-    cam_intrinsics.px = cam_width_px_ / 2.0;
-    cam_intrinsics.py = cam_height_px_ / 2.0;
     
     // 8维过程噪声: [std_pos_img, std_vel_img, std_accel_img, std_size, std_size_vel, std_accel_size, std_pos_3d, std_vel_3d]
     Eigen::Matrix<double, 8, 1> process_noise;
@@ -220,7 +216,7 @@ void InterceptorNodeQuaternion::setup_ekf()
     measurement_noise << bbox_pos_std_dev_, bbox_size_std_dev_, target_physical_size_est_;
     
     const int predicted_imu_freq = 100;
-    ekf_ = std::make_unique<DroneEKF>(cam_intrinsics, process_noise, measurement_noise,
+    ekf_ = std::make_unique<DroneEKF>(cam_intrinsics_, process_noise, measurement_noise,
                                         predicted_imu_freq, detection_latency_,
                                         target_physical_size_est_, perspective_compensation_);
 }
