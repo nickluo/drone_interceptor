@@ -1,4 +1,3 @@
-#include <iostream>
 #include <chrono>
 #include <cmath>
 
@@ -35,16 +34,7 @@ InterceptorNodeQuaternion::InterceptorNodeQuaternion()
     nlp_in_ = drone_interceptor_mpc_quat_acados_get_nlp_in(acados_capsule_);
     nlp_out_ = drone_interceptor_mpc_quat_acados_get_nlp_out(acados_capsule_);
 
-    // 创建DroneEKF - 使用图像坐标系的12维CA模型 + 3D位置估计
-    CameraIntrinsics cam_intrinsics;
-    cam_intrinsics.fx = cam_focal_length_;
-    cam_intrinsics.fy = cam_focal_length_;
-    cam_intrinsics.px = cam_width_px_ / 2.0;
-    cam_intrinsics.py = cam_height_px_ / 2.0;
-    
     setup_ekf();
-    // ekf_legacy_ = std::make_unique<TargetEKF>(dt_, cam_focal_length_, target_physical_size_est_, 
-    //                                           bbox_pos_std_dev_, bbox_size_std_dev_, perspective_compensation_);
     int filter_n = static_cast<int>(RATE_TC_ * 2.0 / dt_);
     if (filter_n < 5) filter_n = 5;
     output_filter_ = std::make_unique<EMAFilter>(filter_n, 4);
@@ -261,8 +251,6 @@ void InterceptorNodeQuaternion::mission_launch_callback(const std_msgs::msg::Hea
         {
             std::unique_lock<std::shared_mutex> lock(mtx_ekf_);  // 写入使用独占锁
             setup_ekf();
-            // ekf_legacy_ = std::make_unique<TargetEKF>(dt_, cam_focal_length_, target_physical_size_est_, 
-            //                                       bbox_pos_std_dev_, bbox_size_std_dev_, perspective_compensation_);
         }
         {
             std::unique_lock<std::shared_mutex> lock(mtx_drone_state_);  // 写入使用独占锁
@@ -275,16 +263,6 @@ void InterceptorNodeQuaternion::mission_launch_callback(const std_msgs::msg::Hea
             is_visible_ = false;
         }
         
-        // 重置LOS测量状态
-        {
-            std::unique_lock<std::shared_mutex> lock(mtx_los_);
-            los_angles_.setZero();
-            los_angles_prev_.setZero();
-            los_rates_.setZero();
-            los_measurement_time_ = 0.0;
-            los_initialized_ = false;
-        }
-
         output_filter_->reset();
         control_history_.clear();
 
@@ -393,12 +371,6 @@ void InterceptorNodeQuaternion::odom_callback(const nav_msgs::msg::Odometry::Sha
     if (mission_state_.is_terminated()) 
         return;
     
-    // 检查极端姿态值
-    // Eigen::Vector3d euler_angles = to_euler_angles(q); // 仅用于检查
-    // if (std::abs(euler_angles(0)) > att_limit_ * M_PI/180.0 || std::abs(euler_angles(1)) > att_limit_ * M_PI/180.0) {
-    //     RCLCPP_WARN(this->get_logger(), "Large tilt angle detected!! Roll: %.2f°, Pitch: %.2f°", 
-    //                 euler_angles(0) * 180.0/M_PI, euler_angles(1) * 180.0/M_PI);
-    // }
     if (!odom_received_)
     {
         {
@@ -458,21 +430,6 @@ void InterceptorNodeQuaternion::bbox_callback(const vision_msgs::msg::Detection2
         // 执行update (New signature for World Frame DroneEKF)
         ekf_->update(detection_time, bbox, curr_drone_state_for_ekf.head<3>(), q_C_W);
         
-        // 更新旧的EKF
-        TargetEKF::Bbox legacy_bbox;
-        legacy_bbox.u = bbox.cx - (cam_width_px_ / 2.0);
-        legacy_bbox.v = bbox.cy - (cam_height_px_ / 2.0);
-        legacy_bbox.size = std::max(bbox.w, bbox.h);
-        
-        // 注意：旧TargetEKF使用的是Body-to-World的Quaternion（如果相机固定）
-        // 如果使用current_gimbal_orientation_，需要确保它是World-to-Camera还是Body-to-Camera
-        // 假设这里我们使用机体姿态（无独立云台）
-        //  if (!ekf_legacy_->is_initialized()) {
-        //     Eigen::Vector3d init_pos = ekf_legacy_->noisy_bbox_to_pos(legacy_bbox, curr_drone_state_for_ekf.head<3>(), q_C_W);
-        //     ekf_legacy_->initialize(init_pos);
-        // } else {
-        //     ekf_legacy_->update(legacy_bbox, curr_drone_state_for_ekf.head<3>(), q_C_W);
-        // }
     }
     
     if (!timer_ && msg->header.frame_id != "" && mission_state_.is_active()) {
@@ -633,16 +590,6 @@ void InterceptorNodeQuaternion::run_control_cycle(const Eigen::Vector3d &pos_est
         stop();
         return;
     }
-
-    // 近距离调试日志：当距离小于5米时打印详细信息
-    // double dist_to_target = (pos_est - curr_drone_state.head<3>()).norm();
-    // Eigen::Vector3d pos_error = pos_est - curr_drone_state.head<3>();
-    // if (dist_to_target < 5.0) {
-    //     RCLCPP_INFO(this->get_logger(), 
-    //         "CLOSE: dist=%.2fm, z_err=%.2f, visible=%d, vz=%.2f",
-    //         dist_to_target, pos_error.z(), is_visible_ ? 1 : 0, 
-    //         curr_drone_state(5));  // vz = 垂直速度
-    // }
     
     // 验证当前状态
     if (!validate_state(curr_drone_state, "current_state")) {
@@ -650,31 +597,6 @@ void InterceptorNodeQuaternion::run_control_cycle(const Eigen::Vector3d &pos_est
         return;
     }
 
-    // --- Compare EKF Outputs ---
-    // if (ekf_legacy_ && ekf_legacy_->is_initialized()) {
-    //      ekf_legacy_->predict(dt_);
-    //      Eigen::VectorXd legacy_state = ekf_legacy_->get_state();
-    //      Eigen::Vector3d pos_legacy = legacy_state.head<3>();
-    //      Eigen::Vector3d vel_legacy = legacy_state.tail<3>();
-         
-    //      double pos_diff = (pos_est - pos_legacy).norm();
-    //      double vel_diff = (vel_est - vel_legacy).norm();
-         
-    //      // 节流打印比较日志
-    //     //  RCLCPP_INFO_THROTTLE(this->get_logger(), *this->get_clock(), 500,
-    //      RCLCPP_INFO(this->get_logger(),
-    //          "EKF Comparison:\n"
-    //          "  DroneEKF Pos: [%.2f, %.2f, %.2f], Vel: [%.2f, %.2f, %.2f]\n"
-    //          "  TargetEKF Pos: [%.2f, %.2f, %.2f], Vel: [%.2f, %.2f, %.2f]\n"
-    //          "  Diff Pos: %.2f m, Vel: %.2f m/s",
-    //          pos_est.x(), pos_est.y(), pos_est.z(), vel_est.x(), vel_est.y(), vel_est.z(),
-    //          pos_legacy.x(), pos_legacy.y(), pos_legacy.z(), vel_legacy.x(), vel_legacy.y(), vel_legacy.z(),
-    //          pos_diff, vel_diff);
-         
-    //      // 可以在这里根据情况选择使用原来的EKF
-    //      // pos_est = pos_legacy;
-    //      // vel_est = vel_legacy;
-    // }
 
     // 检查姿态安全
     if (!check_attitude_safety(curr_drone_state)) {
@@ -1116,10 +1038,13 @@ VectorU InterceptorNodeQuaternion::calculate_pn_controls_image_based(const Vecto
         // Camera X (前) -> World X (东)
         // Camera Y (右) -> World -Y (南, 因为面向东时右边是南)
         // Camera Z (下) -> World -Z (下, ENU中Z向上)
-        Eigen::Matrix3d R_FRD_to_ENU;
-        R_FRD_to_ENU << 1,  0,  0,
-                        0, -1,  0,
-                        0,  0, -1;
+        static const Eigen::Matrix3d R_FRD_to_ENU = [] {
+            Eigen::Matrix3d m;
+            m << 1,  0,  0,
+                 0, -1,  0,
+                 0,  0, -1;
+            return m;
+        }();
         
         // Yaw旋转矩阵 (绕世界Z轴)
         Eigen::Matrix3d R_yaw;
@@ -1282,6 +1207,7 @@ VectorU InterceptorNodeQuaternion::calculate_pn_controls_image_based(const Vecto
 
 Eigen::Vector3d InterceptorNodeQuaternion::get_history_body_rates(const Eigen::Vector3d &current_body_rates, double delay_time) 
 {
+    std::shared_lock<std::shared_mutex> lock(mtx_control_history_);
     if (control_history_.empty()) {
         return current_body_rates;  // 如果没有历史数据，返回当前状态
     }
@@ -1304,9 +1230,12 @@ VectorX InterceptorNodeQuaternion::predict_delayed_state(const VectorX& current_
 {
     VectorX predicted_state = current_state;
 
-    if (control_history_.empty() || delay_time < 1e-3)
     {
-        return predicted_state;  // 如果没有历史数据，返回当前状态
+        std::shared_lock<std::shared_mutex> lock(mtx_control_history_);
+        if (control_history_.empty() || delay_time < 1e-3)
+        {
+            return predicted_state;  // 如果没有历史数据，返回当前状态
+        }
     }
     
     double current_time = this->get_clock()->now().seconds();
@@ -1318,7 +1247,7 @@ VectorX InterceptorNodeQuaternion::predict_delayed_state(const VectorX& current_
     // 计算延迟时间窗口内的平均角速度
     // 优化：使用二分查找找到起始位置
     {
-        std::shared_lock<std::shared_mutex> lg(mtx_drone_state_);  // 读取使用共享锁
+        std::shared_lock<std::shared_mutex> lg(mtx_control_history_);
         
         // 使用lower_bound进行二分查找
         auto it = std::lower_bound(
@@ -1355,6 +1284,7 @@ VectorX InterceptorNodeQuaternion::predict_delayed_state(const VectorX& current_
 
 // 更新控制历史
 void InterceptorNodeQuaternion::update_control_history(double current_time, const Eigen::Vector3d& body_rates) {
+    std::unique_lock<std::shared_mutex> lock(mtx_control_history_);
     control_history_.emplace_back(current_time, body_rates);
     // 清理过旧的历史数据
     double cutoff_time = current_time - max_history_time_;
@@ -1453,7 +1383,7 @@ bool InterceptorNodeQuaternion::check_attitude_safety(const VectorX& state) {
 }
 
 void InterceptorNodeQuaternion::check_ekf_health() {
-    std::unique_lock<std::shared_mutex> lock(mtx_ekf_);  // 可能重置，使用独占锁
+    std::shared_lock<std::shared_mutex> lock(mtx_ekf_);  // 可能重置，使用独占锁
     
     if (!ekf_ || !ekf_->is_initialized()) return;
     
@@ -1464,6 +1394,9 @@ void InterceptorNodeQuaternion::check_ekf_health() {
     // 检查EKF状态是否包含NaN
     if (!ekf_->is_healthy()) {
         RCLCPP_WARN(this->get_logger(), "EKF state contains NaN, resetting...");
+        // 需要升级到独占锁来重置
+        lock.unlock();
+        std::unique_lock<std::shared_mutex> write_lock(mtx_ekf_);
         ekf_->reset();
     }
 }

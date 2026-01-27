@@ -304,7 +304,11 @@ public:
 
         if (current_time > 0) {
             if (last_timestamp_ > 0) {
-                dt_ = current_time - last_timestamp_;
+                const int64_t delta_us = current_time - last_timestamp_;
+                if (delta_us <= 0) {
+                    return; // 防止非递增时间戳导致负dt
+                }
+                dt_ = delta_us;
             }
             last_timestamp_ = current_time;
         }
@@ -446,24 +450,38 @@ public:
             return;
         }
 
-        // 查找历史状态
-        auto it = std::min_element(history_buffer_.begin(), history_buffer_.end(),
-            [&](const StateHistory& a, const StateHistory& b) {
-                return std::abs(a.timestamp - ts) < std::abs(b.timestamp - ts);
-            });
-
-        if (it != history_buffer_.end()) {
-            x_ = it->state;
-            P_ = it->covariance;
+        if (history_buffer_.empty()) {
             update_internal(bbox, drone_pos, q_C_W);
+            return;
+        }
 
-            // 重放后续IMU输入
-            for (auto replay_it = std::next(it); replay_it != history_buffer_.end(); ++replay_it) {
-                dt_ = replay_it->timestamp - std::prev(replay_it)->timestamp;
-                predict(-1.0, replay_it->imu_input);
+        // 查找历史状态 (时间戳单调递增，使用二分查找加速)
+        auto it = std::lower_bound(
+            history_buffer_.begin(), history_buffer_.end(), ts,
+            [](const StateHistory& entry, int64_t t) { return entry.timestamp < t; });
+
+        auto best_it = it;
+        if (it == history_buffer_.end()) {
+            best_it = std::prev(history_buffer_.end());
+        } else if (it != history_buffer_.begin()) {
+            auto prev_it = std::prev(it);
+            if (std::llabs(prev_it->timestamp - ts) <= std::llabs(it->timestamp - ts)) {
+                best_it = prev_it;
             }
-        } else {
-            update_internal(bbox, drone_pos, q_C_W);
+        }
+
+        x_ = best_it->state;
+        P_ = best_it->covariance;
+        update_internal(bbox, drone_pos, q_C_W);
+
+        // 重放后续IMU输入
+        for (auto replay_it = std::next(best_it); replay_it != history_buffer_.end(); ++replay_it) {
+            const int64_t delta_us = replay_it->timestamp - std::prev(replay_it)->timestamp;
+            if (delta_us <= 0) {
+                continue;
+            }
+            dt_ = delta_us;
+            predict(-1.0, replay_it->imu_input);
         }
     }
 
@@ -683,8 +701,12 @@ private:
                   u_pred, v_pred, size_pred;
 
         // 计算雅可比 H (7x18)
-        Matrix7x18d H = Matrix7x18d::Zero();
-        H(0, 0) = 1.0; H(1, 1) = 1.0; H(2, 2) = 1.0; H(3, 3) = 1.0;
+        static const Matrix7x18d H_base = [] {
+            Matrix7x18d m = Matrix7x18d::Zero();
+            m(0, 0) = 1.0; m(1, 1) = 1.0; m(2, 2) = 1.0; m(3, 3) = 1.0;
+            return m;
+        }();
+        Matrix7x18d H = H_base;
 
         // 3D投影雅可比 (d[u,v,size]/d[px,py,pz])
         Eigen::Vector3d r1 = R_W_C.row(0);
@@ -773,228 +795,6 @@ private:
     EMAFilterTemplate<2> ema_filter_;
 };
 
-// ============================================================================
-// TargetEKF Class (保留用于兼容性，建议使用DroneEKF)
-// ============================================================================
-class TargetEKF {
-public:
-    struct Bbox {
-        double u, v, size;
-    };
-
-    TargetEKF(double dt, double focal_length, double target_size_est, double pos_dev, double size_dev,
-              double perspective_compensation = 1.0)
-        : focal_length_(focal_length), target_size_est_(target_size_est), is_initialized_(false),
-          consecutive_update_failures_(0), max_covariance_threshold_(1e6),
-          perspective_compensation_(perspective_compensation) {
-        
-        // 状态向量 [px, py, pz, vx, vy, vz]
-        x_ = Vector6d::Zero();
-        
-        // 状态协方差矩阵 (使用固定大小矩阵)
-        P_ = Matrix6d::Identity() * 100.0;
-        
-        // 状态转移矩阵 (将在 predict 中随 dt 更新)
-        F_ = Matrix6d::Identity();
-        F_.block<3,3>(0, 3) = Eigen::Matrix3d::Identity() * dt;
-
-        // 过程噪声协方差 (基于连续白噪声加速度模型)
-        double q_pos = 0.05 * std::pow(dt, 3) / 3.0;
-        double q_vel = 0.05 * dt;
-        Q_ = Matrix6d::Zero();
-        Q_.diagonal() << q_pos, q_pos, q_pos, q_vel, q_vel, q_vel;
-
-        // 测量噪声协方差 (u, v, size)
-        R_ = Eigen::Matrix3d::Zero();
-        R_.diagonal() << pos_dev * pos_dev, pos_dev * pos_dev, size_dev * size_dev;
-    }
-
-    void initialize(const Eigen::Vector3d& initial_pos_est) {
-        x_.head<3>() = initial_pos_est;
-        x_.tail<3>() = Eigen::Vector3d::Zero(); // 初始速度为0
-        is_initialized_ = true;
-    }
-
-    void predict(double dt) {
-        if (!is_initialized_) return;
-        
-        // 更新状态转移矩阵
-        F_.block<3,3>(0, 3) = Eigen::Matrix3d::Identity() * dt;
-        
-        // 预测状态
-        x_ = F_ * x_;
-        
-        // 预测协方差
-        P_ = F_ * P_ * F_.transpose() + Q_;
-    }
-
-    void update(const Bbox& z, const Eigen::Vector3d& drone_pos, Eigen::Quaterniond q_C_W) {
-        if (!is_initialized_) return;
-        
-        // --- 计算雅可比矩阵 H ---
-        Eigen::Vector3d p_target = x_.head<3>();
-        Eigen::Vector3d los_W = p_target - drone_pos;
-
-        Eigen::Matrix3d R_W_C = q_C_W.toRotationMatrix().transpose();
-        
-        Eigen::Vector3d los_C = R_W_C * los_W;
-        double x_c = los_C(0), y_c = los_C(1), z_c = los_C(2);
-
-        if (x_c < 1e-3) {
-            consecutive_update_failures_++;
-            return; // 避免除以零
-        }
-
-        // 预测的测量值
-        Eigen::Vector3d z_pred;
-        z_pred << focal_length_ * y_c / x_c,
-                  focal_length_ * z_c / x_c,
-                  focal_length_ * target_size_est_ / x_c;
-
-        // 计算雅可比矩阵 H (dh/d(p_target)) - 使用固定大小矩阵
-        Eigen::Vector3d r1 = R_W_C.row(0);
-        Eigen::Vector3d r2 = R_W_C.row(1);
-        Eigen::Vector3d r3 = R_W_C.row(2);
-
-        double x_c_sq = x_c * x_c;
-        RowVector3d du_dp = (focal_length_ / x_c) * r2.transpose() - (focal_length_ * y_c / x_c_sq) * r1.transpose();
-        RowVector3d dv_dp = (focal_length_ / x_c) * r3.transpose() - (focal_length_ * z_c / x_c_sq) * r1.transpose();
-        RowVector3d dsize_dp = -(focal_length_ * target_size_est_ / x_c_sq) * r1.transpose();
-
-        Matrix3x6d H = Matrix3x6d::Zero();
-        H.block<1,3>(0,0) = du_dp;
-        H.block<1,3>(1,0) = dv_dp;
-        H.block<1,3>(2,0) = dsize_dp;
-
-        // --- 卡尔曼增益、状态和协方差更新 ---
-        // 对测量值应用透视补偿
-        double v_sq = z.v * z.v;
-        double f_sq = focal_length_ * focal_length_;
-        double v_compensated = z.v - perspective_compensation_ * target_size_est_ * z.v * focal_length_ / (f_sq + v_sq) / (focal_length_ * target_size_est_ / z.size);
-        
-        Eigen::Vector3d y_residual;
-        y_residual << -z.u, -v_compensated, z.size;
-        y_residual -= z_pred;
-
-        // 使用LLT分解替代矩阵求逆，提高数值稳定性
-        Eigen::Matrix3d S = H * P_ * H.transpose() + R_;
-        Eigen::LLT<Eigen::Matrix3d> llt_S(S);
-        if (llt_S.info() != Eigen::Success) {
-            // S矩阵不正定，跳过更新
-            consecutive_update_failures_++;
-            return;
-        }
-        
-        // K = P * H^T * S^{-1}，通过求解线性系统实现
-        Eigen::Matrix<double, 6, 3> K = P_ * H.transpose() * llt_S.solve(Eigen::Matrix3d::Identity());
-        
-        x_ = x_ + K * y_residual;
-        P_ = (Matrix6d::Identity() - K * H) * P_;
-        
-        // 确保P保持对称正定
-        P_ = (P_ + P_.transpose()) * 0.5;
-        
-        consecutive_update_failures_ = 0;
-    }
-
-    Eigen::Vector3d noisy_bbox_to_pos(const Bbox& bbox, const Eigen::Vector3d& drone_pos, Eigen::Quaterniond q_C_W) {
-        double est_dist_cam_x = focal_length_ * target_size_est_ / bbox.size;
-        Eigen::Matrix3d R_C_W = q_C_W.toRotationMatrix();
-        double est_los_C_y = -bbox.u * est_dist_cam_x / focal_length_;
-        double est_los_C_z = -bbox.v * est_dist_cam_x / focal_length_;
-        
-        // 透视补偿：当从斜向观察目标时，检测框中心会偏向可见部分的中心
-        // 理论上球形目标偏移约为半径(0.5)，但实测使用直径(1.0)效果更好
-        // 可能原因：检测器边界框算法特性、目标非理想球形、系统性偏差等
-        // 补偿量 = factor * target_size * sin(θ) * cos(θ) = factor * target_size * v * f / (f² + v²)
-        double v_sq = bbox.v * bbox.v;
-        double f_sq = focal_length_ * focal_length_;
-        double z_compensation = perspective_compensation_ * target_size_est_ * bbox.v * focal_length_ / (f_sq + v_sq);
-        est_los_C_z -= z_compensation;
-        
-        Eigen::Vector3d est_los_C(est_dist_cam_x, est_los_C_y, est_los_C_z);
-        Eigen::Vector3d est_los_W = R_C_W * est_los_C;
-        Eigen::Vector3d est_target_pos = drone_pos + est_los_W;
-        return est_target_pos;
-    }
-
-    bool is_initialized() const { return is_initialized_; }
-    const Vector6d& get_state() const { return x_; }
-    
-    // 检查协方差矩阵是否健康（未发散）
-    bool check_covariance_health() const {
-        double max_var = P_.diagonal().maxCoeff();
-        if (max_var > max_covariance_threshold_) {
-            return false;  // 协方差过大，滤波器可能发散
-        }
-        // 检测正定性（检查最小特征值）
-        Eigen::SelfAdjointEigenSolver<Matrix6d> solver(P_, Eigen::EigenvaluesOnly);
-        if (solver.eigenvalues().minCoeff() < 0) {
-            return false;  // 协方差矩阵不正定
-        }
-        return true;
-    }
-    
-    // 重置协方差矩阵（当发散时调用）
-    void reset_covariance() {
-        P_ = Matrix6d::Identity() * 100.0;
-        consecutive_update_failures_ = 0;
-    }
-    
-    // 获取连续更新失败次数
-    int get_consecutive_failures() const { return consecutive_update_failures_; }
-
-private:
-    Vector6d x_;
-    Matrix6d P_;
-    Matrix6d F_;
-    Matrix6d Q_;
-    Eigen::Matrix3d R_;
-    double focal_length_;
-    double target_size_est_;
-    double perspective_compensation_;  // 透视补偿因子 (0.5=半径, 1.0=直径)
-    bool is_initialized_;
-    int consecutive_update_failures_;
-    double max_covariance_threshold_;
-};
-
-// Helper to convert Eigen quaternion to Euler angles
-Eigen::Vector3d to_euler_angles(const Eigen::Quaterniond& q) {
-    Eigen::Vector3d angles;
-    // roll (x-axis rotation)
-    double sinr_cosp = 2 * (q.w() * q.x() + q.y() * q.z());
-    double cosr_cosp = 1 - 2 * (q.x() * q.x() + q.y() * q.y());
-    angles.x() = std::atan2(sinr_cosp, cosr_cosp);
-    // pitch (y-axis rotation)
-    double sinp = 2 * (q.w() * q.y() - q.z() * q.x());
-    if (std::abs(sinp) >= 1)
-        angles.y() = std::copysign(M_PI / 2, sinp); // use 90 degrees if out of range
-    else
-        angles.y() = std::asin(sinp);
-    // yaw (z-axis rotation)
-    double siny_cosp = 2 * (q.w() * q.z() + q.x() * q.y());
-    double cosy_cosp = 1 - 2 * (q.y() * q.y() + q.z() * q.z());
-    angles.z() = std::atan2(siny_cosp, cosy_cosp);
-    return angles;
-}
-
-// Helper to convert Euler angles to quaternion (scalar-first convention: [qw, qx, qy, qz])
-Eigen::Vector4d euler_to_quaternion(double phi, double theta, double psi) {
-    // ZYX Euler angle order (Yaw-Pitch-Roll)
-    double cy = std::cos(psi * 0.5);
-    double sy = std::sin(psi * 0.5);
-    double cp = std::cos(theta * 0.5);
-    double sp = std::sin(theta * 0.5);
-    double cr = std::cos(phi * 0.5);
-    double sr = std::sin(phi * 0.5);
-    Eigen::Vector4d quat;
-    quat(0) = cr * cp * cy + sr * sp * sy; // qw
-    quat(1) = sr * cp * cy - cr * sp * sy; // qx
-    quat(2) = cr * sp * cy + sr * cp * sy; // qy
-    quat(3) = cr * cp * sy - sr * sp * cy; // qz
-    return quat;
-}
-
 // Helper to normalize quaternion
 Eigen::Vector4d normalize_quaternion(const Eigen::Vector4d& quat) {
     double norm = quat.norm();
@@ -1004,16 +804,6 @@ Eigen::Vector4d normalize_quaternion(const Eigen::Vector4d& quat) {
         // If quaternion is near zero, return identity quaternion
         return Eigen::Vector4d(1.0, 0.0, 0.0, 0.0);
     }
-}
-
-// Helper to convert quaternion to rotation matrix
-Eigen::Matrix3d quaternion_to_rotation_matrix(const Eigen::Vector4d& quat) {
-    double qw = quat(0), qx = quat(1), qy = quat(2), qz = quat(3);
-    Eigen::Matrix3d R;
-    R << 1-2*(qy*qy+qz*qz), 2*(qx*qy-qw*qz), 2*(qx*qz+qw*qy),
-         2*(qx*qy+qw*qz), 1-2*(qx*qx+qz*qz), 2*(qy*qz-qw*qx),
-         2*(qx*qz-qw*qy), 2*(qy*qz+qw*qx), 1-2*(qx*qx+qy*qy);
-    return R;
 }
 
 // Helper to get yaw angle from quaternion

@@ -175,6 +175,7 @@ private:
     // 延迟补偿相关变量
     std::deque<std::pair<double, Eigen::Vector3d>> control_history_;  // 时间戳和角速度指令历史
     double max_history_time_;  // 最大历史保存时间
+    mutable std::shared_mutex mtx_control_history_;
     
     int N_HORIZON_;
     double dt_;
@@ -207,7 +208,6 @@ private:
     int ekf_health_check_counter_ = 0;
 
     std::unique_ptr<DroneEKF> ekf_;
-    std::unique_ptr<TargetEKF> ekf_legacy_;
     std::unique_ptr<EMAFilter> output_filter_;
     std::unique_ptr<StatusPublisher> status_publisher_;
     
@@ -232,14 +232,6 @@ private:
     vision_msgs::msg::Detection2D current_bbox_;
     
     bool is_visible_ = false;
-    
-    // 图像直接测量的LOS角度和角速率 (相机系)
-    mutable std::shared_mutex mtx_los_;
-    Eigen::Vector2d los_angles_ {0.0, 0.0};       // [azimuth, elevation] in camera frame (rad)
-    Eigen::Vector2d los_angles_prev_ {0.0, 0.0};  // 上一帧LOS角度
-    Eigen::Vector2d los_rates_ {0.0, 0.0};        // LOS角速率 (rad/s)
-    double los_measurement_time_ {0.0};           // 上次测量时间戳
-    bool los_initialized_ {false};                // LOS是否已初始化
     
     // 线程安全状态机
     MissionStateMachine mission_state_;
