@@ -71,6 +71,8 @@ private:
         this->declare_parameter<double>("pn.nav_constant", 4.0);
         this->declare_parameter<double>("pn.switch_dist", 15.0);
         this->declare_parameter<double>("pn.fov_switch_deg", 15.0);
+        this->declare_parameter<double>("pn.max_accel_xy", 20.0);
+        this->declare_parameter<double>("pn.max_accel_z", 20.0);
         
         // Simulation Only
         this->declare_parameter<double>("sim.interception_dist", 1.0);
@@ -153,9 +155,16 @@ private:
     double pn_nav_constant_;
     double pn_switch_dist_;
     double pn_fov_switch_deg_;
-    bool pn_active_ {false}; // Latched state for PN
+    double pn_max_accel_xy_;     // Max horizontal acceleration (m/s^2)
+    double pn_max_accel_z_;      // Max vertical acceleration (m/s^2)
+
+    uint8_t pn_active_ = 0; // Latched state for PN 0: off, 1: on 2: pure inertial
     double pn_vc_initial_ {0.0}; // 切换到PN时body系x轴速度
-    double pn_last_thrust_ {0.0}; // 上一次PN推力指令 (用于变化率限制)
+    VectorU pn_last_u_pn_ {0.0, 0.0, 0.0, 9.81}; // Last computed PN control command
+
+    
+    // PN Filters
+    std::unique_ptr<EMAFilter> pn_accel_filter_;
     
     // 自适应推力效率估计 (MPC阶段学习)
     double thrust_efficiency_ {1.0};  // 推力效率系数 (T_actual = efficiency * T_cmd)
@@ -172,6 +181,7 @@ private:
     bool rate_control_enabled_;
 
     CameraIntrinsics cam_intrinsics_;
+    double detection_ratio_ = 0.0;
 
     // 延迟补偿相关变量
     std::deque<std::pair<double, Eigen::Vector3d>> control_history_;  // 时间戳和角速度指令历史
@@ -233,6 +243,10 @@ private:
     vision_msgs::msg::Detection2D current_bbox_;
     
     bool is_visible_ = false;
+    
+    DroneEKF::Bbox last_bbox_;
+    bool last_bbox_valid_ = false;
+    int bbox_jump_counter_ = 0;
     
     // 线程安全状态机
     MissionStateMachine mission_state_;

@@ -39,6 +39,9 @@ InterceptorNodeQuaternion::InterceptorNodeQuaternion()
     if (filter_n < 5) filter_n = 5;
     output_filter_ = std::make_unique<EMAFilter>(filter_n, 4);
     
+    // 初始化 PN 加速度滤波器 (Smoothing constant N=8, channels=2)
+    pn_accel_filter_ = std::make_unique<EMAFilter>(4, 2);
+
     // 初始化四元数状态 - drone_state_ 已在声明时初始化有效四元数
     drone_state_ = VectorX::Zero();
     drone_state_(6) = 1.0;  // 四元数 w 分量初始化为1
@@ -195,6 +198,8 @@ void InterceptorNodeQuaternion::load_parameters()
     this->get_parameter("pn.nav_constant", pn_nav_constant_);
     this->get_parameter("pn.switch_dist", pn_switch_dist_);
     this->get_parameter("pn.fov_switch_deg", pn_fov_switch_deg_);
+    this->get_parameter("pn.max_accel_xy", pn_max_accel_xy_);
+    this->get_parameter("pn.max_accel_z", pn_max_accel_z_);
 }
 
 void InterceptorNodeQuaternion::setup_ekf()
@@ -260,6 +265,7 @@ void InterceptorNodeQuaternion::mission_launch_callback(const std_msgs::msg::Hea
         }
         
         output_filter_->reset();
+        pn_accel_filter_->reset();
         control_history_.clear();
 
         odom_received_ = false;
@@ -271,7 +277,7 @@ void InterceptorNodeQuaternion::mission_launch_callback(const std_msgs::msg::Hea
         consecutive_solver_failures_ = 0;
         
         // Reset guidance state
-        pn_active_ = false;
+        pn_active_ = 0; // PN 初始状态设为关闭
 
         // 重置性能监控变量，确保每次任务启动行为一致
         solve_count_ = 0;
@@ -384,20 +390,71 @@ void InterceptorNodeQuaternion::bbox_callback(const vision_msgs::msg::Detection2
 { 
     if (!odom_received_ || !mission_state_.is_active())
         return;
+    
+    // 创建DroneEKF的Bbox结构 (使用像素坐标)
+    DroneEKF::Bbox bbox;
+    bbox.cx = msg->bbox.center.position.x;
+    bbox.cy = msg->bbox.center.position.y;
+    bbox.w = msg->bbox.size_x;
+    bbox.h = msg->bbox.size_y;
+    
+    bool frame_valid = msg->header.frame_id != "";
+    
+    // ============================================
+    // Bbox跳变检测：拒绝突然的位置/尺寸跳变
+    // ============================================
+    if (frame_valid && last_bbox_valid_) {
+        // 计算中心点距离跳变
+        double dx = bbox.cx - last_bbox_.cx;
+        double dy = bbox.cy - last_bbox_.cy;
+        double center_jump = std::sqrt(dx*dx + dy*dy);
+        
+        // 计算尺寸变化比例
+        double size_ratio_w = (last_bbox_.w > 0) ? bbox.w / last_bbox_.w : 1.0;
+        double size_ratio_h = (last_bbox_.h > 0) ? bbox.h / last_bbox_.h : 1.0;
+        
+        // 跳变阈值：最大允许150像素位置跳变，2倍尺寸变化
+        const double max_center_jump = cam_intrinsics_.px * 0.3; // 约15%图像宽度
+        const double max_size_ratio = 2.0;
+        const double min_size_ratio = 0.5;
+        
+        bool position_jump = center_jump > max_center_jump;
+        bool size_jump = size_ratio_w > max_size_ratio || size_ratio_w < min_size_ratio ||
+                         size_ratio_h > max_size_ratio || size_ratio_h < min_size_ratio;
+        
+        if (position_jump || size_jump) {
+            bbox_jump_counter_++;
+            RCLCPP_WARN(this->get_logger(), 
+                "Bbox jump detected! center_jump=%.1f, size_ratio=(%.2f, %.2f), counter=%d",
+                center_jump, size_ratio_w, size_ratio_h, bbox_jump_counter_);
+            
+            // 连续3次跳变后重置跟踪状态
+            if (bbox_jump_counter_ >= 3) {
+                RCLCPP_ERROR(this->get_logger(), "Bbox jump persistent, resetting last_bbox");
+                last_bbox_valid_ = false;
+                bbox_jump_counter_ = 0;
+            }
+            // 拒绝此次检测，不更新EKF
+            return;
+        } else {
+            bbox_jump_counter_ = 0;  // 重置跳变计数
+        }
+    }
+    
+    // 更新上一帧bbox用于跳变检测
+    last_bbox_ = bbox;
+    last_bbox_valid_ = frame_valid;
+    
     {
         std::lock_guard<std::mutex> lock(mtx_bbox_);
         current_bbox_ = *msg;
-        is_visible_ = current_bbox_.header.frame_id != "";
+        is_visible_ = frame_valid;
     }
 
     if (is_visible_)
     {
-        // 创建DroneEKF的Bbox结构 (使用像素坐标)
-        DroneEKF::Bbox bbox;
-        bbox.cx = msg->bbox.center.position.x;
-        bbox.cy = msg->bbox.center.position.y;
-        bbox.w = msg->bbox.size_x;
-        bbox.h = msg->bbox.size_y;
+        // RCLCPP_INFO(this->get_logger(), "Received bbox: cx=%.2f, cy=%.2f, w=%.2f, h=%.2f", 
+        //     bbox.cx, bbox.cy, bbox.w, bbox.h);
 
         int64_t detection_time = rclcpp::Time(msg->header.stamp).nanoseconds() / 1000;
         
@@ -422,10 +479,32 @@ void InterceptorNodeQuaternion::bbox_callback(const vision_msgs::msg::Detection2
         // ============================================
         // 直接从检测框计算LOS角度和角速率 (相机系)
         // ============================================
-        std::unique_lock<std::shared_mutex> lock(mtx_ekf_);  // 写入使用独占锁
-        // 执行update (New signature for World Frame DroneEKF)
-        ekf_->update(detection_time, bbox, curr_drone_state_for_ekf.head<3>(), q_C_W);
-        
+        detection_ratio_ = std::max(bbox.w / cam_intrinsics_.px , bbox.h / cam_intrinsics_.py);
+        // RCLCPP_INFO(this->get_logger(), "Detection ratio: %.4f", detection_ratio_);
+        if (detection_ratio_ < 1.0) // 避免过大的bbox导致过大的噪声估计
+        {
+            std::unique_lock<std::shared_mutex> lock(mtx_ekf_);  // 写入使用独占锁
+            if (detection_ratio_ > 0.1) {
+                const double coeff = std::exp((detection_ratio_ - 0.1) * 2); // 指数加权以增强近距离检测的影响
+                const double bbox_pos_std_dev = coeff * bbox_pos_std_dev_;
+                const double bbox_size_std_dev = coeff * bbox_size_std_dev_;
+                const double target_physical_size_est = coeff * target_physical_size_est_;
+                Eigen::Matrix<double, 8, 1> process_noise;
+                process_noise << bbox_pos_std_dev * 0.1,   // std_pos_img
+                                bbox_pos_std_dev * 0.5,   // std_vel_img
+                                bbox_pos_std_dev * 0.25,  // std_accel_img
+                                bbox_size_std_dev  * 0.1,  // std_size
+                                bbox_size_std_dev * 0.5,  // std_size_vel
+                                bbox_size_std_dev * 0.25, // std_accel_size
+                                target_physical_size_est,         // std_pos_3d (米)
+                                target_physical_size_est * 2.0;   // std_vel_3d (米/秒)
+                Eigen::Vector3d measurement_noise;
+                measurement_noise << bbox_pos_std_dev, bbox_size_std_dev, target_physical_size_est;
+                ekf_->set_covariance(process_noise, measurement_noise);
+            }
+            // 执行update (New signature for World Frame DroneEKF)
+            ekf_->update(detection_time, bbox, curr_drone_state_for_ekf.head<3>(), q_C_W);
+        }
     }
     
     if (!timer_ && msg->header.frame_id != "" && mission_state_.is_active()) {
@@ -576,7 +655,12 @@ void InterceptorNodeQuaternion::run_control_cycle(const Eigen::Vector3d &pos_est
             "Target lost! Blind flight count: %d/%d", target_lost_counter_, N_HORIZON_);
     }
 
-    if (target_lost_counter_ > N_HORIZON_ * 2) {
+    int target_lost_counter_limit = N_HORIZON_ * 2;
+    if (pn_active_ > 0) {
+        target_lost_counter_limit = N_HORIZON_;
+    }
+
+    if (target_lost_counter_ > target_lost_counter_limit) {
         RCLCPP_ERROR(this->get_logger(),
             "Target lost for too long. Aborting.");
         status_publisher_->publish(
@@ -614,74 +698,90 @@ void InterceptorNodeQuaternion::run_control_cycle(const Eigen::Vector3d &pos_est
 
     // 验证控制输出
     // Handle PN latching state transition
-    bool should_use_pn = false;
-    double closing_speed_est = 0.0;  // 用于PN的接近速度估计
+    
 
     // RCLCPP_INFO(this->get_logger(), "PN Guidance: Enabled=%d, Active=%d", pn_enabled_ ? 1 : 0, pn_active_ ? 1 : 0);
     
-    if (pn_enabled_ && !std::isnan(pos_est.x()) && !std::isnan(vel_est.x())) {
+    if (pn_enabled_ && pn_active_ == 0 && !std::isnan(pos_est.x()) && !std::isnan(vel_est.x())) {
         // 计算接近速度估计 (用于PN)
         Eigen::Vector3d rel_pos = pos_est - curr_drone_state.head<3>();
         Eigen::Vector3d rel_vel = vel_est - curr_drone_state.segment<3>(3);
+        double closing_speed_est = 1.0;  // 用于PN的接近速度估计
         double dist_to_target = rel_pos.norm();
         if (dist_to_target > 1e-3) {
             closing_speed_est = -rel_pos.dot(rel_vel) / dist_to_target;
         }
         
-        if (pn_active_) {
-            should_use_pn = true;
-        } else {
-            // 使用DroneEKF的stateToLosAngles获取LOS角度判断是否切换到PN
-            bool los_valid = false;
-            double azimuth = 0.0, elevation = 0.0;
-            {
-                std::shared_lock<std::shared_mutex> lock(mtx_ekf_);
-                if (ekf_ && ekf_->is_initialized() && is_visible_) {
-                    Eigen::Vector4d los_state = ekf_->stateToLosAngles(true);
-                    azimuth = los_state(0);
-                    elevation = los_state(1);
-                    los_valid = !std::isnan(azimuth) && !std::isnan(elevation);
-                }
+        // 使用DroneEKF的stateToLosAngles获取LOS角度判断是否切换到PN
+        bool los_valid = false;
+        double azimuth = 0.0, elevation = 0.0;
+        Eigen::Vector4d los_state;
+        {
+            std::shared_lock<std::shared_mutex> lock(mtx_ekf_);
+            if (ekf_ && ekf_->is_initialized() && is_visible_) {
+                los_state = ekf_->stateToLosAngles(true);
+                azimuth = los_state(0);
+                elevation = los_state(1);
+                los_valid = !std::isnan(azimuth) && !std::isnan(elevation);
+            }
+        }
+        
+        if (los_valid) {
+            // 计算LOS偏离视轴角度 (相机系)
+            double angle_off_boresight = std::sqrt(azimuth * azimuth + elevation * elevation);
+            bool target_in_fov_center = (angle_off_boresight < pn_fov_switch_deg_ * M_PI / 180.0);
+            
+            RCLCPP_INFO(this->get_logger(), "LOS angles (az,el): [%.2f, %.2f] deg, Off-boresight: %.2f deg, In FOV: %d", 
+                azimuth * 180.0 / M_PI, elevation * 180.0 / M_PI,
+                angle_off_boresight * 180.0 / M_PI, target_in_fov_center ? 1 : 0);
+            RCLCPP_INFO(this->get_logger(), "Distance to target: %.2f m, Closing speed: %.2f m/s", 
+                dist_to_target, closing_speed_est);
+                
+            // 方案3: 增加垂直速度和LOS角速度约束，避免进入PN时无法收敛
+            double vertical_speed = std::abs(rel_vel.z());
+            const double max_vertical_speed_for_pn = closing_speed_est * 0.2;  // 垂直速度阈值 (m/s) - 更严格
+            bool vertical_speed_ok = (vertical_speed < max_vertical_speed_for_pn);
+            
+            // 额外约束：LOS角速度不能太大
+            double los_rate_check = std::sqrt(los_state(2)*los_state(2) + 
+                                                los_state(3)*los_state(3));
+            const double max_los_rate_for_pn = 5.0 * M_PI / 180.0;  // 5°/s
+            bool los_rate_ok = (los_rate_check < max_los_rate_for_pn);
+            
+            if (!vertical_speed_ok) {
+                RCLCPP_INFO_THROTTLE(this->get_logger(), *this->get_clock(), 500,
+                    "PN switch delayed: vertical speed %.2f m/s > %.1f m/s threshold",
+                    vertical_speed, max_vertical_speed_for_pn);
             }
             
-            if (los_valid) {
-                // 计算LOS偏离视轴角度 (相机系)
-                double angle_off_boresight = std::sqrt(azimuth * azimuth + elevation * elevation);
-                bool target_in_fov_center = (angle_off_boresight < pn_fov_switch_deg_ * M_PI / 180.0);
+            if (!los_rate_ok) {
+                RCLCPP_INFO_THROTTLE(this->get_logger(), *this->get_clock(), 500,
+                    "PN switch delayed: LOS rate %.2f°/s > %.1f°/s threshold",
+                    los_rate_check * 180.0 / M_PI, max_los_rate_for_pn * 180.0 / M_PI);
+            }
+            
+            if (dist_to_target < pn_switch_dist_ && target_in_fov_center && vertical_speed_ok && los_rate_ok) {
+
+                // 首次切换到PN，记录当前body系x轴速度作为期望接近速度
+                // Eigen::Vector3d vel_world = curr_drone_state.segment<3>(3);
+                // Eigen::Quaterniond q(curr_drone_state(6), curr_drone_state(7), curr_drone_state(8), curr_drone_state(9));  // w,x,y,z
+                // Eigen::Matrix3d R_body = q.toRotationMatrix();
+                // Eigen::Vector3d vel_body = R_body.transpose() * vel_world;
+                // pn_vc_initial_ = vel_body(0);
+                // RCLCPP_INFO(this->get_logger(), "PN Initial Vc_body: %.2f m/s", pn_vc_initial_);
                 
-                RCLCPP_INFO(this->get_logger(), "LOS angles (az,el): [%.2f, %.2f] deg, Off-boresight: %.2f deg, In FOV: %d", 
-                    azimuth * 180.0 / M_PI, elevation * 180.0 / M_PI,
-                    angle_off_boresight * 180.0 / M_PI, target_in_fov_center ? 1 : 0);
-                RCLCPP_INFO(this->get_logger(), "Distance to target: %.2f m, Closing speed: %.2f m/s", 
-                    dist_to_target, closing_speed_est);
-                    
-                if (dist_to_target < pn_switch_dist_ && target_in_fov_center) {
-                    should_use_pn = true;
-                    if (!pn_active_) {
-                        // 首次切换到PN，记录当前body系x轴速度作为期望接近速度
-                        Eigen::Vector3d vel_world = curr_drone_state.segment<3>(3);
-                        Eigen::Quaterniond q(curr_drone_state(6), curr_drone_state(7), curr_drone_state(8), curr_drone_state(9));  // w,x,y,z
-                        Eigen::Matrix3d R_body = q.toRotationMatrix();
-                        Eigen::Vector3d vel_body = R_body.transpose() * vel_world;
-                        // pn_vc_initial_ = std::max(vel_body(0) * 1.5, V_DESIRED_);
-                        pn_vc_initial_ = vel_body(0);
-                        RCLCPP_INFO(this->get_logger(), "PN Initial Vc_body: %.2f m/s", pn_vc_initial_);
-                        
-                        // 重置PN推力状态，使用当前MPC的推力作为起点
-                        pn_last_thrust_ = G_;  // 从悬停推力开始
-                    }
-                    pn_active_ = true;
-                    RCLCPP_INFO(this->get_logger(), 
-                        "Switching to IMAGE-BASED PN (Latch Active), Thrust Efficiency: %.3f", 
-                        thrust_efficiency_);
-                }
+                pn_vc_initial_ = closing_speed_est;
+                pn_active_ = 1; // Latch PN active
+                RCLCPP_INFO(this->get_logger(), 
+                    "Switching to IMAGE-BASED PN (Latch Active), Thrust Efficiency: %.3f", 
+                    thrust_efficiency_);
             }
         }
     }
     
     VectorU u_optimal_raw;
 
-    if (should_use_pn) {
+    if (pn_active_ > 0) {
         // Use Image-Based PN Guidance (直接使用检测框计算的LOS角速率)
         u_optimal_raw = calculate_pn_controls_image_based(curr_drone_state, pos_est, vel_est);
         // Reset solver failure counter as we are not relying on it
@@ -802,16 +902,15 @@ void InterceptorNodeQuaternion::run_control_cycle(const Eigen::Vector3d &pos_est
 
         ocp_nlp_out_get(nlp_config_, nlp_dims_, nlp_out_, 0, "u", u_optimal_raw.data());
     }
-
-    // 验证控制输出
-    if (!validate_control(u_optimal_raw)) {
-        RCLCPP_WARN(this->get_logger(), "Invalid control output, applying limits");
-    }
-    // 应用控制限幅
-    VectorU u_optimal_limited = apply_control_limits(u_optimal_raw);
     
     // Warm start update
-    if (!should_use_pn) {
+    if (pn_active_ == 0) {
+        // 验证控制输出
+        if (!validate_control(u_optimal_raw)) {
+            RCLCPP_WARN(this->get_logger(), "Invalid control output, applying limits");
+        }
+        // 应用控制限幅
+        u_optimal_raw = apply_control_limits(u_optimal_raw);
         for (int i = 0; i < N_HORIZON_ - 1; ++i) {
             ocp_nlp_out_get(nlp_config_, nlp_dims_, nlp_out_, i + 1, "x", x_warm_start_[i].data());
             // 正确的四元数归一化方式
@@ -823,22 +922,34 @@ void InterceptorNodeQuaternion::run_control_cycle(const Eigen::Vector3d &pos_est
         x_warm_start_[N_HORIZON_ - 1].segment<4>(6) = normalize_quaternion(x_warm_start_[N_HORIZON_ - 1].segment<4>(6));
         x_warm_start_[N_HORIZON_] = x_warm_start_[N_HORIZON_ - 1];
         ocp_nlp_out_get(nlp_config_, nlp_dims_, nlp_out_, N_HORIZON_ - 1, "u", u_warm_start_[N_HORIZON_ - 1].data());
-    } else {
-        // In PN mode, we should perhaps propagate state simply to keep x_warm_start_ valid if we switch back?
-        // For now, let's just keep x_warm_start_ as current state replicated
-        for (int i = 0; i <= N_HORIZON_; ++i) x_warm_start_[i] = curr_drone_state;
-    }
+    } 
+    // else {
+    //     // In PN mode, we should perhaps propagate state simply to keep x_warm_start_ valid if we switch back?
+    //     // For now, let's just keep x_warm_start_ as current state replicated
+    //     for (int i = 0; i <= N_HORIZON_; ++i) x_warm_start_[i] = curr_drone_state;
+    // }
 
-    Eigen::VectorXd u_filtered_dynamic = output_filter_->filter(u_optimal_limited);
-    
+    double thrust = 0;
+    Eigen::Vector3d body_rates;
+
+    Eigen::VectorXd u_filtered_dynamic = output_filter_->filter(u_optimal_raw);
+
     if (timer_boot_count_++ < N_HORIZON_ * 1) {  // 前几次发送悬停控制，等待滤波器稳定
         failsafe(false);  // 发送悬停指令而非不发送任何控制
         return;
     }
 
     // 提取控制量
-    double thrust = u_filtered_dynamic(3);
-    Eigen::Vector3d body_rates(u_filtered_dynamic(0), u_filtered_dynamic(1), u_filtered_dynamic(2));
+    if (pn_active_ == 1 && detection_ratio_ > 1.0) {
+        pn_active_ = 2; // 切换到盲飞阶段
+        thrust = pn_last_u_pn_(3);
+        body_rates << pn_last_u_pn_(0), pn_last_u_pn_(1), pn_last_u_pn_(2);
+    }
+    else {
+        thrust = u_filtered_dynamic(3);
+        body_rates << u_filtered_dynamic(0), u_filtered_dynamic(1), u_filtered_dynamic(2);
+    }
+
 
     quadrotor_msgs::msg::ControlCommand::UniquePtr control_msg = 
         std::make_unique<quadrotor_msgs::msg::ControlCommand>();
@@ -901,302 +1012,224 @@ VectorU InterceptorNodeQuaternion::calculate_pn_controls_image_based(const Vecto
     VectorU u_pn;
     u_pn << 0.0, 0.0, 0.0, G_;  // 默认悬停
     
-    // 从EKF获取LOS角度和角速率
-    Eigen::Vector4d los_state;
-    {
-        std::shared_lock<std::shared_mutex> lock(mtx_ekf_);
-        if (!ekf_ || !ekf_->is_initialized()) {
-            RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 100, 
-                "PN: EKF not initialized, returning hover");
-            return u_pn;
-        }
-        // stateToLosAngles返回 [azimuth, elevation, azimuth_rate, elevation_rate] (弧度, 弧度/秒)
-        // compensate_rotation = true: 补偿相机自转，获取惯性系下的LOS角速率
-        los_state = ekf_->stateToLosAngles(true);
+    // Blind Mode / Inertial Terminal Phase (State 2)
+    // Hold the last valid command to avoid glint error jumps
+    if (pn_active_ == 2) {
+        return pn_last_u_pn_;
     }
     
-    double azimuth = los_state(0);       // 方位角 (弧度), 正=目标在相机右边
-    double elevation = los_state(1);     // 俯仰角 (弧度), 正=目标在相机下方
-    double azimuth_rate = los_state(2);  // 方位角速率 (弧度/秒)
-    double elevation_rate = los_state(3); // 俯仰角速率 (弧度/秒)
+    // 从EKF获取LOS角度和角速率 (仅用于日志和偏航控制)
+    // Eigen::Vector4d los_state;
+    // {
+    //     std::shared_lock<std::shared_mutex> lock(mtx_ekf_);
+    //     if (!ekf_ || !ekf_->is_initialized()) {
+    //         RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 100, 
+    //             "PN: EKF not initialized, returning hover");
+    //         return u_pn;
+    //     }
+    //     los_state = ekf_->stateToLosAngles(true);
+    // }
     
-    // 检查有效性
-    if (std::isnan(azimuth_rate) || std::isnan(elevation_rate)) {
-        RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 100, 
-            "PN: Invalid LOS rates (NaN), returning hover");
-        return u_pn;
-    }
+    // double azimuth = los_state(0);       // 方位角 (弧度), 正=目标在相机右边
+    // double elevation = los_state(1);     // 俯仰角 (弧度), 正=目标在相机下方
+    // double azimuth_rate = los_state(2);  // 方位角速率 (弧度/秒)
+    // double elevation_rate = los_state(3); // 俯仰角速率 (弧度/秒)
+    
+    // // 检查有效性
+    // if (std::isnan(azimuth_rate) || std::isnan(elevation_rate)) {
+    //     RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 100, 
+    //         "PN: Invalid LOS rates (NaN), returning hover");
+    //     return u_pn;
+    // }
 
-    Eigen::Vector3d rel_pos = pos_est - drone_state.head<3>();
-    Eigen::Vector3d rel_vel = vel_est - drone_state.segment<3>(3);
+    // ============================================================================
+    // 3D True Proportional Navigation (TPN) - 直接在世界系中计算
+    // 
+    // 原理: 使PN加速度垂直于LOS方向，消除LOS角速率
+    // 公式: a_cmd = N * Vc * Omega_LOS (向量形式)
+    // 其中 Omega_LOS = (r × v_rel) / |r|² 是LOS角速度向量
+    // 
+    // TPN命令: a_pn = N * Vc * (Omega_LOS × r_hat)
+    //        = N * Vc * [(r × v_rel) / |r|² × r_hat]
+    //        = N * Vc / |r| * [(r_hat × v_rel) × r_hat]
+    //        = N * Vc / |r| * [v_rel - (v_rel · r_hat) * r_hat]  (垂直于r的v_rel分量)
+    // ============================================================================
+    
+    Eigen::Vector3d drone_pos = drone_state.head<3>();
+    Eigen::Vector3d drone_vel = drone_state.segment<3>(3);
+    
+    Eigen::Vector3d rel_pos = pos_est - drone_pos;  // 目标相对无人机位置
+    Eigen::Vector3d rel_vel = vel_est - drone_vel;  // 目标相对无人机速度
+    
     double dist_to_target = rel_pos.norm();
-    double closing_speed_est = pn_vc_initial_;
-    if (dist_to_target > 1e-3) {
-        closing_speed_est = -rel_pos.dot(rel_vel) / dist_to_target;
-    }
-
-    // 使用初始记录的接近速度 (在PN激活时锁定)
-    double Vc = closing_speed_est;
-    if (Vc < V_DESIRED_ * 0.5) {
-        Vc = V_DESIRED_;  // 最小接近速度
+    if (dist_to_target < 0.1) {
+        RCLCPP_WARN(this->get_logger(), "PN: Target too close (%.2fm)", dist_to_target);
+        return pn_last_u_pn_;
     }
     
-    // ============================================================================
-    // 自适应增益PD控制器
-    // 
-    // 设计原则:
-    // 1. 使用二阶系统理论设计增益: ωn (自然频率) 和 ζ (阻尼比)
-    // 2. K_p = ωn², K_d = 2*ζ*ωn
-    // 3. 自然频率根据估计的接近时间(TTI)自适应调整
-    // 4. 保持阻尼比 ζ ≈ 0.7-1.0 确保稳定性
-    //
-    // TTI估计: 使用目标尺寸变化率
-    // 如果目标变大，说明在接近; 变化率越大，越接近
-    // ============================================================================
+    Eigen::Vector3d los_unit = rel_pos / dist_to_target;  // LOS单位向量
     
+    // 接近速度 (正=靠近)
+    double closing_speed = -rel_pos.dot(rel_vel) / dist_to_target;
     
-    // 估计接近时间 (TTI)
-    double tti_from_dist = dist_to_target / closing_speed_est;
-    double tti = std::clamp(tti_from_dist, 0.3, 5.0);  // 限制在0.3-5秒范围
+    // 确保接近速度为正
+    if (closing_speed < 1.0) {
+        closing_speed = pn_vc_initial_ > 1.0 ? pn_vc_initial_ : 1.0;
+    }
+    
+    // 估计拦截时间
+    double tti = dist_to_target / closing_speed;
     
     // ============================================================================
-    // 自适应自然频率设计
-    // 
-    // 原则: 控制器带宽应该随TTI减小而增加
-    // 但带宽不能太高，否则会放大噪声和延迟
-    //
-    // ωn = base_freq / sqrt(tti)  (TTI越小，频率越高)
-    // 限制 ωn 在 [1, 4] rad/s 范围内
+    // 末制导切换
     // ============================================================================
-    double base_omega = 2.0;  // 基础自然频率
-    double omega_n = base_omega / std::sqrt(tti);
-    omega_n = std::clamp(omega_n, 1.0, 4.0);  // 限制频率范围
-    
-    // 阻尼比: 略欠阻尼以获得快速响应，但不能太小避免振荡
-    double zeta = 0.8;  // 阻尼比
-    
-    // PD增益计算 (单位: rad/s² per rad, rad/s² per rad/s)
-    // 转换为加速度增益需要乘以一个尺度因子
-    // 对于小角度: a ≈ distance * ω² * θ
-    // 使用 Vc 作为距离代理 (典型末端距离 ≈ Vc * 1秒)
-    double gain_scale = Vc;  // 将角度误差转换为加速度的尺度
-    
-    double K_p_adaptive = omega_n * omega_n * gain_scale;
-    double K_d_adaptive = 2.0 * zeta * omega_n * gain_scale;
-    
-    // 限制增益范围，防止过激
-    K_p_adaptive = std::clamp(K_p_adaptive, 10.0, 100.0);
-    K_d_adaptive = std::clamp(K_d_adaptive, 5.0, 50.0);
-    
-    // 水平和垂直可以使用不同增益 (垂直响应通常较慢)
-    double K_p_az = K_p_adaptive;
-    double K_d_az = K_d_adaptive;
-    double K_p_el = K_p_adaptive * 1.2;  // 垂直略高，因为推力响应慢
-    double K_d_el = K_d_adaptive * 0.8;  // 垂直阻尼略低
-    
-    // ============================================================================
-    // PD控制加速度计算
-    // ============================================================================
-    double a_cam_y = K_p_az * azimuth + K_d_az * azimuth_rate;
-    double a_cam_z = K_p_el * elevation + K_d_el * elevation_rate;
-    
-    // 限制加速度指令 (允许更大的垂直机动)
-    const double max_accel_h = G_ * 1.0;   // 水平方向限制 (~10 m/s²)
-    const double max_accel_v = G_ * 1.0;   // 垂直方向限制 (~10 m/s²)
-    a_cam_y = std::clamp(a_cam_y, -max_accel_h, max_accel_h);
-    a_cam_z = std::clamp(a_cam_z, -max_accel_v, max_accel_v);
-    
-    // ============================================================================
-    // 获取云台姿态和机体姿态
-    // ============================================================================
-    Eigen::Quaterniond q_drone(drone_state(6), drone_state(7), drone_state(8), drone_state(9));
-    Eigen::Matrix3d R_B_W = q_drone.toRotationMatrix();  // Body to World rotation
-    
-    // 获取云台姿态 (相机相对于世界系的姿态)
-    // 注意: 需要包含从相机FRD到世界ENU的完整变换
-    Eigen::Matrix3d R_C_W;  // Camera to World rotation
-    bool has_independent_gimbal = gimbal_received_;
-    
-    if (has_independent_gimbal) {
-        // 独立云台: 使用接收的云台姿态
-        // 假设云台姿态已经是相机系(FRD)到世界系(ENU)的完整变换
-        std::shared_lock<std::shared_mutex> lock(mtx_gimbal_);
-        R_C_W = current_gimbal_orientation_.toRotationMatrix();
-    } else {
-        // 水平云台: 相机只跟随机体的yaw，保持水平
-        // 需要两步变换:
-        // 1. 相机FRD到"标准"相机系 (在yaw=0时与ENU对齐，但Y/Z翻转)
-        // 2. 应用yaw旋转
-        
-        double yaw = std::atan2(R_B_W(1, 0), R_B_W(0, 0));
-        
-        // 基础变换: 相机FRD到世界ENU (yaw=0时)
-        // Camera X (前) -> World X (东)
-        // Camera Y (右) -> World -Y (南, 因为面向东时右边是南)
-        // Camera Z (下) -> World -Z (下, ENU中Z向上)
-        static const Eigen::Matrix3d R_FRD_to_ENU = [] {
-            Eigen::Matrix3d m;
-            m << 1,  0,  0,
-                 0, -1,  0,
-                 0,  0, -1;
-            return m;
-        }();
-        
-        // Yaw旋转矩阵 (绕世界Z轴)
-        Eigen::Matrix3d R_yaw;
-        double c = std::cos(yaw);
-        double s = std::sin(yaw);
-        R_yaw << c, -s, 0,
-                 s,  c, 0,
-                 0,  0, 1;
-        
-        // 组合: 先FRD到ENU，再绕Z轴旋转yaw
-        R_C_W = R_yaw * R_FRD_to_ENU;
+    const double terminal_dist_threshold = 3.0;
+    const double terminal_tti_threshold = 0.2;
+    if ((dist_to_target < terminal_dist_threshold || tti < terminal_tti_threshold) && pn_active_ == 1) {
+        pn_active_ = 2;
+        RCLCPP_INFO(this->get_logger(), 
+            "PN: Entering terminal phase (dist=%.2fm, TTI=%.2fs), holding last command", 
+            dist_to_target, tti);
+        return pn_last_u_pn_;
     }
     
     // ============================================================================
-    // 将相机系加速度转换到世界系，再转换到机体系
+    // 3D PN加速度计算
     // 
-    // 相机系 (FRD): X前, Y右, Z下
-    // 机体系 (FLU): X前, Y左, Z上
-    // 世界系 (ENU): X东, Y北, Z上
+    // LOS角速度向量: Omega = (r × v_rel) / |r|²
+    // PN加速度: a_pn = N * Vc * (Omega × los_unit)
     // ============================================================================
+    double N = pn_nav_constant_;
     
-    // 相机系加速度向量 (X前方向不需要加速度，由推力和俯仰提供)
-    Eigen::Vector3d a_cam(0.0, a_cam_y, a_cam_z);
+    // 计算LOS角速度向量 (世界系)
+    Eigen::Vector3d omega_los = rel_pos.cross(rel_vel) / (dist_to_target * dist_to_target);
     
-    // 转换到世界系: a_world = R_C_W * a_cam
-    Eigen::Vector3d a_world = R_C_W * a_cam;
-    
-    // 转换到机体系: a_body = R_W_B * a_world = R_B_W^T * a_world
-    Eigen::Vector3d a_body = R_B_W.transpose() * a_world;
-    
-    // 相机系到机体系的坐标变换 (FRD -> FLU): y_flu = -y_frd, z_flu = -z_frd
-    // 但由于我们通过世界系转换，已经正确处理了坐标变换
+    // PN加速度 = N * Vc * (omega_los × los_unit)
+    // 这个加速度垂直于LOS方向，指向需要转向的方向
+    Eigen::Vector3d a_pn = N * closing_speed * omega_los.cross(los_unit);
     
     // ============================================================================
-    // 计算所需姿态角 (机体系FLU)
-    // 
-    // FLU系下 (右手定则):
-    // - 向右加速 (a_body_y < 0, 因为Y轴向左) 需要正roll (向右倾斜)
-    // - 向前加速 (a_body_x > 0) 需要正pitch (机头下压)
-    // - 向上加速 (a_body_z > 0) 需要增加推力
-    //
-    // 小角度近似:
-    // a_body_y ≈ -g * roll  =>  roll ≈ -a_body_y / g
-    // a_body_x ≈ g * pitch  =>  pitch ≈ a_body_x / g
+    // 添加前向加速度分量 (沿LOS方向)
+    // 用于维持或增加接近速度
     // ============================================================================
+    double desired_closing_speed = pn_vc_initial_ > V_DESIRED_ * 0.5 ? pn_vc_initial_ : V_DESIRED_;
+    double closing_speed_error = desired_closing_speed - closing_speed;
+    double ax_forward = std::clamp(2.0 * closing_speed_error, -5.0, 10.0);
     
-    // 计算所需滚转角: 需要产生 a_body_y 的加速度
-    // 在FLU系中，正roll产生负Y加速度（向右），所以 roll = -a_body_y / g
-    double roll_desired = -std::atan2(a_body(1), G_);
+    // 沿LOS方向的加速度 (朝向目标为正)
+    Eigen::Vector3d a_forward = ax_forward * los_unit;
     
-    // 计算所需俯仰角调整
-    // 当前俯仰角 + 垂直加速度补偿
-    // 在FLU系中，正pitch产生负X加速度（减速），所以向前加速需要负pitch
-    // 对于垂直方向 (Z轴向上)，a_body_z > 0 表示向上加速，需要增加推力
-    // a_body_z < 0 表示向下加速，可以通过减小推力或正pitch来实现
+    // 总PN加速度 (世界系)
+    Eigen::Vector3d a_world = a_pn + a_forward;
     
-    // 提取当前欧拉角 (ZYX顺序: yaw-pitch-roll) for FLU
-    double roll_current = std::atan2(R_B_W(2, 1), R_B_W(2, 2));
-    double pitch_current = -std::asin(std::clamp(R_B_W(2, 0), -1.0, 1.0));
-    double yaw_current = std::atan2(R_B_W(1, 0), R_B_W(0, 0));
-    
-    // 俯仰角: 基于当前俯仰 + 补偿项
-    // a_body_x 正表示向前加速需求，需要正pitch (机头下压)
-    // 保守处理，减小增益
-    double pitch_desired = pitch_current + std::atan2(a_body(0), G_) * 0.3;
-    
-    // 限制姿态角 (使用自适应限制：远距离时限制更严格)
-    // TTI大时使用较小倾斜，TTI小时允许更大倾斜
-    double tilt_scale = std::clamp(1.0 / tti, 0.3, 1.0);  // TTI=3s -> 0.33, TTI=0.5s -> 1.0
-    const double max_tilt_base = att_limit_ * M_PI / 180.0;
-    const double max_tilt = max_tilt_base * tilt_scale;
-    roll_desired = std::clamp(roll_desired, -max_tilt, max_tilt);
-    pitch_desired = std::clamp(pitch_desired, -max_tilt, max_tilt);
-    
-    // ============================================================================
-    // 角速率计算 (比例控制 + 变化率限制)
-    // ============================================================================
-    double rate_gain = 2.5;  // 角度误差到角速率的增益 (降低以减少振荡)
-    double roll_rate = rate_gain * (roll_desired - roll_current);
-    double pitch_rate = rate_gain * (pitch_desired - pitch_current);
-    
-    // Yaw控制: 保持相机对准目标
-    // 需要将相机系的azimuth误差转换到机体系的yaw误差
-    double yaw_error;
-    if (has_independent_gimbal) {
-        // 独立云台: 机体yaw不需要跟踪目标
-        yaw_error = 0.0;
-    } else {
-        // 水平云台: 相机yaw跟随机体，需要机体转向目标
-        // azimuth > 0 表示目标在右边，需要向右转 (FLU中负yaw rate)
-        // 注意: FLU中正yaw是绕Z轴正向 (向上)，即逆时针 (向左转)
-        yaw_error = -azimuth;  // 取负使得目标在右边时向右转
+    // 限制水平和垂直加速度
+    double a_xy = std::sqrt(a_world.x() * a_world.x() + a_world.y() * a_world.y());
+    if (a_xy > pn_max_accel_xy_) {
+        double scale = pn_max_accel_xy_ / a_xy;
+        a_world.x() *= scale;
+        a_world.y() *= scale;
     }
-    double yaw_rate = rate_gain * yaw_error * gimbal_y_coeff_;
-    (void)yaw_current;
+    a_world.z() = std::clamp(a_world.z(), -pn_max_accel_z_, pn_max_accel_z_);
     
-    // 限制角速率
-    roll_rate = std::clamp(roll_rate, -ControlLimits::ROLL_PITCH_RATE_MAX * 0.5, ControlLimits::ROLL_PITCH_RATE_MAX * 0.5);
-    pitch_rate = std::clamp(pitch_rate, -ControlLimits::ROLL_PITCH_RATE_MAX * 0.5, ControlLimits::ROLL_PITCH_RATE_MAX * 0.5);
-    yaw_rate = std::clamp(yaw_rate, -ControlLimits::YAW_RATE_MAX * 0.5, ControlLimits::YAW_RATE_MAX * 0.5);
+    // 滤波
+    Eigen::VectorXd accel_raw(2);
+    accel_raw << std::sqrt(a_world.x()*a_world.x() + a_world.y()*a_world.y()), a_world.z();
+    Eigen::VectorXd accel_filtered = pn_accel_filter_->filter(accel_raw);
+    // 保持方向，只滤波幅值
+    if (a_xy > 0.1) {
+        double scale = accel_filtered(0) / a_xy;
+        a_world.x() *= scale;
+        a_world.y() *= scale;
+    }
+    a_world.z() = accel_filtered(1);
     
     // ============================================================================
-    // 推力计算 (FLU系: Z轴向上)
-    // 
-    // 需要的垂直加速度 a_body_z (向上为正):
-    // thrust = g + a_body_z (在无倾斜时)
-    // 考虑倾斜补偿: thrust = (g + a_body_z) / cos(tilt)
-    //
-    // 注意: PN末端导引需要快速响应，不能有太多增益衰减
+    // 推力和姿态计算
     // ============================================================================
-    double tilt_angle = std::sqrt(roll_desired * roll_desired + pitch_desired * pitch_desired);
-    double cos_tilt = std::cos(std::min(tilt_angle, max_tilt));
     
-    // 注意: 推力效率 > 1 表示实际加速度比预期大
-    // 但为了稳定性，暂时不使用自适应效率，直接使用1.0
-    // double eff = std::clamp(thrust_efficiency_, 0.8, 1.2);
-    double eff = 1.0;
+    // 总加速度 = PN加速度 + 重力补偿
+    Eigen::Vector3d a_total = a_world + Eigen::Vector3d(0.0, 0.0, G_);
     
-    // 基础推力补偿重力和倾斜
-    double thrust_base = G_ / cos_tilt;
-    
-    // 垂直加速度补偿 - 直接使用计算的加速度，不衰减
-    // a_body(2) > 0 = 向上加速需求 -> 增加推力
-    // a_body(2) < 0 = 向下加速需求 -> 减小推力
-    double thrust_accel = a_body(2);  // 直接使用，不衰减
-    
-    double thrust_cmd = (thrust_base + thrust_accel) / eff;
-    
-    // 限制推力变化率 (PN模式需要更快响应)
-    // 20 m/s²/s 的变化率，允许在0.25秒内从悬停到最大倾斜
-    const double max_thrust_rate = ControlLimits::THRUST_MAX * dt_;
-    if (pn_last_thrust_ < 0.1) pn_last_thrust_ = G_;  // 初始化
-    double thrust_delta = thrust_cmd - pn_last_thrust_;
-    thrust_delta = std::clamp(thrust_delta, -max_thrust_rate, max_thrust_rate);
-    double thrust = pn_last_thrust_ + thrust_delta;
-    
+    // 推力大小
+    double thrust = a_total.norm() * thrust_efficiency_;
     thrust = std::clamp(thrust, ControlLimits::THRUST_MIN, ControlLimits::THRUST_MAX);
-    pn_last_thrust_ = thrust;
     
-    // 组装控制输出 [roll_rate, pitch_rate, yaw_rate, thrust]
-    u_pn << roll_rate, pitch_rate, yaw_rate, thrust;
+    // 期望的机体Z轴方向 = 推力方向
+    Eigen::Vector3d z_body_desired = a_total.normalized();
+    if (z_body_desired.hasNaN() || z_body_desired.norm() < 0.5) {
+        z_body_desired = Eigen::Vector3d(0.0, 0.0, 1.0);
+    }
     
-    // 调试日志 (包含自适应增益信息)
-    RCLCPP_INFO_THROTTLE(this->get_logger(), *this->get_clock(), 100,
-    // RCLCPP_INFO(this->get_logger(),
-        "PN: LOS[az=%.1f°, el=%.1f°] Rate[%.1f, %.1f]°/s, "
-        "TTI=%.2fs, Kp=%.1f, Kd=%.1f, "
-        "a_body[%.1f, %.1f, %.1f], Att[r=%.1f°, p=%.1f°]->[%.1f°, %.1f°], "
-        "Cmd[p=%.2f, q=%.2f, r=%.2f, T=%.1f]",
-        azimuth * 180.0/M_PI, elevation * 180.0/M_PI,
-        azimuth_rate * 180.0/M_PI, elevation_rate * 180.0/M_PI,
-        tti, K_p_az, K_d_az,
-        a_body(0), a_body(1), a_body(2),
-        roll_current * 180.0/M_PI, pitch_current * 180.0/M_PI,
-        roll_desired * 180.0/M_PI, pitch_desired * 180.0/M_PI,
-        roll_rate, pitch_rate, yaw_rate, thrust);
+    // ============================================================================
+    // 角速度计算
+    // ============================================================================
+    
+    Eigen::Quaterniond q_curr(drone_state(6), drone_state(7), drone_state(8), drone_state(9));
+    Eigen::Matrix3d R_B_W = q_curr.toRotationMatrix();
+    Eigen::Vector3d z_body_current = R_B_W.col(2);
+    
+    // 计算旋转误差
+    Eigen::Vector3d rotation_axis = z_body_current.cross(z_body_desired);
+    double sin_angle = rotation_axis.norm();
+    double cos_angle = z_body_current.dot(z_body_desired);
+    
+    Eigen::Vector3d omega_world = Eigen::Vector3d::Zero();
+    if (sin_angle > 1e-6) {
+        rotation_axis.normalize();
+        double angle = std::atan2(sin_angle, cos_angle);
+        const double attitude_gain = 5.0;
+        omega_world = rotation_axis * angle * attitude_gain;
+    }
+    
+    // 转换到机体系
+    Eigen::Vector3d omega_body = R_B_W.transpose() * omega_world;
+    
+    // ============================================================================
+    // 偏航控制: 使用LOS水平投影方向
+    // 目标: 让无人机机头指向目标
+    // ============================================================================
+    Eigen::Vector3d los_horizontal = los_unit;
+    los_horizontal.z() = 0.0;
+    if (los_horizontal.norm() > 0.1) {
+        los_horizontal.normalize();
+        
+        // 当前机头方向 (世界系)
+        Eigen::Vector3d x_body_current = R_B_W.col(0);
+        Eigen::Vector3d x_body_horizontal = x_body_current;
+        x_body_horizontal.z() = 0.0;
+        if (x_body_horizontal.norm() > 0.1) {
+            x_body_horizontal.normalize();
+            
+            // 计算偏航误差 (使用叉积的z分量)
+            double yaw_error = x_body_horizontal.cross(los_horizontal).z();
+            const double yaw_gain = 3.0;
+            double yaw_rate_cmd = yaw_gain * yaw_error;
+            yaw_rate_cmd = std::clamp(yaw_rate_cmd, -ControlLimits::YAW_RATE_MAX, ControlLimits::YAW_RATE_MAX);
+            omega_body(2) = yaw_rate_cmd;
+        }
+    }
+    
+    // 限制角速度
+    omega_body(0) = std::clamp(omega_body(0), -ControlLimits::ROLL_PITCH_RATE_MAX, ControlLimits::ROLL_PITCH_RATE_MAX);
+    omega_body(1) = std::clamp(omega_body(1), -ControlLimits::ROLL_PITCH_RATE_MAX, ControlLimits::ROLL_PITCH_RATE_MAX);
+    
+    // ============================================================================
+    // 输出
+    // ============================================================================
+    u_pn << omega_body(0), omega_body(1), omega_body(2), thrust;
+    
+    pn_last_u_pn_ = u_pn;
+    
+    // 调试日志
+    // RCLCPP_INFO_THROTTLE(this->get_logger(), *this->get_clock(), 200,
+    //     "PN: az=%.1f° el=%.1f° | az_rate=%.2f°/s el_rate=%.2f°/s | Vc=%.1fm/s dist=%.1fm TTI=%.2fs",
+    //     azimuth * 180.0 / M_PI, elevation * 180.0 / M_PI,
+    //     azimuth_rate * 180.0 / M_PI, elevation_rate * 180.0 / M_PI,
+    //     closing_speed, dist_to_target, tti);
+    // RCLCPP_INFO_THROTTLE(this->get_logger(), *this->get_clock(), 200,
+    //     "PN: a_pn=[%.1f,%.1f,%.1f] a_fwd=%.1f | omega=[%.2f,%.2f,%.2f] | T=%.1f",
+    //     a_pn.x(), a_pn.y(), a_pn.z(), ax_forward,
+    //     omega_body(0), omega_body(1), omega_body(2), thrust);
     
     return u_pn;
 }

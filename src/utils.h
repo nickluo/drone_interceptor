@@ -132,6 +132,10 @@ public:
         return data_;
     }
 
+    Eigen::VectorXd data() const {
+        return data_;
+    }
+
 private:
     double alpha_;
     int channels_;
@@ -237,6 +241,7 @@ public:
           target_size_est_(target_size_est),
           perspective_compensation_(perspective_compensation),
           ema_filter_(estimated_imu_freq / 10),
+          imu_flow_filter_(estimated_imu_freq / 20),
           is_initialized_(false),
           last_timestamp_(-1.0)
     {
@@ -247,6 +252,22 @@ public:
         x_.setZero();
         v_imu_cache_.setZero();
 
+        set_covariance(process_noise_std, measurement_noise_std);
+
+        // 初始协方差
+        P_ = Q_ * 10.0;
+        
+        // 测量矩阵 H (7x18): 直接观测 [cx, cy, w, h] 和通过投影观测3D位置
+        H_.setZero();
+        H_(0, 0) = 1.0; // cx
+        H_(1, 1) = 1.0; // cy
+        H_(2, 2) = 1.0; // w
+        H_(3, 3) = 1.0; // h
+        // H(4:6, 12:17) 在update中动态计算 (非线性)
+    }
+
+    void set_covariance(const Eigen::Matrix<double, 8, 1>& process_noise_std,
+             const Eigen::Vector3d& measurement_noise_std) {
         // 解析过程噪声
         double std_pos_img = process_noise_std(0);
         double std_vel_img = process_noise_std(1);
@@ -271,9 +292,6 @@ public:
                   std_vel_3d*std_vel_3d, std_vel_3d*std_vel_3d, std_vel_3d*std_vel_3d;  // vx, vy, vz
         Q_ = q_diag.asDiagonal();
 
-        // 初始协方差
-        P_ = Q_ * 10.0;
-
         // 测量噪声协方差 R (7x7): [cx, cy, w, h, u, v, size]
         double std_meas_pos = measurement_noise_std(0);
         double std_meas_size = measurement_noise_std(1);
@@ -283,23 +301,17 @@ public:
                   std_meas_size*std_meas_size, std_meas_size*std_meas_size,
                   std_meas_3d*std_meas_3d, std_meas_3d*std_meas_3d, std_meas_3d*std_meas_3d;
         R_ = r_diag.asDiagonal();
-
-        // 测量矩阵 H (7x18): 直接观测 [cx, cy, w, h] 和通过投影观测3D位置
-        H_.setZero();
-        H_(0, 0) = 1.0; // cx
-        H_(1, 1) = 1.0; // cy
-        H_(2, 2) = 1.0; // w
-        H_(3, 3) = 1.0; // h
-        // H(4:6, 12:17) 在update中动态计算 (非线性)
     }
 
 
     /**
      * @brief EKF预测步骤
      * @param current_time 当前时间戳 (微秒)
-     * @param imu_omega 相机角速度 [omega_x, omega_y, omega_z]
+     * @param imu_omega 相机角速度 [omega_x, omega_y, omega_z] - 期望FRD坐标系 (X前, Y右, Z下)
+     *                  如果输入是FLU坐标系，会自动转换
+     * @param is_flu 输入角速度是否为FLU坐标系 (默认true，因为ROS2通常使用FLU)
      */
-    void predict(int64_t current_time, const Eigen::Vector3d& imu_omega) {
+    void predict(int64_t current_time, const Eigen::Vector3d& imu_omega, bool is_flu = true) {
         if (!is_initialized_) return;
 
         if (current_time > 0) {
@@ -342,9 +354,11 @@ public:
         x_pred.segment<4>(8) = x_prev.segment<4>(8);
 
         // --- IMU运动补偿 ---
+        // 光流公式期望相机坐标系为FRD (X前/光轴, Y右, Z下)
+        // 如果输入是FLU (X前, Y左, Z上)，需要转换: omega_y_FRD = -omega_y_FLU, omega_z_FRD = -omega_z_FLU
         double omega_x = imu_omega(0);
-        double omega_y = imu_omega(1);
-        double omega_z = imu_omega(2);
+        double omega_y = is_flu ? -imu_omega(1) : imu_omega(1);
+        double omega_z = is_flu ? -imu_omega(2) : imu_omega(2);
         double cx = x_prev(0);
         double cy = x_prev(1);
         double px = intrinsics_.px;
@@ -358,6 +372,10 @@ public:
         double v_imu_cy = (fy + (1.0/fy)*(cy-py)*(cy-py))*omega_x 
                         - (1.0/fx)*(cx-px)*(cy-py)*omega_y 
                         - (fy/fx)*(cx-px)*omega_z;
+
+        // Filter IMU flow to reduce noise injection
+        v_imu_cx = imu_flow_filter_.filter(v_imu_cx, 0);
+        v_imu_cy = imu_flow_filter_.filter(v_imu_cy, 1);
 
         v_imu_cache_ << v_imu_cx, v_imu_cy;
         
@@ -567,6 +585,7 @@ public:
         P_ = Q_ * 10.0;
         history_buffer_.clear();
         ema_filter_.reset();
+        imu_flow_filter_.reset();
     }
 
     /** @brief 检查协方差矩阵健康状态 */
@@ -793,6 +812,7 @@ private:
 
     // EMA滤波器
     EMAFilterTemplate<2> ema_filter_;
+    EMAFilterTemplate<2> imu_flow_filter_;
 };
 
 // Helper to normalize quaternion
