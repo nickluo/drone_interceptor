@@ -20,9 +20,12 @@ interceptor_node_quaternion:
     
     # Proportional Navigation (PN) Terminal Guidance
     pn:
-      enabled: false
-      switch_dist: 15.0       # Distance to switch to PN (meters)
+      enabled: true
+      nav_constant: 5.0    # Navigation constant (N)
+      switch_dist: 10.0       # Distance to switch to PN (meters)
       fov_switch_deg: 2.0    # Switch only if target within this FOV (degrees)
+      max_accel_xy: 25.0     # Max horizontal acceleration (m/s^2)
+      max_accel_z: 15.0      # Max vertical acceleration (m/s^2)
     
     # Simulation parameters
     sim:
@@ -36,14 +39,14 @@ interceptor_node_quaternion:
     perception:
       bbox_pos_std_dev: 3.0
       bbox_size_std_dev: 3.0
-      target_physical_size_est: 1.0
+      target_physical_size_est: 0.8
       perspective_compensation: 0.0  # 透视补偿因子 (0.5=半径理论值, 1.0=直径经验值)
     
     # Control execution delay compensation
     control:
       execution_delay: 0.05  # 0.05 seconds (50ms) delay compensation for real flight
       rate_tc: 0.02           # First-order response time constant for body rates
-      # ctrl_scale: 0.85         # Scale factor for ctrl_coeff = scale * (1-exp(-dt/rate_tc))
+      # ctrl_scale: 0.63         # Scale factor for ctrl_coeff = scale * (1-exp(-dt/rate_tc))
       max_history_time_factor: 2.0  # History buffer size as multiple of execution_delay
       rate_control_enabled: true  # Enable rate control compensation
     
@@ -67,7 +70,7 @@ interceptor_node_quaternion:
     # Cost function weights
     cost:
       w_los: 50.0              # Line-of-sight error weight
-      w_align: 5.0             # Velocity alignment weight
+      w_align: 1.0             # Velocity alignment weight
       w_closing_speed: 0.1     # Closing speed error weight
       w_rates: 0.001           # Body rate control effort weight
       w_tilt: 0.000001         # Tilt angle error weight
