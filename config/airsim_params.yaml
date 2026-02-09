@@ -69,9 +69,9 @@ interceptor_node_quaternion:
     
     # Cost function weights
     cost:
-      w_los: 50.0              # Line-of-sight error weight
-      w_align: 1.0             # Velocity alignment weight
-      w_closing_speed: 0.1     # Closing speed error weight
+      w_los: 100.0              # Line-of-sight error weight
+      w_align: 5.0             # Velocity alignment weight
+      w_closing_speed: 0.01     # Closing speed error weight
       w_rates: 0.001           # Body rate control effort weight
       w_tilt: 0.000001         # Tilt angle error weight
       w_u_alpha: 0.1           # Body rate change weight

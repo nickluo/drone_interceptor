@@ -39,7 +39,7 @@ InterceptorNodeQuaternion::InterceptorNodeQuaternion()
     if (filter_n < 5) filter_n = 5;
     output_filter_ = std::make_unique<EMAFilter>(filter_n, 4);
     
-    // 初始化 PN 加速度滤波器 (Smoothing constant N=8, channels=2)
+    // 初始化 PN 加速度滤波器 (Smoothing constant N=4, channels=2)
     pn_accel_filter_ = std::make_unique<EMAFilter>(4, 2);
 
     // 初始化四元数状态 - drone_state_ 已在声明时初始化有效四元数
@@ -744,8 +744,8 @@ void InterceptorNodeQuaternion::run_control_cycle(const Eigen::Vector3d &pos_est
             
             // 额外约束：LOS角速度不能太大
             double los_rate_check = std::sqrt(los_state(2)*los_state(2) + 
-                                                los_state(3)*los_state(3));
-            const double max_los_rate_for_pn = 5.0 * M_PI / 180.0;  // 5°/s
+                                              los_state(3)*los_state(3));
+            const double max_los_rate_for_pn = pn_fov_switch_deg_ * M_PI / 180.0;  // 5°/s
             bool los_rate_ok = (los_rate_check < max_los_rate_for_pn);
             
             if (!vertical_speed_ok) {
@@ -1172,12 +1172,14 @@ VectorU InterceptorNodeQuaternion::calculate_pn_controls_image_based(const Vecto
     Eigen::Vector3d rotation_axis = z_body_current.cross(z_body_desired);
     double sin_angle = rotation_axis.norm();
     double cos_angle = z_body_current.dot(z_body_desired);
+
+    const double attitude_gain = N * 1.5;
+    const double yaw_gain = N * 0.75;
     
     Eigen::Vector3d omega_world = Eigen::Vector3d::Zero();
     if (sin_angle > 1e-6) {
         rotation_axis.normalize();
         double angle = std::atan2(sin_angle, cos_angle);
-        const double attitude_gain = 5.0;
         omega_world = rotation_axis * angle * attitude_gain;
     }
     
@@ -1202,7 +1204,6 @@ VectorU InterceptorNodeQuaternion::calculate_pn_controls_image_based(const Vecto
             
             // 计算偏航误差 (使用叉积的z分量)
             double yaw_error = x_body_horizontal.cross(los_horizontal).z();
-            const double yaw_gain = 3.0;
             double yaw_rate_cmd = yaw_gain * yaw_error;
             yaw_rate_cmd = std::clamp(yaw_rate_cmd, -ControlLimits::YAW_RATE_MAX, ControlLimits::YAW_RATE_MAX);
             omega_body(2) = yaw_rate_cmd;
