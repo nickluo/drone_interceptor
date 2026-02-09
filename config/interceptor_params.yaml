@@ -59,8 +59,14 @@ interceptor_node_quaternion:
       # fov_deg: 30.0
 
       # For focal length based calculation
-      native_width_px: 1920
-      focal_length_mm: 16.0
+      # settings for MV-IMX264M
+      # native_width_px: 1920
+      # focal_length_mm: 16.0
+      # pixel_size_um: 3.45
+
+      # settings for MV-IMX265M
+      native_width_px: 1520
+      focal_length_mm: 10.0
       pixel_size_um: 3.45
 
     gimbal:
