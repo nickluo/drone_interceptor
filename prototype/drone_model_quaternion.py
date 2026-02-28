@@ -160,10 +160,6 @@ class DroneModelQuaternion:
         v_norm = relative_vel_W / relative_vel
         los_norm = los_W / dist_to_target
 
-        # coeff_align = ca.tanh(dist*0.25)
-        # alignment_error = 1 - ca.dot(v_norm, los_norm)
-        # alignment_error = ca.acos(ca.dot(v_norm, los_norm)) / ca.pi  # 使用夹角作为误差度量
-        # alignment_error = W_align * coeff_align * ca.acos(ca.dot(v_norm, los_norm)) / ca.pi
         alignment_error = W_align *(1 - ca.dot(v_norm, los_norm))
 
         # 3. 期望接近速度误差 (Closing Speed Error)
@@ -192,7 +188,6 @@ class DroneModelQuaternion:
         overspeed_penalty = 1.0 + 10.0 / (1.0 + ca.exp(20.0 * speed_diff / v_desired))  # 使用平滑函数避免不连续
         closing_speed_error = W_closing_speed * overspeed_penalty * speed_diff
         radial_speed_error = W_closing_speed * radial_speed_sq
-        
 
         # 4. 控制量误差 (Control Effort)
         # 悬停时推力加速度应等于重力加速度
