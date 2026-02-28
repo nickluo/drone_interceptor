@@ -57,7 +57,7 @@ TARGET_VELOCITY = np.array([-10.0, 5.0, 0.5]) # 目标做匀速直线运动
 # ======== 目标与相机物理属性 (Target & Camera Properties) ========
 # --- 目标 ---
 TARGET_PHYSICAL_SIZE_TRUTH = 0.5  # 目标的真实物理尺寸 (m), 用于相机模型
-TARGET_PHYSICAL_SIZE_EST = 0.9    # 状态估计器使用的目标尺寸 (m), 可模拟估计误差
+TARGET_WIDTH_INITIAL_EST = 1.0    # Bearing-Angle EKF 宽度初始猜测 (m), 将自适应收敛至真值
 
 # --- 相机 ---
 CAM_FOV_DEG = 30.0  # 相机水平视场角 (degrees)
@@ -78,9 +78,9 @@ W_U_THRUST = 0.0001       # 油门控制量权重
 
 # ======== 3D PN 导引律参数 (3D PN Guidance Parameters) ========
 PN_ENABLED = True
-PN_NAV_CONSTANT = 4.0       # 导航比 (N)
-PN_SWITCH_DIST = 15.0       # 切换距离阈值 (m)
-PN_FOV_SWITCH_DEG = 15.0    # 切换FOV阈值 (deg, 偏离光轴的角度)
+PN_NAV_CONSTANT = 5.0       # 导航比 (N)
+PN_SWITCH_DIST = 10.0       # 切换距离阈值 (m)
+PN_FOV_SWITCH_DEG = 2.0    # 切换FOV阈值 (deg, 偏离光轴的角度)
 PN_MIN_TIME_GO = 2.0        # 剩余时间阈值 (s)
 
 # ======== 云台参数 (Gimbal Parameters) ========
@@ -266,7 +266,10 @@ def main():
     target_vel_true = TARGET_VELOCITY.copy()
     
     camera = CameraModel(CAM_FOCAL_LENGTH, TARGET_PHYSICAL_SIZE_TRUTH, CAM_FOV_DEG, BBOX_POS_STD_DEV, BBOX_SIZE_STD_DEV)
-    estimator = TargetEKF(dt, CAM_FOCAL_LENGTH, TARGET_PHYSICAL_SIZE_EST, BBOX_POS_STD_DEV, BBOX_SIZE_STD_DEV)
+    estimator = TargetEKF(dt, CAM_FOCAL_LENGTH, BBOX_POS_STD_DEV, BBOX_SIZE_STD_DEV,
+                           initial_width_est=TARGET_WIDTH_INITIAL_EST,
+                           range_init_bias=0.6,
+                           q_accel=3.0, q_W=0.0002)
     output_filter = EMAFilter(int(N_HORIZON/TF*0.1), channels=4)
 
     perceptor = PerceptionSim(camera, PERCEPTION_DELAY, dt)
@@ -320,11 +323,11 @@ def main():
             drone_pos, psi = drone_state_at_meas[0:3], drone_state_at_meas[8]
             gimbal_r, gimbal_p, gimbal_y = drone_state_at_meas[12], drone_state_at_meas[13], drone_state_at_meas[14]
             
-            raw_pos_est = estimator.noisy_bbox_to_pos(meas_bbox, drone_pos, psi, gimbal_r, gimbal_p, gimbal_y)
             if not estimator.is_initialized:
-                estimator.initialize(raw_pos_est)
+                estimator.initialize(meas_bbox, drone_pos, psi, gimbal_r, gimbal_p, gimbal_y)
             else:
                 estimator.update(meas_bbox, drone_pos, psi, gimbal_r, gimbal_p, gimbal_y)
+            raw_pos_est = estimator.get_target_position()
         else:
             target_lost_counter += 1 # 目标丢失，增加计数器
             raw_pos_est = None
@@ -469,6 +472,7 @@ def main():
                 for k in range(N_HORIZON + 1):
                     t_k = k * dt
                     predicted_target_pos_est = pos_est + t_k * vel_est
+                    predicted_target_vel_est = vel_est
                     if (TRACKING_DISTANCE > 0.001):
                         # --- 计算期望接近速度 (Tracking Logic) ---
                         x_k = acados_solver.get(k, "x")
@@ -479,7 +483,7 @@ def main():
                         v_exp = tracking_coeff * V_DESIRED
                     else:
                         v_exp = V_DESIRED
-                    acados_solver.set(k, "p", np.hstack([predicted_target_pos_est, vel_est, DRAG_COEFF, v_exp, RATE_TC, W_COST, GIMBAL_RP_COEFF, GIMBAL_Y_COEFF]))
+                    acados_solver.set(k, "p", np.hstack([predicted_target_pos_est, predicted_target_vel_est, DRAG_COEFF, v_exp, RATE_TC, W_COST, GIMBAL_RP_COEFF, GIMBAL_Y_COEFF]))
 
                 t0 = time.time()
                 status = acados_solver.solve()
@@ -592,7 +596,7 @@ def plot_results(hist, dt):
     ax.legend(); ax.set_title('3D Trajectory (Quaternion Version)'); ax.grid(True); ax.axis('auto'); plt.show()
     
     # 性能指标图
-    fig, axs = plt.subplots(3, 1, figsize=(15, 12), sharex=True)
+    fig, axs = plt.subplots(4, 1, figsize=(15, 16), sharex=True)
     fig.suptitle('Interceptor Performance Metrics (Quaternion Version)', fontsize=16)
     if len(hist['distance']) > 0:
         axs[0].plot(time_axis_u, hist['distance'], label='Distance to Target')
@@ -635,8 +639,19 @@ def plot_results(hist, dt):
         axs[2].plot(time_axis_u, los_error[:, 0], label='LOS y-error (left/right)')
         axs[2].plot(time_axis_u, los_error[:, 1], label='LOS z-error (up/down)')
     axs[2].set_ylabel('Error'); axs[2].set_title('Line-of-Sight Error in Camera Frame')
-    axs[2].set_xlabel('Time [s]')
-    
+
+    # 目标宽度 W 估计图 (Bearing-Angle EKF)
+    if len(hist['target_est_ekf']) > 0 and hist['target_est_ekf'].shape[1] >= 7:
+        n_ekf = len(hist['target_est_ekf'])
+        time_ekf = time_axis_u[-n_ekf:] if n_ekf <= len(time_axis_u) else time_axis_u
+        axs[3].plot(time_ekf, hist['target_est_ekf'][:, 6], 'b-', label='Estimated W (EKF)')
+        axs[3].axhline(y=TARGET_PHYSICAL_SIZE_TRUTH, color='r', linestyle='--',
+                        label=f'True W ({TARGET_PHYSICAL_SIZE_TRUTH} m)')
+        axs[3].axhline(y=TARGET_WIDTH_INITIAL_EST, color='g', linestyle=':',
+                        label=f'Initial Guess ({TARGET_WIDTH_INITIAL_EST} m)')
+    axs[3].set_ylabel('Width [m]'); axs[3].set_title('Target Width Estimation (Bearing-Angle EKF)')
+    axs[3].set_xlabel('Time [s]')
+
     for ax in axs: ax.grid(True); ax.legend()
     plt.tight_layout(rect=[0, 0, 1, 0.96]); plt.show()
 

@@ -41,11 +41,11 @@ class CameraModel:
         
         dist_cam_x = los_C[0]
         if dist_cam_x <= 0.1: 
-            return {'u': 0, 'v': 0, 'size': 0, 'azimuth': 0, 'elevation': 0}, False
+            return {'u': 0, 'v': 0, 'size': 0, 'azimuth': 0, 'elevation': 0, 'visual_angle': 0}, False
 
         angle_to_center = np.arctan2(np.sqrt(los_C[1]**2 + los_C[2]**2), dist_cam_x)
         if angle_to_center > self.max_angle_rad: 
-            return {'u': 0, 'v': 0, 'size': 0, 'azimuth': 0, 'elevation': 0}, False
+            return {'u': 0, 'v': 0, 'size': 0, 'azimuth': 0, 'elevation': 0, 'visual_angle': 0}, False
 
         pixel_size = self.f * self.target_size / dist_cam_x
         bbox = {
@@ -53,7 +53,8 @@ class CameraModel:
             'u': self.f * los_C[1] / dist_cam_x,
             'v': self.f * los_C[2] / dist_cam_x,
             'azimuth': np.arctan2(-los_C[2], dist_cam_x),
-            'elevation': np.arctan2(-los_C[1], dist_cam_x)
+            'elevation': np.arctan2(-los_C[1], dist_cam_x),
+            'visual_angle': 2.0 * np.arctan(self.target_size / (2.0 * dist_cam_x))
         }
         return bbox, True
 
@@ -67,6 +68,7 @@ class CameraModel:
         noisy_bbox['size'] = max(1.0, noisy_bbox['size'])
         noisy_bbox['azimuth'] = np.arctan(-noisy_bbox['v'] / self.f)
         noisy_bbox['elevation'] = np.arctan(-noisy_bbox['u'] / self.f)
+        noisy_bbox['visual_angle'] = 2.0 * np.arctan(noisy_bbox['size'] / (2.0 * self.f))
         return noisy_bbox
 
 class PerceptionSim:
