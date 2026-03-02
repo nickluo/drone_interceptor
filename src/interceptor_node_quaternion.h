@@ -20,6 +20,7 @@
 
 #include "quadrotor_msgs/msg/control_command.hpp"
 #include "utils.h"
+#include "bearing_angle_ekf.h"
 
 using VectorX = Eigen::Matrix<double, 16, 1>;
 using VectorU = Eigen::Matrix<double, 4, 1>;
@@ -84,6 +85,12 @@ private:
         this->declare_parameter<double>("perception.target_physical_size_est", 1.0);
         this->declare_parameter<double>("perception.perspective_compensation", 1.0);  // 透视补偿因子
         this->declare_parameter<double>("perception.detection_latency", 0.08);  // 检测延迟估计
+
+        // Bearing-Angle EKF parameters
+        this->declare_parameter<double>("bearing_ekf.q_accel", 3.0);
+        this->declare_parameter<double>("bearing_ekf.q_W", 0.0002);
+        this->declare_parameter<double>("bearing_ekf.range_init_bias", 0.6);
+        this->declare_parameter<double>("bearing_ekf.alpha_R_inflate", 2.0);
 
         this->declare_parameter<double>("control.execution_delay", 0.05);
         this->declare_parameter<double>("control.rate_tc", 0.05);
@@ -161,6 +168,12 @@ private:
     uint8_t pn_active_ = 0; // Latched state for PN 0: off, 1: on 2: pure inertial
     double pn_vc_initial_ {0.0}; // 切换到PN时body系x轴速度
     VectorU pn_last_u_pn_ {0.0, 0.0, 0.0, 9.81}; // Last computed PN control command
+    int pn_switch_ready_count_ {0};  // 连续满足PN切换条件的周期数
+
+    // Phase-lead compensation state (prevents EMA-lag overshoot at rate zero-crossings)
+    double pn_prev_az_rate_ {0.0};
+    double pn_prev_el_rate_ {0.0};
+    bool pn_lead_initialized_ {false};
 
     
     // PN Filters
@@ -176,6 +189,12 @@ private:
     double perspective_compensation_;  // 透视补偿因子
     double detection_latency_;  // 检测延迟估计
     double control_execution_delay_;
+
+    // Bearing-Angle EKF parameters
+    double ekf_q_accel_;
+    double ekf_q_W_;
+    double ekf_range_init_bias_;
+    double ekf_alpha_R_inflate_;
     double ctrl_coeff_;
     double att_limit_;
     bool rate_control_enabled_;
@@ -218,7 +237,7 @@ private:
     int solve_count_ = 0;
     int ekf_health_check_counter_ = 0;
 
-    std::unique_ptr<DroneEKF> ekf_;
+    std::unique_ptr<BearingAngleEKF> ekf_;
     std::unique_ptr<EMAFilter> output_filter_;
     std::unique_ptr<StatusPublisher> status_publisher_;
     
@@ -244,9 +263,18 @@ private:
     
     bool is_visible_ = false;
     
-    DroneEKF::Bbox last_bbox_;
+    struct SimpleBbox { double cx, cy, w, h; };
+    SimpleBbox last_bbox_ {};
     bool last_bbox_valid_ = false;
     int bbox_jump_counter_ = 0;
+
+    // EKF prediction timer and tracking
+    double last_ekf_predict_time_ = -1.0;  // For predict dt computation
+    EMAFilter los_rate_filter_ {10, 2};     // For LOS rate filtering in PN switch
+    
+    // Image-plane tracker for direct LOS rate estimation (range-independent)
+    std::unique_ptr<ImagePlaneTracker> img_tracker_;
+    mutable std::shared_mutex mtx_img_tracker_;
     
     // 线程安全状态机
     MissionStateMachine mission_state_;
