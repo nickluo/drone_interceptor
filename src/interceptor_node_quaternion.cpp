@@ -204,21 +204,23 @@ void InterceptorNodeQuaternion::load_parameters()
 
 void InterceptorNodeQuaternion::setup_ekf()
 {
-    // 创建DroneEKF - 使用图像坐标系的12维CA模型 + 3D位置估计
+    // 创建DroneEKF - 使用图像坐标系的12维CA模型 + 3D位置估计 (19D)
     
-    // 8维过程噪声: [std_pos_img, std_vel_img, std_accel_img, std_size, std_size_vel, std_accel_size, std_pos_3d, std_vel_3d]
-    Eigen::Matrix<double, 8, 1> process_noise;
+    // 9维过程噪声: [std_pos_img, std_vel_img, std_accel_img, std_size, std_size_vel, std_accel_size, std_q_W, std_pos_3d, std_vel_3d]
+    Eigen::Matrix<double, 9, 1> process_noise;
     process_noise << bbox_pos_std_dev_ * 0.1,   // std_pos_img
                     bbox_pos_std_dev_ * 0.5,   // std_vel_img
                     bbox_pos_std_dev_ * 0.25,  // std_accel_img
                     bbox_size_std_dev_ * 0.1,  // std_size
                     bbox_size_std_dev_ * 0.5,  // std_size_vel
                     bbox_size_std_dev_ * 0.25, // std_accel_size
-                    target_physical_size_est_,         // std_pos_3d (米)
-                    target_physical_size_est_ * 2.0;   // std_vel_3d (米/秒)
-    // 3维测量噪声: [std_meas_pos, std_meas_size, std_meas_3d]
+                    0.005,                     // std_q_W (目标物理宽度随机游走)
+                    target_physical_size_est_ * 0.5, // std_pos_3d (米)
+                    target_physical_size_est_;       // std_vel_3d (米/秒)
+    
+    // 3维测量噪声: [std_meas_pos, std_meas_size, std_meas_angle]
     Eigen::Vector3d measurement_noise;
-    measurement_noise << bbox_pos_std_dev_, bbox_size_std_dev_, target_physical_size_est_;
+    measurement_noise << bbox_pos_std_dev_, bbox_size_std_dev_, bbox_size_std_dev_ * 0.5;
     
     const int predicted_imu_freq = 100;
     ekf_ = std::make_unique<DroneEKF>(cam_intrinsics_, process_noise, measurement_noise,
@@ -480,29 +482,33 @@ void InterceptorNodeQuaternion::bbox_callback(const vision_msgs::msg::Detection2
         // 直接从检测框计算LOS角度和角速率 (相机系)
         // ============================================
         detection_ratio_ = std::max(bbox.w / cam_intrinsics_.px , bbox.h / cam_intrinsics_.py);
-        // RCLCPP_INFO(this->get_logger(), "Detection ratio: %.4f", detection_ratio_);
+        
         if (detection_ratio_ < 1.0) // 避免过大的bbox导致过大的噪声估计
         {
-            std::unique_lock<std::shared_mutex> lock(mtx_ekf_);  // 写入使用独占锁
+            std::unique_lock<std::shared_mutex> ekf_lock(mtx_ekf_);
             if (detection_ratio_ > 0.1) {
                 const double coeff = std::exp((detection_ratio_ - 0.1) * 2); // 指数加权以增强近距离检测的影响
                 const double bbox_pos_std_dev = coeff * bbox_pos_std_dev_;
                 const double bbox_size_std_dev = coeff * bbox_size_std_dev_;
                 const double target_physical_size_est = coeff * target_physical_size_est_;
-                Eigen::Matrix<double, 8, 1> process_noise;
+                
+                Eigen::Matrix<double, 9, 1> process_noise;
                 process_noise << bbox_pos_std_dev * 0.1,   // std_pos_img
                                 bbox_pos_std_dev * 0.5,   // std_vel_img
                                 bbox_pos_std_dev * 0.25,  // std_accel_img
                                 bbox_size_std_dev  * 0.1,  // std_size
                                 bbox_size_std_dev * 0.5,  // std_size_vel
                                 bbox_size_std_dev * 0.25, // std_accel_size
-                                target_physical_size_est,         // std_pos_3d (米)
-                                target_physical_size_est * 2.0;   // std_vel_3d (米/秒)
+                                0.005 * coeff,            // std_q_W (W的过程噪声)
+                                target_physical_size_est * 0.5, // std_pos_3d (米)
+                                target_physical_size_est;       // std_vel_3d (米/秒)
+                
                 Eigen::Vector3d measurement_noise;
-                measurement_noise << bbox_pos_std_dev, bbox_size_std_dev, target_physical_size_est;
+                measurement_noise << bbox_pos_std_dev, bbox_size_std_dev, bbox_size_std_dev * 0.5;
+                
                 ekf_->set_covariance(process_noise, measurement_noise);
             }
-            // 执行update (New signature for World Frame DroneEKF)
+            // 执行update
             ekf_->update(detection_time, bbox, curr_drone_state_for_ekf.head<3>(), q_C_W);
         }
     }
@@ -734,18 +740,20 @@ void InterceptorNodeQuaternion::run_control_cycle(const Eigen::Vector3d &pos_est
             RCLCPP_INFO(this->get_logger(), "LOS angles (az,el): [%.2f, %.2f] deg, Off-boresight: %.2f deg, In FOV: %d", 
                 azimuth * 180.0 / M_PI, elevation * 180.0 / M_PI,
                 angle_off_boresight * 180.0 / M_PI, target_in_fov_center ? 1 : 0);
-            RCLCPP_INFO(this->get_logger(), "Distance to target: %.2f m, Closing speed: %.2f m/s", 
-                dist_to_target, closing_speed_est);
+            RCLCPP_INFO(this->get_logger(), "Distance to target: %.2f m, Closing speed: %.2f m/s, Estimated width: %.2f m", 
+                dist_to_target, closing_speed_est, ekf_->getEstimatedWidth());
                 
             // 方案3: 增加垂直速度和LOS角速度约束，避免进入PN时无法收敛
             double vertical_speed = std::abs(rel_vel.z());
-            const double max_vertical_speed_for_pn = closing_speed_est * 0.2;  // 垂直速度阈值 (m/s) - 更严格
+            // 放宽垂直速度阈值，当接近速度极小时也有基础容忍度，允许顺利进入PN
+            const double max_vertical_speed_for_pn = std::max(2.0, closing_speed_est * 0.5);  
             bool vertical_speed_ok = (vertical_speed < max_vertical_speed_for_pn);
             
             // 额外约束：LOS角速度不能太大
             double los_rate_check = std::sqrt(los_state(2)*los_state(2) + 
                                               los_state(3)*los_state(3));
-            const double max_los_rate_for_pn = pn_fov_switch_deg_ * M_PI / 180.0;  // 5°/s
+            // 放宽LOS角速度，允许最大 15 deg/s 的初始偏差
+            const double max_los_rate_for_pn = 15.0 * M_PI / 180.0;  // 15°/s
             bool los_rate_ok = (los_rate_check < max_los_rate_for_pn);
             
             if (!vertical_speed_ok) {
@@ -1019,28 +1027,28 @@ VectorU InterceptorNodeQuaternion::calculate_pn_controls_image_based(const Vecto
     }
     
     // 从EKF获取LOS角度和角速率 (仅用于日志和偏航控制)
-    // Eigen::Vector4d los_state;
-    // {
-    //     std::shared_lock<std::shared_mutex> lock(mtx_ekf_);
-    //     if (!ekf_ || !ekf_->is_initialized()) {
-    //         RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 100, 
-    //             "PN: EKF not initialized, returning hover");
-    //         return u_pn;
-    //     }
-    //     los_state = ekf_->stateToLosAngles(true);
-    // }
+    Eigen::Vector4d los_state;
+    {
+        std::shared_lock<std::shared_mutex> lock(mtx_ekf_);
+        if (!ekf_ || !ekf_->is_initialized()) {
+            RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 100, 
+                "PN: EKF not initialized, returning hover");
+            return u_pn;
+        }
+        los_state = ekf_->stateToLosAngles(true);
+    }
     
-    // double azimuth = los_state(0);       // 方位角 (弧度), 正=目标在相机右边
-    // double elevation = los_state(1);     // 俯仰角 (弧度), 正=目标在相机下方
-    // double azimuth_rate = los_state(2);  // 方位角速率 (弧度/秒)
-    // double elevation_rate = los_state(3); // 俯仰角速率 (弧度/秒)
+    double azimuth = los_state(0);       // 方位角 (弧度), 正=目标在相机右边
+    double elevation = los_state(1);     // 俯仰角 (弧度), 正=目标在相机下方
+    double azimuth_rate = los_state(2);  // 方位角速率 (弧度/秒)
+    double elevation_rate = los_state(3); // 俯仰角速率 (弧度/秒)
     
-    // // 检查有效性
-    // if (std::isnan(azimuth_rate) || std::isnan(elevation_rate)) {
-    //     RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 100, 
-    //         "PN: Invalid LOS rates (NaN), returning hover");
-    //     return u_pn;
-    // }
+    // 检查有效性
+    if (std::isnan(azimuth_rate) || std::isnan(elevation_rate)) {
+        RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 100, 
+            "PN: Invalid LOS rates (NaN), returning hover");
+        return u_pn;
+    }
 
     // ============================================================================
     // 3D True Proportional Navigation (TPN) - 直接在世界系中计算
@@ -1083,12 +1091,13 @@ VectorU InterceptorNodeQuaternion::calculate_pn_controls_image_based(const Vecto
     // ============================================================================
     // 末制导切换
     // ============================================================================
-    const double terminal_dist_threshold = 3.0;
+    const double terminal_dist_threshold = ekf_->getEstimatedWidth() * 2.5;
     const double terminal_tti_threshold = 0.2;
     if ((dist_to_target < terminal_dist_threshold || tti < terminal_tti_threshold) && pn_active_ == 1) {
         pn_active_ = 2;
+        pn_last_u_pn_.head<3>().setZero(); // Zero out angular rates to coast linearly
         RCLCPP_INFO(this->get_logger(), 
-            "PN: Entering terminal phase (dist=%.2fm, TTI=%.2fs), holding last command", 
+            "PN: Entering terminal phase (dist=%.2fm, TTI=%.2fs), coasting with zero angular rates", 
             dist_to_target, tti);
         return pn_last_u_pn_;
     }
@@ -1122,24 +1131,27 @@ VectorU InterceptorNodeQuaternion::calculate_pn_controls_image_based(const Vecto
     // 总PN加速度 (世界系)
     Eigen::Vector3d a_world = a_pn + a_forward;
     
-    // 限制水平和垂直加速度
+    // 限制水平和垂直加速度 (统一缩放以保持向量方向)
     double a_xy = std::sqrt(a_world.x() * a_world.x() + a_world.y() * a_world.y());
-    if (a_xy > pn_max_accel_xy_) {
-        double scale = pn_max_accel_xy_ / a_xy;
-        a_world.x() *= scale;
-        a_world.y() *= scale;
+    double scale_xy = (a_xy > pn_max_accel_xy_) ? (pn_max_accel_xy_ / a_xy) : 1.0;
+    double scale_z = 1.0;
+    if (std::abs(a_world.z()) > pn_max_accel_z_) {
+        scale_z = pn_max_accel_z_ / std::abs(a_world.z());
     }
-    a_world.z() = std::clamp(a_world.z(), -pn_max_accel_z_, pn_max_accel_z_);
+    double scale = std::min(scale_xy, scale_z);
+    a_world *= scale;
     
-    // 滤波
+    // 重新计算并滤波
+    a_xy = std::sqrt(a_world.x() * a_world.x() + a_world.y() * a_world.y());
     Eigen::VectorXd accel_raw(2);
-    accel_raw << std::sqrt(a_world.x()*a_world.x() + a_world.y()*a_world.y()), a_world.z();
+    accel_raw << a_xy, a_world.z();
     Eigen::VectorXd accel_filtered = pn_accel_filter_->filter(accel_raw);
-    // 保持方向，只滤波幅值
+    
+    // 保持XY方向不变，应用滤波后的幅值
     if (a_xy > 0.1) {
-        double scale = accel_filtered(0) / a_xy;
-        a_world.x() *= scale;
-        a_world.y() *= scale;
+        double ratio = accel_filtered(0) / a_xy;
+        a_world.x() *= ratio;
+        a_world.y() *= ratio;
     }
     a_world.z() = accel_filtered(1);
     
@@ -1222,15 +1234,19 @@ VectorU InterceptorNodeQuaternion::calculate_pn_controls_image_based(const Vecto
     pn_last_u_pn_ = u_pn;
     
     // 调试日志
-    // RCLCPP_INFO_THROTTLE(this->get_logger(), *this->get_clock(), 200,
-    //     "PN: az=%.1f° el=%.1f° | az_rate=%.2f°/s el_rate=%.2f°/s | Vc=%.1fm/s dist=%.1fm TTI=%.2fs",
-    //     azimuth * 180.0 / M_PI, elevation * 180.0 / M_PI,
-    //     azimuth_rate * 180.0 / M_PI, elevation_rate * 180.0 / M_PI,
-    //     closing_speed, dist_to_target, tti);
-    // RCLCPP_INFO_THROTTLE(this->get_logger(), *this->get_clock(), 200,
-    //     "PN: a_pn=[%.1f,%.1f,%.1f] a_fwd=%.1f | omega=[%.2f,%.2f,%.2f] | T=%.1f",
-    //     a_pn.x(), a_pn.y(), a_pn.z(), ax_forward,
-    //     omega_body(0), omega_body(1), omega_body(2), thrust);
+    RCLCPP_INFO_THROTTLE(this->get_logger(), *this->get_clock(), 100,
+        "PN: az=%.2f° el=%.2f° | az_rate=%.2f°/s el_rate=%.2f°/s | Vc=%.2fm/s dist=%.2fm TTI=%.2fs",
+        azimuth * 180.0 / M_PI, elevation * 180.0 / M_PI,
+        azimuth_rate * 180.0 / M_PI, elevation_rate * 180.0 / M_PI,
+        closing_speed, dist_to_target, tti);
+    
+    // Calculate world LOS rate magnitude from omega_los for logging
+    double omega_los_deg = omega_los.norm() * 180.0 / M_PI;
+    
+    RCLCPP_INFO_THROTTLE(this->get_logger(), *this->get_clock(), 100,
+        "PN: omega_los=%.2f°/s | a_pn=[%.1f,%.1f,%.1f] a_fwd=%.1f | omega=[%.2f,%.2f,%.2f] | T=%.1f",
+        omega_los_deg, a_pn.x(), a_pn.y(), a_pn.z(), ax_forward,
+        omega_body(0), omega_body(1), omega_body(2), thrust);
     
     return u_pn;
 }

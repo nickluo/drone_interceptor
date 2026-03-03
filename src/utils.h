@@ -198,9 +198,9 @@ struct CameraIntrinsics {
 class DroneEKF {
 public:
     // 固定大小类型定义
-    using Vector18d = Eigen::Matrix<double, 18, 1>;
-    using Matrix18d = Eigen::Matrix<double, 18, 18>;
-    using Matrix7x18d = Eigen::Matrix<double, 7, 18>;
+    using Vector19d = Eigen::Matrix<double, 19, 1>;
+    using Matrix19d = Eigen::Matrix<double, 19, 19>;
+    using Matrix7x19d = Eigen::Matrix<double, 7, 19>;
     using Vector7d = Eigen::Matrix<double, 7, 1>;
     using Matrix7d = Eigen::Matrix<double, 7, 7>;
 
@@ -214,8 +214,8 @@ public:
     // ============================================================================
     struct StateHistory {
         int64_t timestamp;
-        Vector18d state;
-        Matrix18d covariance;
+        Vector19d state;
+        Matrix19d covariance;
         Eigen::Vector3d imu_input;
     };
 
@@ -229,7 +229,7 @@ public:
      * @param target_size_est 目标估计尺寸 (米)
      */
     DroneEKF(const CameraIntrinsics& intrinsics,
-             const Eigen::Matrix<double, 8, 1>& process_noise_std,
+             const Eigen::Matrix<double, 9, 1>& process_noise_std,
              const Eigen::Vector3d& measurement_noise_std,
              int estimated_imu_freq,
              double estimated_detection_latency,
@@ -256,17 +256,19 @@ public:
 
         // 初始协方差
         P_ = Q_ * 10.0;
+        P_(18, 18) = 4.0; // P_W
         
-        // 测量矩阵 H (7x18): 直接观测 [cx, cy, w, h] 和通过投影观测3D位置
+        // 测量矩阵 H (7x19): 直接观测 [cx, cy, w, h] 和通过投影观测3D位置计算来的 [az, el, alpha]
+        // H(0:3, 0:3) 在上面为单位阵
+        // H(4:6, 12:18) 在update中动态计算 (非线性)
         H_.setZero();
         H_(0, 0) = 1.0; // cx
         H_(1, 1) = 1.0; // cy
         H_(2, 2) = 1.0; // w
         H_(3, 3) = 1.0; // h
-        // H(4:6, 12:17) 在update中动态计算 (非线性)
     }
 
-    void set_covariance(const Eigen::Matrix<double, 8, 1>& process_noise_std,
+    void set_covariance(const Eigen::Matrix<double, 9, 1>& process_noise_std,
              const Eigen::Vector3d& measurement_noise_std) {
         // 解析过程噪声
         double std_pos_img = process_noise_std(0);
@@ -275,11 +277,12 @@ public:
         double std_size = process_noise_std(3);
         double std_size_vel = process_noise_std(4);
         double std_accel_size = process_noise_std(5);
-        double std_pos_3d = process_noise_std(6);
-        double std_vel_3d = process_noise_std(7);
+        double std_q_W = process_noise_std(6);
+        double std_pos_3d = process_noise_std(7);
+        double std_vel_3d = process_noise_std(8);
 
-        // 构建过程噪声协方差矩阵 Q (18x18)
-        Vector18d q_diag;
+        // 构建过程噪声协方差矩阵 Q (19x19)
+        Vector19d q_diag;
         // 图像空间 (12维)
         q_diag << std_pos_img*std_pos_img, std_pos_img*std_pos_img,           // cx, cy
                   std_size*std_size, std_size*std_size,                        // w, h
@@ -287,19 +290,24 @@ public:
                   std_size_vel*std_size_vel, std_size_vel*std_size_vel,        // vw, vh
                   std_accel_img*std_accel_img, std_accel_img*std_accel_img,    // ax_img, ay_img
                   std_accel_size*std_accel_size, std_accel_size*std_accel_size,// aw, ah
-        // 3D空间 (6维)
+        // 3D空间 (7维)
                   std_pos_3d*std_pos_3d, std_pos_3d*std_pos_3d, std_pos_3d*std_pos_3d,  // px, py, pz
-                  std_vel_3d*std_vel_3d, std_vel_3d*std_vel_3d, std_vel_3d*std_vel_3d;  // vx, vy, vz
+                  std_vel_3d*std_vel_3d, std_vel_3d*std_vel_3d, std_vel_3d*std_vel_3d,  // vx, vy, vz
+                  std_q_W*std_q_W;                                                     // W
         Q_ = q_diag.asDiagonal();
 
-        // 测量噪声协方差 R (7x7): [cx, cy, w, h, u, v, size]
+        // 测量噪声协方差 R (7x7): [cx, cy, w, h, az, el, alpha]
         double std_meas_pos = measurement_noise_std(0);
         double std_meas_size = measurement_noise_std(1);
-        double std_meas_3d = measurement_noise_std(2);
+        double std_meas_angle = measurement_noise_std(2); // alpha noise, effectively size_dev / f
         Vector7d r_diag;
+        double f_avg = (intrinsics_.fx + intrinsics_.fy) / 2.0;
+        double sigma_az = std_meas_pos / intrinsics_.fx;
+        double sigma_el = std_meas_pos / intrinsics_.fy;
+        double sigma_alpha = std_meas_angle / f_avg;
         r_diag << std_meas_pos*std_meas_pos, std_meas_pos*std_meas_pos,
                   std_meas_size*std_meas_size, std_meas_size*std_meas_size,
-                  std_meas_3d*std_meas_3d, std_meas_3d*std_meas_3d, std_meas_3d*std_meas_3d;
+                  sigma_az*sigma_az, sigma_el*sigma_el, sigma_alpha*sigma_alpha * 2.0; // alpha_R_inflate = 2.0
         R_ = r_diag.asDiagonal();
     }
 
@@ -328,14 +336,14 @@ public:
         // 确保dt有效
         const double dt = dt_ / 1e6; // 转换为秒
         const double dt2 = 0.5 * dt * dt;
-        const Vector18d x_prev = x_;
+        const Vector19d x_prev = x_;
         
         // 检查输入有效性
         if (imu_omega.hasNaN() || x_prev.hasNaN()) {
             return;
         }
 
-        Vector18d x_pred;
+        Vector19d x_pred;
         
         // --- 图像空间 CA 模型预测 (12维) ---
         // 位置: p = p0 + v*dt + 0.5*a*dt²
@@ -390,9 +398,12 @@ public:
 
         // 速度: v = v0
         x_pred.segment<3>(15) = x_prev.segment<3>(15);
+        
+        // Width W: Random walk
+        x_pred(18) = x_prev(18);
 
-        // --- 计算雅可比矩阵 F (18x18) ---
-        Matrix18d F = Matrix18d::Identity();
+        // --- 计算雅可比矩阵 F (19x19) ---
+        Matrix19d F = Matrix19d::Identity();
         
         // 图像空间 CA 模型
         F(0, 4) = dt;  F(0, 8) = dt2;
@@ -421,8 +432,14 @@ public:
         F(14, 17) = dt;
 
         // --- 更新状态和协方差 ---
-        x_ = x_pred;
-        P_ = F * P_ * F.transpose() + Q_;
+    x_ = x_pred;
+    
+    // 采用稳定缩放的 Q 矩阵，避免因为 ROS jitter 导致 dt 极小时 qa 趋于无限大从而引发 NaN 爆炸
+    double dt_ratio = dt / 0.01;
+    if (dt_ratio < 0.01) dt_ratio = 0.01;
+    if (dt_ratio > 10.0) dt_ratio = 10.0;
+
+    P_ = F * P_ * F.transpose() + Q_ * dt_ratio;
         
         // 强制对称性
         P_ = 0.5 * (P_ + P_.transpose());
@@ -526,9 +543,16 @@ public:
         return state;
     }
 
-    /** @brief 获取完整18D状态向量 */
-    const Vector18d& getFullState() const {
+    /** @brief 获取完整19D状态向量 */
+    const Vector19d& getFullState() const {
         return x_;
+    }
+
+    /**
+     * @brief 获取估计的物理宽度
+     */
+    double getEstimatedWidth() const {
+        return x_(18);
     }
 
     /**
@@ -592,7 +616,7 @@ public:
     bool checkCovarianceHealth() const {
         double max_var = P_.diagonal().maxCoeff();
         if (max_var > 1e6) return false;
-        Eigen::SelfAdjointEigenSolver<Matrix18d> solver(P_, Eigen::EigenvaluesOnly);
+        Eigen::SelfAdjointEigenSolver<Matrix19d> solver(P_, Eigen::EigenvaluesOnly);
         return solver.eigenvalues().minCoeff() >= 0;
     }
 
@@ -638,7 +662,7 @@ private:
         double f_sq = intrinsics_.fx * intrinsics_.fx;
         double v_compensated = v - perspective_compensation_ * target_size_est_ * v * intrinsics_.fx / (f_sq + v_sq) / (intrinsics_.fx * target_size_est_ / bbox_size);
         
-        // 相机系LOS向量 (注意负号 - 与TargetEKF一致)
+        // 相机系LOS向量 (注意负号 - 匹配FLU中Y为左, Z为上)
         double est_los_C_y = -u * est_dist_cam_x / intrinsics_.fx;
         double est_los_C_z = -v_compensated * est_dist_cam_x / intrinsics_.fy;
         Eigen::Vector3d los_C(est_dist_cam_x, est_los_C_y, est_los_C_z);
@@ -652,9 +676,12 @@ private:
         }
         
         x_.segment<3>(12) = target_pos_W;
+        x_.segment<3>(15).setZero();
+        x_(18) = target_size_est_;
         
         // 重置协方差
         P_ = Q_ * 10.0;
+        P_(18, 18) = 4.0;
         
         is_initialized_ = true;
         last_timestamp_ = -1.0;
@@ -682,76 +709,87 @@ private:
         
         // --- 计算3D投影测量和雅可比 ---
         Eigen::Vector3d p_target = x_.segment<3>(12);
+        double W = x_(18);
         Eigen::Vector3d los_W = p_target - drone_pos;
         Eigen::Matrix3d R_W_C = q_C_W.toRotationMatrix().transpose();
         Eigen::Vector3d los_C = R_W_C * los_W;
         
         double x_c = los_C(0), y_c = los_C(1), z_c = los_C(2);
 
-        if (x_c < 0.1) return; // 避免除零，目标必须在相机前方
-
-        // 预测的3D投影测量 (u, v, size_proj)
-        // 相机坐标系: X前, Y右, Z下
-        // 投影: u = -fx * y/x (负号因为y正=右但u正=左时目标在右边图像偏右)
-        // 实际上与TargetEKF一致: 预测值使用相同公式
-        double u_pred = intrinsics_.fx * y_c / x_c;  // 不带负号，残差计算时处理
-        double v_pred = intrinsics_.fy * z_c / x_c;
-        double size_pred = intrinsics_.fx * target_size_est_ / x_c;
-
-        // 从bbox计算实际测量的u,v (相对主点，带负号与TargetEKF一致)
-        double u_meas = -(bbox(0) - intrinsics_.px);  // 负号匹配TargetEKF
-        double v_meas_raw = -(bbox(1) - intrinsics_.py);  // 负号匹配TargetEKF
-        double size_meas = std::max(bbox(2), bbox(3));
+        if (x_c < 1.0) return; // 避免除零，目标必须在相机前方
         
-        // 透视补偿 (与TargetEKF相同)
-        double v_raw = bbox(1) - intrinsics_.py;
-        double v_sq = v_raw * v_raw;
-        double f_sq = intrinsics_.fx * intrinsics_.fx;
-        double v_meas = v_meas_raw + perspective_compensation_ * target_size_est_ * v_raw * intrinsics_.fx / (f_sq + v_sq) / (intrinsics_.fx * target_size_est_ / size_meas);
+        // 奇异性保护
+        double r = los_W.norm();
+        if (r < 5.0) {
+            double scale = 5.0 / (r + 1e-5);
+            x_.segment<3>(12) = drone_pos + los_W * scale;
+            los_W = x_.segment<3>(12) - drone_pos;
+            los_C = R_W_C * los_W;
+            x_c = los_C(0); y_c = los_C(1); z_c = los_C(2);
+        }
 
-        // 构建完整测量向量 [cx, cy, w, h, u, v, size]
+        // 预测的 Bearing-Angle 测量 (azimuth, elevation, visual_angle)
+        // 相机坐标系(FLU): X前, Y左, Z上
+        // 目标向右 (Y反向) -> 图像cx>px (向右) -> 期望az>0, 故 az = arctan2(-y_c, x_c)
+        // 目标向下 (Z反向) -> 图像cy>py (向下) -> 期望el>0, 故 el = arctan2(-z_c, x_c)
+        double az_pred = std::atan2(-y_c, x_c);
+        double el_pred = std::atan2(-z_c, x_c);
+        double alpha_pred = 2.0 * std::atan(W / (2.0 * x_c));
+
+        // 从bbox计算实际测量的 az, el, alpha
+        double bbox_u = bbox(0) - intrinsics_.px;
+        double bbox_v = bbox(1) - intrinsics_.py;
+        double az_meas = std::atan2(bbox_u, intrinsics_.fx);
+        double el_meas = std::atan2(bbox_v, intrinsics_.fy);
+        
+        double size_meas = std::max(bbox(2), bbox(3));
+        double f_avg = (intrinsics_.fx + intrinsics_.fy) / 2.0;
+        double alpha_meas = 2.0 * std::atan(size_meas / (2.0 * f_avg));
+
+        // 构建完整测量向量 [cx, cy, w, h, az, el, alpha]
         Vector7d z_full;
         z_full << bbox(0), bbox(1), bbox(2), bbox(3),
-                  u_meas, v_meas, size_meas;
+                  az_meas, el_meas, alpha_meas;
 
         // 预测测量
         Vector7d z_pred;
         z_pred << x_(0), x_(1), x_(2), x_(3),
-                  u_pred, v_pred, size_pred;
+                  az_pred, el_pred, alpha_pred;
 
-        // 计算雅可比 H (7x18)
-        static const Matrix7x18d H_base = [] {
-            Matrix7x18d m = Matrix7x18d::Zero();
+        // 计算雅可比 H (7x19)
+        static const Matrix7x19d H_base = [] {
+            Matrix7x19d m = Matrix7x19d::Zero();
             m(0, 0) = 1.0; m(1, 1) = 1.0; m(2, 2) = 1.0; m(3, 3) = 1.0;
             return m;
         }();
-        Matrix7x18d H = H_base;
+        Matrix7x19d H = H_base;
 
-        // 3D投影雅可比 (d[u,v,size]/d[px,py,pz])
-        Eigen::Vector3d r1 = R_W_C.row(0);
-        Eigen::Vector3d r2 = R_W_C.row(1);
-        Eigen::Vector3d r3 = R_W_C.row(2);
-        double x_c_sq = x_c * x_c;
+        // 3D投影雅可比 (d[az,el,alpha]/d[px,py,pz,W])
+        double den_az = x_c * x_c + y_c * y_c;
+        if (den_az < 1e-10) den_az = 1e-10;
+        Eigen::RowVector3d daz_dlosC(y_c / den_az, -x_c / den_az, 0.0);
+        H.block<1, 3>(4, 12) = daz_dlosC * R_W_C;
 
-        Eigen::RowVector3d du_dp = (intrinsics_.fx / x_c) * r2.transpose() 
-                                 - (intrinsics_.fx * y_c / x_c_sq) * r1.transpose();
-        Eigen::RowVector3d dv_dp = (intrinsics_.fy / x_c) * r3.transpose() 
-                                 - (intrinsics_.fy * z_c / x_c_sq) * r1.transpose();
-        Eigen::RowVector3d dsize_dp = -(intrinsics_.fx * target_size_est_ / x_c_sq) * r1.transpose();
+        double den_el = x_c * x_c + z_c * z_c;
+        if (den_el < 1e-10) den_el = 1e-10;
+        Eigen::RowVector3d del_dlosC(z_c / den_el, 0.0, -x_c / den_el);
+        H.block<1, 3>(5, 12) = del_dlosC * R_W_C;
 
-        H.block<1, 3>(4, 12) = du_dp;
-        H.block<1, 3>(5, 12) = dv_dp;
-        H.block<1, 3>(6, 12) = dsize_dp;
+        double den_alpha = 4.0 * x_c * x_c + W * W;
+        H.block<1, 3>(6, 12) = (-4.0 * W / den_alpha) * R_W_C.row(0);
+        H(6, 18) = 4.0 * x_c / den_alpha;
 
         // --- 卡尔曼更新 ---
         Vector7d y = z_full - z_pred;
+        y(4) = std::remainder(y(4), 2.0 * M_PI);
+        y(5) = std::remainder(y(5), 2.0 * M_PI);
         
         // 限制残差大小防止发散
         for (int i = 0; i < 7; ++i) {
             y(i) = std::clamp(y(i), -500.0, 500.0);
         }
         
-        Eigen::Matrix<double, 18, 7> PH_T = P_ * H.transpose();
+        Eigen::Matrix<double, 19, 7> PH_T = P_ * H.transpose();
         Matrix7d S = H * PH_T + R_;
 
         // 使用LLT分解替代行列式检查
@@ -760,7 +798,7 @@ private:
             return; // S矩阵不正定
         }
 
-        Eigen::Matrix<double, 18, 7> K = PH_T * llt_S.solve(Matrix7d::Identity());
+        Eigen::Matrix<double, 19, 7> K = PH_T * llt_S.solve(Matrix7d::Identity());
         
         // 检查K是否有效
         if (K.hasNaN()) {
@@ -770,11 +808,14 @@ private:
         x_ = x_ + K * y;
 
         // Joseph形式协方差更新
-        static const Matrix18d I = Matrix18d::Identity();
-        Matrix18d I_KH = I - K * H;
+        static const Matrix19d I = Matrix19d::Identity();
+        Matrix19d I_KH = I - K * H;
         P_ = I_KH * P_ * I_KH.transpose() + K * R_ * K.transpose();
         P_ = 0.5 * (P_ + P_.transpose());
         
+        // 物理约束: 目标宽度 W >= 0.1m
+        if (x_(18) < 0.1) x_(18) = 0.1;
+
         // 最终NaN检查
         if (x_.hasNaN() || P_.hasNaN()) {
             // 恢复到更新前状态并重置
@@ -782,16 +823,16 @@ private:
         }
     }
 
-    // 状态向量 (18维)
-    Vector18d x_;
+    // 状态向量 (19维)
+    Vector19d x_;
     // 协方差矩阵
-    Matrix18d P_;
+    Matrix19d P_;
     // 过程噪声协方差
-    Matrix18d Q_;
+    Matrix19d Q_;
     // 测量噪声协方差
     Matrix7d R_;
     // 测量矩阵
-    Matrix7x18d H_;
+    Matrix7x19d H_;
 
     // 相机参数
     CameraIntrinsics intrinsics_;
