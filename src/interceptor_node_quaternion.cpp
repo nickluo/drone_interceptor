@@ -38,9 +38,6 @@ InterceptorNodeQuaternion::InterceptorNodeQuaternion()
     int filter_n = static_cast<int>(RATE_TC_ * 2.0 / dt_);
     if (filter_n < 5) filter_n = 5;
     output_filter_ = std::make_unique<EMAFilter>(filter_n, 4);
-    
-    // 初始化 PN 加速度滤波器 (Smoothing constant N=4, channels=2)
-    pn_accel_filter_ = std::make_unique<EMAFilter>(4, 2);
 
     // 初始化四元数状态 - drone_state_ 已在声明时初始化有效四元数
     drone_state_ = VectorX::Zero();
@@ -127,7 +124,6 @@ void InterceptorNodeQuaternion::load_parameters()
     this->get_parameter("perception.bbox_pos_std_dev", bbox_pos_std_dev_);
     this->get_parameter("perception.bbox_size_std_dev", bbox_size_std_dev_);
     this->get_parameter("perception.target_physical_size_est", target_physical_size_est_);
-    this->get_parameter("perception.perspective_compensation", perspective_compensation_);
     this->get_parameter("perception.detection_latency", detection_latency_);
     this->get_parameter("control.execution_delay", control_execution_delay_);
 
@@ -213,6 +209,8 @@ void InterceptorNodeQuaternion::setup_ekf()
 {
     // 创建 BearingAngleEKF — 7维状态 [px,py,pz,vx,vy,vz,W]
     // 使用 bearing-angle 测量模型: [azimuth, elevation, visual_angle]
+    // Estimate predict frequency from control rate (gimbal callback may be faster)
+    double predict_freq = 1.0 / dt_;
     ekf_ = std::make_unique<BearingAngleEKF>(
         cam_intrinsics_.fx,            // focal length in pixels
         bbox_pos_std_dev_,             // pixel position noise
@@ -221,11 +219,14 @@ void InterceptorNodeQuaternion::setup_ekf()
         ekf_range_init_bias_,          // range init bias (breaks W/d coupling)
         ekf_q_accel_,                  // acceleration process noise
         ekf_q_W_,                      // W random walk noise
-        ekf_alpha_R_inflate_           // visual angle R inflation
+        ekf_alpha_R_inflate_,          // visual angle R inflation
+        predict_freq,                  // estimated predict frequency for history buffer
+        detection_latency_             // estimated detection latency for history buffer
     );
     RCLCPP_INFO(this->get_logger(), 
-        "BearingAngleEKF initialized: focal=%.1f, W_init=%.2f, bias=%.2f, q_accel=%.2f, q_W=%.4f",
-        cam_intrinsics_.fx, target_physical_size_est_, ekf_range_init_bias_, ekf_q_accel_, ekf_q_W_);
+        "BearingAngleEKF initialized: focal=%.1f, W_init=%.2f, bias=%.2f, q_accel=%.2f, q_W=%.4f, hist_buf=%s",
+        cam_intrinsics_.fx, target_physical_size_est_, ekf_range_init_bias_, ekf_q_accel_, ekf_q_W_,
+        (detection_latency_ > 0.0 ? "enabled" : "disabled"));
     
     // Create image-plane tracker for direct LOS rate estimation
     // sigma_pos ≈ pixel_noise / focal_length
@@ -272,7 +273,6 @@ void InterceptorNodeQuaternion::mission_launch_callback(const std_msgs::msg::Hea
         }
         
         output_filter_->reset();
-        pn_accel_filter_->reset();
         los_rate_filter_.reset();
         {
             std::unique_lock<std::shared_mutex> lock(mtx_img_tracker_);
@@ -324,13 +324,14 @@ void InterceptorNodeQuaternion::gimbal_callback(const sensor_msgs::msg::Imu::Sha
     }
     {
         // BearingAngleEKF: predict with dt (CV model, no IMU omega needed)
+        // Pass timestamp to build history buffer for delayed measurement rollback
         std::unique_lock<std::shared_mutex> lock(mtx_ekf_);
         if (ekf_->is_initialized()) {
             double now = rclcpp::Time(msg->header.stamp).seconds();
             if (last_ekf_predict_time_ > 0.0) {
                 double dt = now - last_ekf_predict_time_;
                 if (dt > 0.0 && dt < 0.5) {
-                    ekf_->predict(dt);
+                    ekf_->predict(dt, now);
                 }
             }
             last_ekf_predict_time_ = now;
@@ -377,11 +378,12 @@ void InterceptorNodeQuaternion::odom_callback(const nav_msgs::msg::Odometry::Sha
         std::unique_lock<std::shared_mutex> lock(mtx_ekf_);
         if (ekf_->is_initialized()) {
             // BearingAngleEKF: predict with dt (CV model)
+            // Pass timestamp to build history buffer for delayed measurement rollback
             double now = rclcpp::Time(msg->header.stamp).seconds();
             if (last_ekf_predict_time_ > 0.0) {
                 double dt = now - last_ekf_predict_time_;
                 if (dt > 0.0 && dt < 0.5) {
-                    ekf_->predict(dt);
+                    ekf_->predict(dt, now);
                 }
             }
             last_ekf_predict_time_ = now;
@@ -517,8 +519,9 @@ void InterceptorNodeQuaternion::bbox_callback(const vision_msgs::msg::Detection2
                 BearingAngleEKF::Measurement z = BearingAngleEKF::compute_measurement(
                     u_offset, v_offset, bbox_size, cam_intrinsics_.fx);
                 
-                // Update EKF
-                ekf_->update(z, drone_pos, R_WC);
+                // Update EKF with measurement timestamp for delayed rollback
+                // obs_time = image capture time (before detection pipeline latency)
+                ekf_->update(z, drone_pos, R_WC, obs_time);
             }
         }
     }
@@ -1127,8 +1130,11 @@ VectorU InterceptorNodeQuaternion::calculate_pn_controls_image_based(const Vecto
     // ============================================================================
     // 末制导切换 (缩短盲飞距离以提高命中精度)
     // ============================================================================
-    const double terminal_dist_threshold = 1.5;
-    const double terminal_tti_threshold = 0.15;
+    double terminal_dist_threshold = ekf_->get_width() * 2.0;  // 以目标宽度为基准的距离阈值
+    if (terminal_dist_threshold < 1.0) {
+        terminal_dist_threshold = 1.0;  // 最小切换距离，避免过早切换
+    }
+    const double terminal_tti_threshold = 0.2;
     if ((dist_to_target < terminal_dist_threshold || tti < terminal_tti_threshold) && pn_active_ == 1) {
         pn_active_ = 2;
         RCLCPP_INFO(this->get_logger(), 
@@ -1147,10 +1153,9 @@ VectorU InterceptorNodeQuaternion::calculate_pn_controls_image_based(const Vecto
     // 通过 R_CW 变换到世界系
     //
     // 相比原始像素速度，EMA滤波的角速率更平滑，可避免振荡
-    // 不再使用 pn_accel_filter (双重滤波引入相位滞后导致不稳定)
     // ============================================================================
     
-    double N = pn_nav_constant_;  // 固定导航常数，不使用自适应
+    const double N = pn_nav_constant_;  // 固定导航常数，不使用自适应
     
     // 从 ImagePlaneTracker 获取 EMA 滤波的 LOS 角速率
     double az_rate = img_los_state(2);  // azimuth rate (rad/s)
@@ -1167,9 +1172,8 @@ VectorU InterceptorNodeQuaternion::calculate_pn_controls_image_based(const Vecto
     // ============================================================================
     const double T_d = 0.03;  // 超前时间常数 (s), 匹配 EMA 群延迟
     if (pn_lead_initialized_) {
-        double dt_pn = 0.02;  // ~50Hz control rate
-        double az_rate_dot = (az_rate - pn_prev_az_rate_) / dt_pn;
-        double el_rate_dot = (el_rate - pn_prev_el_rate_) / dt_pn;
+        double az_rate_dot = (az_rate - pn_prev_az_rate_) / dt_;
+        double el_rate_dot = (el_rate - pn_prev_el_rate_) / dt_;
         az_rate += T_d * az_rate_dot;
         el_rate += T_d * el_rate_dot;
     }
@@ -1256,8 +1260,8 @@ VectorU InterceptorNodeQuaternion::calculate_pn_controls_image_based(const Vecto
     double sin_angle = rotation_axis.norm();
     double cos_angle = z_body_current.dot(z_body_desired);
 
-    const double attitude_gain = 4.0;   // 固定增益，平衡跟踪速度和超调
-    const double yaw_gain = 2.5;
+    const double attitude_gain = N * 1.5;
+    const double yaw_gain = N * 0.75;
     
     Eigen::Vector3d omega_world = Eigen::Vector3d::Zero();
     if (sin_angle > 1e-6) {

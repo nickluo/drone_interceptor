@@ -83,7 +83,6 @@ private:
         this->declare_parameter<double>("perception.bbox_pos_std_dev", 2.0);
         this->declare_parameter<double>("perception.bbox_size_std_dev", 5.0);
         this->declare_parameter<double>("perception.target_physical_size_est", 1.0);
-        this->declare_parameter<double>("perception.perspective_compensation", 1.0);  // 透视补偿因子
         this->declare_parameter<double>("perception.detection_latency", 0.08);  // 检测延迟估计
 
         // Bearing-Angle EKF parameters
@@ -174,10 +173,6 @@ private:
     double pn_prev_az_rate_ {0.0};
     double pn_prev_el_rate_ {0.0};
     bool pn_lead_initialized_ {false};
-
-    
-    // PN Filters
-    std::unique_ptr<EMAFilter> pn_accel_filter_;
     
     // 自适应推力效率估计 (MPC阶段学习)
     double thrust_efficiency_ {1.0};  // 推力效率系数 (T_actual = efficiency * T_cmd)

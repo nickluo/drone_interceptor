@@ -19,6 +19,8 @@
 #include <Eigen/Dense>
 #include <cmath>
 #include <iostream>
+#include <deque>
+#include <algorithm>
 
 class BearingAngleEKF {
 public:
@@ -45,6 +47,17 @@ public:
     };
 
     /**
+     * @brief History state snapshot for delayed measurement rollback
+     * Stores EKF state at each predict step to enable out-of-sequence
+     * measurement processing (compensating detection latency).
+     */
+    struct StateHistory {
+        double timestamp;       // seconds
+        Vector7d state;         // state vector snapshot
+        Matrix7d covariance;    // covariance snapshot
+    };
+
+    /**
      * @brief Constructor
      * @param cam_focal_length Camera focal length in pixels
      * @param pos_dev Bbox position noise std dev in pixels
@@ -54,6 +67,8 @@ public:
      * @param q_accel Process noise acceleration spectral density (m²/s⁴)/Hz
      * @param q_W Process noise for W random walk (m²/s)
      * @param alpha_R_inflate Inflation factor for visual angle measurement noise
+     * @param estimated_predict_freq Estimated predict() call frequency in Hz (0 = disable history)
+     * @param estimated_detection_latency Estimated detection pipeline latency in seconds (0 = disable history)
      */
     BearingAngleEKF(double cam_focal_length,
                     double pos_dev,
@@ -62,7 +77,9 @@ public:
                     double range_init_bias = 0.5,
                     double q_accel = 1.0,
                     double q_W = 0.002,
-                    double alpha_R_inflate = 2.0)
+                    double alpha_R_inflate = 2.0,
+                    double estimated_predict_freq = 0.0,
+                    double estimated_detection_latency = 0.0)
         : focal_length_(cam_focal_length),
           initial_width_est_(initial_width_est),
           range_init_bias_(range_init_bias),
@@ -70,6 +87,13 @@ public:
           q_W_(q_W),
           is_initialized_(false)
     {
+        // History buffer for delayed measurement rollback
+        if (estimated_predict_freq > 0.0 && estimated_detection_latency > 0.0) {
+            max_buffer_size_ = static_cast<size_t>(estimated_predict_freq * estimated_detection_latency * 2.5);
+            if (max_buffer_size_ < 10) max_buffer_size_ = 10;
+        } else {
+            max_buffer_size_ = 0;  // disabled
+        }
         // Derive angular measurement noise from pixel noise
         double sigma_az = pos_dev / cam_focal_length;
         double sigma_el = pos_dev / cam_focal_length;
@@ -125,6 +149,7 @@ public:
                        4.0).asDiagonal();
 
         is_initialized_ = true;
+        history_buffer_.clear();  // Fresh start for history
         std::cout << "[INFO] Bearing-Angle EKF initialized: pos=["
                   << initial_pos_est.transpose() << "], W_init=" << x_(6) << "m" << std::endl;
     }
@@ -132,8 +157,10 @@ public:
     /**
      * @brief EKF prediction step (Constant Velocity model with kinematic process noise)
      * @param dt Time step in seconds
+     * @param timestamp Current time in seconds (> 0 to save state to history buffer for
+     *                  delayed measurement rollback; <= 0 skips history save, used during replay)
      */
-    void predict(double dt)
+    void predict(double dt, double timestamp = -1.0)
     {
         if (!is_initialized_) return;
 
@@ -162,18 +189,101 @@ public:
         // Predict state and covariance
         x_ = F * x_;
         P_ = F * P_ * F.transpose() + Q;
+
+        // Save to history buffer for delayed measurement rollback
+        if (timestamp > 0.0 && max_buffer_size_ > 0) {
+            history_buffer_.push_back({timestamp, x_, P_});
+            while (history_buffer_.size() > max_buffer_size_) {
+                history_buffer_.pop_front();
+            }
+        }
     }
 
     /**
-     * @brief EKF update step with bearing-angle measurements
-     * @param z Bearing-angle measurement (azimuth, elevation, visual_angle)
+     * @brief EKF update with delayed measurement rollback
+     *
+     * When measurement_timestamp > 0 and the history buffer is populated,
+     * the filter rolls back state/covariance to the predict step closest to
+     * the measurement time, applies the update there, then replays all
+     * subsequent predict steps to bring state back to current time.
+     * This compensates for detection pipeline latency.
+     *
+     * @param z Bearing-angle measurement
      * @param drone_pos Drone position in world frame
      * @param R_WC Rotation matrix from world to camera frame
-     * @return true if update was accepted, false if rejected (behind camera, singularity, chi² gate)
+     * @param measurement_timestamp Time the image was captured (seconds, > 0 to enable rollback)
+     * @return true if update accepted
      */
     bool update(const Measurement& z,
                 const Vector3d& drone_pos,
-                const Matrix3d& R_WC)
+                const Matrix3d& R_WC,
+                double measurement_timestamp = -1.0)
+    {
+        if (!is_initialized_) return false;
+
+        // ---- Delayed-measurement rollback path ----
+        if (measurement_timestamp > 0.0 && !history_buffer_.empty()) {
+            // Binary search for closest historical state
+            auto it = std::lower_bound(
+                history_buffer_.begin(), history_buffer_.end(), measurement_timestamp,
+                [](const StateHistory& entry, double t) { return entry.timestamp < t; });
+
+            auto best_it = it;
+            if (it == history_buffer_.end()) {
+                best_it = std::prev(history_buffer_.end());
+            } else if (it != history_buffer_.begin()) {
+                auto prev_it = std::prev(it);
+                if (std::abs(prev_it->timestamp - measurement_timestamp) <=
+                    std::abs(it->timestamp - measurement_timestamp)) {
+                    best_it = prev_it;
+                }
+            }
+
+            // Save current state in case the update is rejected
+            Vector7d saved_x = x_;
+            Matrix7d saved_P = P_;
+
+            // Roll back to historical state
+            x_ = best_it->state;
+            P_ = best_it->covariance;
+
+            // Apply measurement update at the historical state
+            bool accepted = update_internal(z, drone_pos, R_WC);
+
+            if (!accepted) {
+                // Rejected — restore current state, no side effects
+                x_ = saved_x;
+                P_ = saved_P;
+                return false;
+            }
+
+            // Replay predictions forward, updating stale history entries
+            double prev_time = best_it->timestamp;
+            for (auto replay_it = std::next(best_it); replay_it != history_buffer_.end(); ++replay_it) {
+                double dt_replay = replay_it->timestamp - prev_time;
+                if (dt_replay > 0.0 && dt_replay < 0.5) {
+                    predict(dt_replay);  // no timestamp → won't save to history
+                }
+                // Overwrite stale entry with corrected post-update trajectory
+                replay_it->state = x_;
+                replay_it->covariance = P_;
+                prev_time = replay_it->timestamp;
+            }
+            return true;
+        }
+
+        // ---- Direct update path (no rollback) ----
+        return update_internal(z, drone_pos, R_WC);
+    }
+
+private:
+    /**
+     * @brief Internal EKF update (measurement model + Kalman gain)
+     * @return true if update was accepted, false if rejected
+     */
+    bool update_internal(const Measurement& z,
+                         const Vector3d& drone_pos,
+                         const Matrix3d& R_WC)
     {
         if (!is_initialized_) return false;
 
@@ -263,6 +373,7 @@ public:
         return true;
     }
 
+public:
     /**
      * @brief Get estimated target position in world frame
      */
@@ -309,6 +420,7 @@ public:
         P_ = Vector7d(900.0, 900.0, 900.0,
                        100.0, 100.0, 100.0,
                        4.0).asDiagonal();
+        history_buffer_.clear();
     }
 
     /**
@@ -462,6 +574,10 @@ private:
 
     // Status
     bool is_initialized_;
+
+    // History buffer for delayed measurement rollback
+    std::deque<StateHistory> history_buffer_;
+    size_t max_buffer_size_ = 0;
 };
 
 
