@@ -322,6 +322,14 @@ public:
     void predict(int64_t current_time, const Eigen::Vector3d& imu_omega, bool is_flu = true) {
         if (!is_initialized_) return;
 
+        // 保存云台角速度 (转换到FRD相机坐标系用于LOS rate计算)
+        // FLU→FRD: y取反, z取反
+        if (is_flu) {
+            last_gimbal_omega_frd_ << imu_omega(0), -imu_omega(1), -imu_omega(2);
+        } else {
+            last_gimbal_omega_frd_ = imu_omega;
+        }
+
         if (current_time > 0) {
             if (last_timestamp_ > 0) {
                 const int64_t delta_us = current_time - last_timestamp_;
@@ -578,20 +586,17 @@ public:
     }
 
     /**
-     * @brief 将状态转换为视线角和角速度
-     * @param compensate_rotation 是否补偿相机自转
+     * @brief 将状态转换为视线角和角速度 (惯性系)
+     * @param compensate_rotation 是否使用惯性系LOS角速度 (加上云台角速度)
      * @return [azimuth, elevation, azimuth_rate, elevation_rate] (弧度, 弧度/秒)
+     *
+     * 原理: 惯性系LOS角速度 = 相机坐标系LOS角变化率 + 云台角速度
+     * 相机坐标系LOS角变化率通过EKF位置状态的有限差分计算, 避免使用
+     * 被前向运动透视流(translational flow)污染的EKF速度状态.
      */
     Eigen::Vector4d stateToLosAngles(bool compensate_rotation = false) {
         double cx = x_(0);
         double cy = x_(1);
-        double vx_target = x_(4);
-        double vy_target = x_(5);
-
-        if (!compensate_rotation) {
-            vx_target += v_imu_cache_(0);
-            vy_target += v_imu_cache_(1);
-        }
 
         double norm_x = (cx - intrinsics_.px) / intrinsics_.fx;
         double norm_y = (cy - intrinsics_.py) / intrinsics_.fy;
@@ -599,8 +604,34 @@ public:
         double azimuth = std::atan(norm_x);
         double elevation = std::atan(norm_y);
 
-        double azimuth_rate = (vx_target / intrinsics_.fx) / (1.0 + norm_x * norm_x);
-        double elevation_rate = (vy_target / intrinsics_.fy) / (1.0 + norm_y * norm_y);
+        // 使用有限差分计算相机坐标系内的LOS角变化率
+        // 这避免了EKF速度状态(vx_img)被前向运动的translational flow污染的问题
+        double azimuth_rate = 0.0;
+        double elevation_rate = 0.0;
+        double dt_sec = dt_ / 1e6;
+
+        if (los_angle_initialized_ && dt_sec > 0.001 && dt_sec < 0.1) {
+            // 相机坐标系内的LOS角变化率 (目标在画面中的角速度)
+            double camera_az_rate = (azimuth - prev_azimuth_) / dt_sec;
+            double camera_el_rate = (elevation - prev_elevation_) / dt_sec;
+
+            if (compensate_rotation) {
+                // 惯性系LOS角速度 = 相机系变化率 + 云台角速度
+                // 云台FRD坐标系: yaw(omega_z_FRD) 对应 azimuth, pitch(omega_y_FRD) 对应 elevation
+                // 注意符号: 云台向右转(yaw>0)时, 目标在画面中向左移(azimuth减小)
+                // 所以: 惯性系azimuth_rate = camera_rate + gimbal_yaw_rate
+                azimuth_rate = camera_az_rate + last_gimbal_omega_frd_(2);   // + omega_z_FRD (yaw)
+                elevation_rate = camera_el_rate + last_gimbal_omega_frd_(1); // + omega_y_FRD (pitch)
+            } else {
+                // 相机坐标系LOS角速度 (不加云台旋转)
+                azimuth_rate = camera_az_rate;
+                elevation_rate = camera_el_rate;
+            }
+        }
+
+        prev_azimuth_ = azimuth;
+        prev_elevation_ = elevation;
+        los_angle_initialized_ = true;
 
         azimuth_rate = ema_filter_.filter(azimuth_rate, 0);
         elevation_rate = ema_filter_.filter(elevation_rate, 1);
@@ -632,6 +663,8 @@ public:
         history_buffer_.clear();
         ema_filter_.reset();
         imu_flow_filter_.reset();
+        los_angle_initialized_ = false;
+        last_gimbal_omega_frd_.setZero();
     }
 
     /** @brief 检查协方差矩阵健康状态 */
@@ -872,6 +905,12 @@ private:
 
     // IMU缓存
     Eigen::Vector2d v_imu_cache_;
+    Eigen::Vector3d last_gimbal_omega_frd_ = Eigen::Vector3d::Zero(); // 云台角速度 (FRD)
+
+    // LOS角有限差分缓存
+    double prev_azimuth_ = 0.0;
+    double prev_elevation_ = 0.0;
+    bool los_angle_initialized_ = false;
 
     // EMA滤波器
     EMAFilterTemplate<2> ema_filter_;
