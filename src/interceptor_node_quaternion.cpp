@@ -765,8 +765,8 @@ void InterceptorNodeQuaternion::run_control_cycle(const Eigen::Vector3d &pos_est
             // 额外约束：LOS角速度不能太大
             double los_rate_check = std::sqrt(los_state(2)*los_state(2) + 
                                               los_state(3)*los_state(3));
-            // 放宽LOS角速度，允许最大2倍初始视场角的角速度
-            const double max_los_rate_for_pn = 2.0 * pn_fov_switch_deg_ * M_PI / 180.0;
+            // 放宽LOS角速度，允许最大5倍初始视场角的角速度
+            const double max_los_rate_for_pn = 5.0 * pn_fov_switch_deg_ * M_PI / 180.0;
             bool los_rate_ok = (los_rate_check < max_los_rate_for_pn);
             
             if (!vertical_speed_ok) {
