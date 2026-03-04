@@ -1092,7 +1092,7 @@ VectorU InterceptorNodeQuaternion::calculate_pn_controls_image_based(const Vecto
     // 末制导切换
     // ============================================================================
     const double terminal_dist_threshold = ekf_->getEstimatedWidth() * 2.5;
-    const double terminal_tti_threshold = 0.2;
+    const double terminal_tti_threshold = 0.1;
     if ((dist_to_target < terminal_dist_threshold || tti < terminal_tti_threshold) && pn_active_ == 1) {
         pn_active_ = 2;
         pn_last_u_pn_.head<3>().setZero(); // Zero out angular rates to coast linearly
@@ -1111,7 +1111,26 @@ VectorU InterceptorNodeQuaternion::calculate_pn_controls_image_based(const Vecto
     double N = pn_nav_constant_;
     
     // 计算LOS角速度向量 (世界系)
-    Eigen::Vector3d omega_los = rel_pos.cross(rel_vel) / (dist_to_target * dist_to_target);
+    // 弃用极度嘈杂的3D坐标交叉相乘法 (rel_pos.cross(rel_vel))，
+    // 改用EKF直接输出的、经IMU补偿后的高精度图像平面角速率。
+    Eigen::Quaterniond q_C_W;
+    if (gimbal_received_) {
+        std::shared_lock<std::shared_mutex> gimbal_lock(mtx_gimbal_);
+        q_C_W = current_gimbal_orientation_;
+    } else {
+        // Horizontal Gimbal: Only Yaw follows drone
+        double psi = get_yaw_from_quaternion(drone_state.segment<4>(6));
+        Eigen::AngleAxisd yaw_rot(psi, Eigen::Vector3d::UnitZ());
+        q_C_W = Eigen::Quaterniond(yaw_rot);
+    }
+    
+    // 构造机体系(FLU)下的LOS角速率向量
+    // elevation_rate > 0 (目标画面向下移) -> 视线绕机体Y轴(向左)做正旋转(机头下沉)
+    // azimuth_rate > 0 (目标画面向右移) -> 视线绕机体Z轴(向上)做负旋转(机头向右)
+    Eigen::Vector3d omega_los_FLU(0.0, elevation_rate, -azimuth_rate);
+    
+    // 转换到世界系
+    Eigen::Vector3d omega_los = q_C_W.toRotationMatrix() * omega_los_FLU;
     
     // PN加速度 = N * Vc * (omega_los × los_unit)
     // 这个加速度垂直于LOS方向，指向需要转向的方向
