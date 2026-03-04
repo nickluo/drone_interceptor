@@ -39,8 +39,8 @@ InterceptorNodeQuaternion::InterceptorNodeQuaternion()
     if (filter_n < 5) filter_n = 5;
     output_filter_ = std::make_unique<EMAFilter>(filter_n, 4);
     
-    // 初始化 PN 加速度滤波器 (Smoothing constant N=4, channels=2)
-    pn_accel_filter_ = std::make_unique<EMAFilter>(4, 2);
+    // 初始化 PN 加速度滤波器 (Smoothing constant N=2, channels=2) 降低延迟，提高对机动目标的响应速度
+    pn_accel_filter_ = std::make_unique<EMAFilter>(2, 2);
 
     // 初始化四元数状态 - drone_state_ 已在声明时初始化有效四元数
     drone_state_ = VectorX::Zero();
@@ -316,6 +316,10 @@ void InterceptorNodeQuaternion::gimbal_callback(const sensor_msgs::msg::Imu::Sha
             // 使用angular_velocity字段获取角速度 (FLU坐标系: roll, pitch, yaw)
             Eigen::Vector3d current_gimbal_rate;
             current_gimbal_rate << msg->angular_velocity.x, msg->angular_velocity.y, msg->angular_velocity.z;
+            RCLCPP_INFO_THROTTLE(this->get_logger(), *this->get_clock(), 500,
+                "Gimbal IMU (FLU): roll=%.3f pitch=%.3f yaw=%.3f rad/s (%.1f %.1f %.1f deg/s)",
+                current_gimbal_rate(0), current_gimbal_rate(1), current_gimbal_rate(2),
+                current_gimbal_rate(0) * 180.0/M_PI, current_gimbal_rate(1) * 180.0/M_PI, current_gimbal_rate(2) * 180.0/M_PI);
             ekf_->predict(rclcpp::Time(msg->header.stamp).nanoseconds() / 1000, current_gimbal_rate);
         }
     }
@@ -735,6 +739,7 @@ void InterceptorNodeQuaternion::run_control_cycle(const Eigen::Vector3d &pos_est
         if (los_valid) {
             // 计算LOS偏离视轴角度 (相机系)
             double angle_off_boresight = std::sqrt(azimuth * azimuth + elevation * elevation);
+            // 收紧FOV阈值，确保在更接近真实的碰撞航线上时才进入PN
             bool target_in_fov_center = (angle_off_boresight < pn_fov_switch_deg_ * M_PI / 180.0);
             
             RCLCPP_INFO(this->get_logger(), "LOS angles (az,el): [%.2f, %.2f] deg, Off-boresight: %.2f deg, In FOV: %d", 
@@ -742,6 +747,14 @@ void InterceptorNodeQuaternion::run_control_cycle(const Eigen::Vector3d &pos_est
                 angle_off_boresight * 180.0 / M_PI, target_in_fov_center ? 1 : 0);
             RCLCPP_INFO(this->get_logger(), "Distance to target: %.2f m, Closing speed: %.2f m/s, Estimated width: %.2f m", 
                 dist_to_target, closing_speed_est, ekf_->getEstimatedWidth());
+            // Diagnostic: print EKF internal decomposition
+            auto full_state = ekf_->getFullState();
+            auto v_imu = ekf_->getImuFlowCache();
+            RCLCPP_INFO(this->get_logger(), 
+                "EKF diag: vx_img=%.1f vy_img=%.1f | v_imu=[%.1f,%.1f] | ax=%.1f ay=%.1f | LOS_rate=[%.2f,%.2f]°/s",
+                full_state(4), full_state(5), v_imu(0), v_imu(1),
+                full_state(8), full_state(9),
+                los_state(2) * 180.0 / M_PI, los_state(3) * 180.0 / M_PI);
                 
             // 方案3: 增加垂直速度和LOS角速度约束，避免进入PN时无法收敛
             double vertical_speed = std::abs(rel_vel.z());
@@ -752,8 +765,8 @@ void InterceptorNodeQuaternion::run_control_cycle(const Eigen::Vector3d &pos_est
             // 额外约束：LOS角速度不能太大
             double los_rate_check = std::sqrt(los_state(2)*los_state(2) + 
                                               los_state(3)*los_state(3));
-            // 放宽LOS角速度，允许最大 15 deg/s 的初始偏差
-            const double max_los_rate_for_pn = 15.0 * M_PI / 180.0;  // 15°/s
+            // 放宽LOS角速度，允许最大2倍初始视场角的角速度
+            const double max_los_rate_for_pn = 2.0 * pn_fov_switch_deg_ * M_PI / 180.0;
             bool los_rate_ok = (los_rate_check < max_los_rate_for_pn);
             
             if (!vertical_speed_ok) {
@@ -901,8 +914,9 @@ void InterceptorNodeQuaternion::run_control_cycle(const Eigen::Vector3d &pos_est
                     double efficiency_sample = actual_accel_z / expected_accel_z;
                     // 限制合理范围
                     efficiency_sample = std::clamp(efficiency_sample, 0.5, 1.5);
-                    // 指数移动平均更新
-                    thrust_efficiency_ = 0.9 * thrust_efficiency_ + 0.1 * efficiency_sample;
+                    // 禁用动态推力估计，因为它在高速追击的大倾角下（阻力大）会严重低估推力，
+                    // 导致 PN 阶段推力指令补偿过大（推力乘子高达 1/0.5=2.0），从而让倾角超限(>45度)。
+                    // thrust_efficiency_ = 0.9 * thrust_efficiency_ + 0.1 * efficiency_sample;
                 }
             }
             last_thrust_cmd_ = u_optimal_raw(3);
@@ -1108,33 +1122,59 @@ VectorU InterceptorNodeQuaternion::calculate_pn_controls_image_based(const Vecto
     // LOS角速度向量: Omega = (r × v_rel) / |r|²
     // PN加速度: a_pn = N * Vc * (Omega × los_unit)
     // ============================================================================
-    double N = pn_nav_constant_;
+    double base_N = pn_nav_constant_;
     
-    // 计算LOS角速度向量 (世界系)
-    // 弃用极度嘈杂的3D坐标交叉相乘法 (rel_pos.cross(rel_vel))，
-    // 改用EKF直接输出的、经IMU补偿后的高精度图像平面角速率。
-    Eigen::Quaterniond q_C_W;
+    // 动态调整N值：接近速度极快时缩小N，避免指令过度放大导致的振荡
+    double adaptive_N = base_N;
+    if (closing_speed > 10.0) {
+        adaptive_N = base_N * (10.0 / closing_speed);
+    }
+    adaptive_N = std::max(2.5, adaptive_N); // 保证最小制导增益
+    
+    // ============================================================================
+    // 计算LOS角速度向量 (世界系 ENU)
+    // ============================================================================
+    Eigen::Vector3d omega_los; 
+    
     if (gimbal_received_) {
+        // current_gimbal_orientation_ (来自于AirSim发布的gimbal)
+        // 在 tracker 节点中已经被转换为标准的 ROS ENU 坐标系表示：
+        // 它的物理意义是：从相机机体坐标系(FLU: 前左上) 到 AirSim世界系(ENU: 东北天) 的旋转。
         std::shared_lock<std::shared_mutex> gimbal_lock(mtx_gimbal_);
-        q_C_W = current_gimbal_orientation_;
+        Eigen::Quaterniond q_FLU_ENU = current_gimbal_orientation_;
+        
+        // 构造Camera Body (FLU)坐标系下的LOS角速率向量
+        // elevation_rate > 0 (目标在画面中向下移) -> 视线绕FLU左轴(Y)做正旋转
+        // azimuth_rate > 0 (目标在画面中向右移) -> 视线绕FLU上轴(Z)做负旋转
+        Eigen::Vector3d omega_los_FLU(0.0, elevation_rate, -azimuth_rate);
+        
+        // 转换到 ROS 世界系 (ENU)
+        omega_los = q_FLU_ENU.toRotationMatrix() * omega_los_FLU;
     } else {
-        // Horizontal Gimbal: Only Yaw follows drone
+        // 无云台时的Fallback: 使用无人机的FLU坐标系和偏航角。
+        // drone_state 的四元数是从 FLU 到 ENU 的旋转。
         double psi = get_yaw_from_quaternion(drone_state.segment<4>(6));
-        Eigen::AngleAxisd yaw_rot(psi, Eigen::Vector3d::UnitZ());
-        q_C_W = Eigen::Quaterniond(yaw_rot);
+        Eigen::Matrix3d R_yaw_ENU = Eigen::AngleAxisd(psi, Eigen::Vector3d::UnitZ()).toRotationMatrix();
+        
+        // 构造FLU机体系(前左上)的LOS角速率向量
+        // elevation_rate > 0 (目标向下移) -> 绕左轴(Y)做正旋转
+        // azimuth_rate > 0 (目标向右移) -> 绕上轴(Z)做负旋转
+        Eigen::Vector3d omega_los_FLU(0.0, elevation_rate, -azimuth_rate);
+        
+        // 转换到 ROS 世界系 (ENU)
+        omega_los = R_yaw_ENU * omega_los_FLU;
     }
     
-    // 构造机体系(FLU)下的LOS角速率向量
-    // elevation_rate > 0 (目标画面向下移) -> 视线绕机体Y轴(向左)做正旋转(机头下沉)
-    // azimuth_rate > 0 (目标画面向右移) -> 视线绕机体Z轴(向上)做负旋转(机头向右)
-    Eigen::Vector3d omega_los_FLU(0.0, elevation_rate, -azimuth_rate);
-    
-    // 转换到世界系
-    Eigen::Vector3d omega_los = q_C_W.toRotationMatrix() * omega_los_FLU;
+    // 限制omega_los的大小，避免噪声放大
+    const double max_omega_for_pn = 30.0 * M_PI / 180.0;
+    if (omega_los.norm() > max_omega_for_pn) {
+        omega_los = omega_los.normalized() * max_omega_for_pn;
+    }
     
     // PN加速度 = N * Vc * (omega_los × los_unit)
     // 这个加速度垂直于LOS方向，指向需要转向的方向
-    Eigen::Vector3d a_pn = N * closing_speed * omega_los.cross(los_unit);
+    double capped_closing_speed = std::min(closing_speed, 15.0); // 限制最大速度乘子
+    Eigen::Vector3d a_pn = adaptive_N * capped_closing_speed * omega_los.cross(los_unit);
     
     // ============================================================================
     // 添加前向加速度分量 (沿LOS方向)
@@ -1181,8 +1221,9 @@ VectorU InterceptorNodeQuaternion::calculate_pn_controls_image_based(const Vecto
     // 总加速度 = PN加速度 + 重力补偿
     Eigen::Vector3d a_total = a_world + Eigen::Vector3d(0.0, 0.0, G_);
     
-    // 推力大小
-    double thrust = a_total.norm() * thrust_efficiency_;
+    // 推力大小 (为了达到a_total的实际物理加速度，指令需除以推力效率; 比如效率0.84，需要指令更大)
+    double eff = std::clamp(thrust_efficiency_, 0.5, 1.0);
+    double thrust = a_total.norm() / eff;
     thrust = std::clamp(thrust, ControlLimits::THRUST_MIN, ControlLimits::THRUST_MAX);
     
     // 期望的机体Z轴方向 = 推力方向
@@ -1204,8 +1245,9 @@ VectorU InterceptorNodeQuaternion::calculate_pn_controls_image_based(const Vecto
     double sin_angle = rotation_axis.norm();
     double cos_angle = z_body_current.dot(z_body_desired);
 
-    const double attitude_gain = N * 1.5;
-    const double yaw_gain = N * 0.75;
+    // 对于attitude角速度，同样使用自适应N来避免响应过激
+    const double attitude_gain = adaptive_N * 1.5;
+    const double yaw_gain = adaptive_N * 0.75;
     
     Eigen::Vector3d omega_world = Eigen::Vector3d::Zero();
     if (sin_angle > 1e-6) {

@@ -358,68 +358,80 @@ public:
         x_pred(6) = x_prev(6) + x_prev(10) * dt;  // vw
         x_pred(7) = x_prev(7) + x_prev(11) * dt;  // vh
 
-        // 加速度: a = a0
-        x_pred.segment<4>(8) = x_prev.segment<4>(8);
+        // 加速度: a = a0 * decay (衰减因子防止加速度状态无限增长)
+        // 使用指数衰减，时间常数约300ms，防止CA模型在IMU补偿偏差下积分发散
+        const double accel_decay = std::exp(-dt / 0.3);
+        x_pred.segment<4>(8) = x_prev.segment<4>(8) * accel_decay;
 
         // --- IMU运动补偿 ---
-        // 光流公式期望相机坐标系为FRD (X前/光轴, Y右, Z下)
-        // 如果输入是FLU (X前, Y左, Z上)，需要转换: omega_y_FRD = -omega_y_FLU, omega_z_FRD = -omega_z_FLU
-        double omega_x = imu_omega(0);
-        double omega_y = is_flu ? -imu_omega(1) : imu_omega(1);
-        double omega_z = is_flu ? -imu_omega(2) : imu_omega(2);
-        double cx = x_prev(0);
-        double cy = x_prev(1);
-        double px = intrinsics_.px;
-        double py = intrinsics_.py;
-        double fx = intrinsics_.fx;
-        double fy = intrinsics_.fy;
+    // 输入 imu_omega 是期望在FRD坐标系 (X前/光轴, Y右, Z下)
+    // 如果输入是FLU (X前, Y左, Z上)，需要转换: omega_y_FRD = -omega_y_FLU, omega_z_FRD = -omega_z_FLU
+    double omega_x = imu_omega(0); // FRD Roll (绕光轴)
+    double omega_y = is_flu ? -imu_omega(1) : imu_omega(1); // FRD Pitch (绕右轴)
+    double omega_z = is_flu ? -imu_omega(2) : imu_omega(2); // FRD Yaw (绕下轴)
+    
+    // 光流公式期望标准相机坐标系 (X右, Y下, Z前)
+    // 旋转角速度对应关系:
+    // w_x (绕相机的X轴旋转, 即Pitch) = omega_y (FRD绕Y轴)
+    // w_y (绕相机的Y轴旋转, 即Yaw) = omega_z (FRD绕Z轴)
+    // w_z (绕相机的Z轴旋转, 即Roll) = omega_x (FRD绕X轴)
+    double w_x = omega_y;
+    double w_y = omega_z;
+    double w_z = omega_x;
 
-        double v_imu_cx = (1.0/fy)*(cx-px)*(cy-py)*omega_x 
-                        - (fx + (1.0/fx)*(cx-px)*(cx-px))*omega_y 
-                        + (fx/fy)*(cy-py)*omega_z;
-        double v_imu_cy = (fy + (1.0/fy)*(cy-py)*(cy-py))*omega_x 
-                        - (1.0/fx)*(cx-px)*(cy-py)*omega_y 
-                        - (fy/fx)*(cx-px)*omega_z;
+    double cx = x_prev(0);
+    double cy = x_prev(1);
+    double px = intrinsics_.px;
+    double py = intrinsics_.py;
+    double fx = intrinsics_.fx;
+    double fy = intrinsics_.fy;
 
-        // Filter IMU flow to reduce noise injection
-        v_imu_cx = imu_flow_filter_.filter(v_imu_cx, 0);
-        v_imu_cy = imu_flow_filter_.filter(v_imu_cy, 1);
+    double v_imu_cx = (1.0/fy)*(cx-px)*(cy-py)*w_x 
+                    - (fx + (1.0/fx)*(cx-px)*(cx-px))*w_y 
+                    + (fx/fy)*(cy-py)*w_z;
+    double v_imu_cy = (fy + (1.0/fy)*(cy-py)*(cy-py))*w_x 
+                    - (1.0/fx)*(cx-px)*(cy-py)*w_y 
+                    - (fy/fx)*(cx-px)*w_z;
 
-        v_imu_cache_ << v_imu_cx, v_imu_cy;
-        
-        x_pred(0) += v_imu_cx * dt;
-        x_pred(1) += v_imu_cy * dt;
+    // Filter IMU flow to reduce noise injection
+    v_imu_cx = imu_flow_filter_.filter(v_imu_cx, 0);
+    v_imu_cy = imu_flow_filter_.filter(v_imu_cy, 1);
 
-        // --- 3D空间 CV 模型预测 (6维) ---
-        // 位置: p = p0 + v*dt
-        x_pred(12) = x_prev(12) + x_prev(15) * dt;  // px
-        x_pred(13) = x_prev(13) + x_prev(16) * dt;  // py
-        x_pred(14) = x_prev(14) + x_prev(17) * dt;  // pz
+    v_imu_cache_ << v_imu_cx, v_imu_cy;
+    
+    x_pred(0) += v_imu_cx * dt;
+    x_pred(1) += v_imu_cy * dt;
 
-        // 速度: v = v0
-        x_pred.segment<3>(15) = x_prev.segment<3>(15);
-        
-        // Width W: Random walk
-        x_pred(18) = x_prev(18);
+    // --- 3D空间 CV 模型预测 (6维) ---
+    // 位置: p = p0 + v*dt
+    x_pred(12) = x_prev(12) + x_prev(15) * dt;  // px
+    x_pred(13) = x_prev(13) + x_prev(16) * dt;  // py
+    x_pred(14) = x_prev(14) + x_prev(17) * dt;  // pz
 
-        // --- 计算雅可比矩阵 F (19x19) ---
-        Matrix19d F = Matrix19d::Identity();
-        
-        // 图像空间 CA 模型
-        F(0, 4) = dt;  F(0, 8) = dt2;
-        F(1, 5) = dt;  F(1, 9) = dt2;
-        F(2, 6) = dt;  F(2, 10) = dt2;
-        F(3, 7) = dt;  F(3, 11) = dt2;
-        F(4, 8) = dt;
-        F(5, 9) = dt;
-        F(6, 10) = dt;
-        F(7, 11) = dt;
+    // 速度: v = v0
+    x_pred.segment<3>(15) = x_prev.segment<3>(15);
+    
+    // Width W: Random walk
+    x_pred(18) = x_prev(18);
 
-        // IMU补偿的雅可比
-        double d_vcx_dcx = (1.0/fy)*(cy-py)*omega_x - (2.0/fx)*(cx-px)*omega_y;
-        double d_vcx_dcy = (1.0/fy)*(cx-px)*omega_x + (fx/fy)*omega_z;
-        double d_vcy_dcx = -(1.0/fx)*(cy-py)*omega_y - (fy/fx)*omega_z;
-        double d_vcy_dcy = (2.0/fy)*(cy-py)*omega_x - (1.0/fx)*(cx-px)*omega_y;
+    // --- 计算雅可比矩阵 F (19x19) ---
+    Matrix19d F = Matrix19d::Identity();
+    
+    // 图像空间 CA 模型
+    F(0, 4) = dt;  F(0, 8) = dt2;
+    F(1, 5) = dt;  F(1, 9) = dt2;
+    F(2, 6) = dt;  F(2, 10) = dt2;
+    F(3, 7) = dt;  F(3, 11) = dt2;
+    F(4, 8) = dt;
+    F(5, 9) = dt;
+    F(6, 10) = dt;
+    F(7, 11) = dt;
+
+    // IMU补偿的雅可比
+    double d_vcx_dcx = (1.0/fy)*(cy-py)*w_x - (2.0/fx)*(cx-px)*w_y;
+    double d_vcx_dcy = (1.0/fy)*(cx-px)*w_x + (fx/fy)*w_z;
+    double d_vcy_dcx = -(1.0/fx)*(cy-py)*w_y - (fy/fx)*w_z;
+    double d_vcy_dcy = (2.0/fy)*(cy-py)*w_x - (1.0/fx)*(cx-px)*w_y;
 
         F(0, 0) += d_vcx_dcx * dt;
         F(0, 1) += d_vcx_dcy * dt;
@@ -433,6 +445,11 @@ public:
 
         // --- 更新状态和协方差 ---
     x_ = x_pred;
+    
+    // Safety Clamping for Image Coordinates to prevent Jacobian explosion 
+    // when target is tracked far off-screen during extreme maneuvers (>80 deg out)
+    x_(0) = std::clamp(x_(0), -3000.0, 4000.0);
+    x_(1) = std::clamp(x_(1), -3000.0, 4000.0);
     
     // 采用稳定缩放的 Q 矩阵，避免因为 ROS jitter 导致 dt 极小时 qa 趋于无限大从而引发 NaN 爆炸
     double dt_ratio = dt / 0.01;
@@ -553,6 +570,11 @@ public:
      */
     double getEstimatedWidth() const {
         return x_(18);
+    }
+
+    /** @brief 获取IMU光流补偿缓存 */
+    Eigen::Vector2d getImuFlowCache() const {
+        return v_imu_cache_;
     }
 
     /**
