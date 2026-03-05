@@ -756,46 +756,48 @@ void InterceptorNodeQuaternion::run_control_cycle(const Eigen::Vector3d &pos_est
                 full_state(8), full_state(9),
                 los_state(2) * 180.0 / M_PI, los_state(3) * 180.0 / M_PI);
                 
-            // 方案3: 增加垂直速度和LOS角速度约束，避免进入PN时无法收敛
+            // ============================================================
+            // 模糊评分PN切换判定
+            // 每个条件贡献0~1分, 距离紧迫度提升容忍度
+            // ============================================================
+            double angle_off_boresight_deg = angle_off_boresight * 180.0 / M_PI;
             double vertical_speed = std::abs(rel_vel.z());
-            // 放宽垂直速度阈值，当接近速度极小时也有基础容忍度，允许顺利进入PN
-            const double max_vertical_speed_for_pn = std::max(2.0, closing_speed_est * 0.5);  
-            bool vertical_speed_ok = (vertical_speed < max_vertical_speed_for_pn);
-            
-            // 额外约束：LOS角速度不能太大
+            double max_vertical_speed_for_pn = std::max(2.0, closing_speed_est * 0.5);
             double los_rate_check = std::sqrt(los_state(2)*los_state(2) + 
                                               los_state(3)*los_state(3));
-            // 放宽LOS角速度，允许最大5倍初始视场角的角速度
-            const double max_los_rate_for_pn = 5.0 * pn_fov_switch_deg_ * M_PI / 180.0;
-            bool los_rate_ok = (los_rate_check < max_los_rate_for_pn);
+            double los_rate_check_deg = los_rate_check * 180.0 / M_PI;
+            double max_los_rate_deg = 5.0 * pn_fov_switch_deg_;
             
-            if (!vertical_speed_ok) {
-                RCLCPP_INFO_THROTTLE(this->get_logger(), *this->get_clock(), 500,
-                    "PN switch delayed: vertical speed %.2f m/s > %.1f m/s threshold",
-                    vertical_speed, max_vertical_speed_for_pn);
-            }
+            // 各因子评分 (0=差, 1=好), 使用平滑sigmoid
+            // FOV评分: off-boresight在fov_switch以内得满分, 超出后平滑衰减
+            double fov_score = 1.0 / (1.0 + std::exp(4.0 * (angle_off_boresight_deg / pn_fov_switch_deg_ - 1.0)));
+            // 垂直速度评分
+            double vz_score = 1.0 / (1.0 + std::exp(4.0 * (vertical_speed / max_vertical_speed_for_pn - 1.0)));
+            // LOS角速度评分
+            double los_rate_score = 1.0 / (1.0 + std::exp(4.0 * (los_rate_check_deg / max_los_rate_deg - 1.0)));
             
-            if (!los_rate_ok) {
-                RCLCPP_INFO_THROTTLE(this->get_logger(), *this->get_clock(), 500,
-                    "PN switch delayed: LOS rate %.2f°/s > %.1f°/s threshold",
-                    los_rate_check * 180.0 / M_PI, max_los_rate_for_pn * 180.0 / M_PI);
-            }
+            // 距离紧迫度: 越近越宽容 (在switch_dist处为1.0, 在half处为1.5)
+            double dist_ratio = dist_to_target / pn_switch_dist_;
+            double urgency = 1.0 + 0.5 * std::max(0.0, 1.0 - dist_ratio);
             
-            if (dist_to_target < pn_switch_dist_ && target_in_fov_center && vertical_speed_ok && los_rate_ok) {
-
-                // 首次切换到PN，记录当前body系x轴速度作为期望接近速度
-                // Eigen::Vector3d vel_world = curr_drone_state.segment<3>(3);
-                // Eigen::Quaterniond q(curr_drone_state(6), curr_drone_state(7), curr_drone_state(8), curr_drone_state(9));  // w,x,y,z
-                // Eigen::Matrix3d R_body = q.toRotationMatrix();
-                // Eigen::Vector3d vel_body = R_body.transpose() * vel_world;
-                // pn_vc_initial_ = vel_body(0);
-                // RCLCPP_INFO(this->get_logger(), "PN Initial Vc_body: %.2f m/s", pn_vc_initial_);
-                
+            // 加权评分 (FOV权重最高)
+            double pn_score = (0.5 * fov_score + 0.25 * vz_score + 0.25 * los_rate_score) * urgency;
+            const double pn_switch_threshold = 0.6;
+            
+            // 硬性兜底: 距离 < 一半切换距离时, 只要目标可见就强制切换
+            bool force_switch = (dist_to_target < pn_switch_dist_ * 0.5) && is_visible_;
+            
+            RCLCPP_INFO_THROTTLE(this->get_logger(), *this->get_clock(), 200,
+                "PN score: %.2f (fov=%.2f vz=%.2f los=%.2f urgency=%.2f) thresh=%.2f %s",
+                pn_score, fov_score, vz_score, los_rate_score, urgency, 
+                pn_switch_threshold, force_switch ? "[FORCE]" : "");
+            
+            if ((dist_to_target < pn_switch_dist_ && pn_score >= pn_switch_threshold) || force_switch) {
                 pn_vc_initial_ = closing_speed_est;
                 pn_active_ = 1; // Latch PN active
                 RCLCPP_INFO(this->get_logger(), 
-                    "Switching to IMAGE-BASED PN (Latch Active), Thrust Efficiency: %.3f", 
-                    thrust_efficiency_);
+                    "Switching to IMAGE-BASED PN (Latch Active, score=%.2f%s), Thrust Efficiency: %.3f", 
+                    pn_score, force_switch ? " FORCED" : "", thrust_efficiency_);
             }
         }
     }
@@ -1109,7 +1111,7 @@ VectorU InterceptorNodeQuaternion::calculate_pn_controls_image_based(const Vecto
     const double terminal_tti_threshold = 0.1;
     if ((dist_to_target < terminal_dist_threshold || tti < terminal_tti_threshold) && pn_active_ == 1) {
         pn_active_ = 2;
-        pn_last_u_pn_.head<3>().setZero(); // Zero out angular rates to coast linearly
+        pn_last_u_pn_.head<3>() *= 0.5; // Retain partial correction instead of coasting blind
         RCLCPP_INFO(this->get_logger(), 
             "PN: Entering terminal phase (dist=%.2fm, TTI=%.2fs), coasting with zero angular rates", 
             dist_to_target, tti);
@@ -1129,7 +1131,14 @@ VectorU InterceptorNodeQuaternion::calculate_pn_controls_image_based(const Vecto
     if (closing_speed > 10.0) {
         adaptive_N = base_N * (10.0 / closing_speed);
     }
-    adaptive_N = std::max(2.5, adaptive_N); // 保证最小制导增益
+    
+    // 末段渐弱: TTI < 0.3s 时线性降低N, 防止近距离剧烈振荡
+    // 0.3s 对应约3m距离(Vc=10m/s), 此时目标已非常近, 检测噪声大
+    // if (tti < 0.3) {
+    //     adaptive_N *= std::max(0.2, tti / 0.3);  // 最低降到20%
+    // }
+    
+    adaptive_N = std::max(2.0, adaptive_N); // 保证最小制导增益
     
     // ============================================================================
     // 计算LOS角速度向量 (世界系 ENU)

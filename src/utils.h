@@ -240,7 +240,7 @@ public:
           dt_(1.0 / estimated_imu_freq),
           target_size_est_(target_size_est),
           perspective_compensation_(perspective_compensation),
-          ema_filter_(estimated_imu_freq / 10),
+          ema_filter_(estimated_imu_freq / 20),
           imu_flow_filter_(estimated_imu_freq / 20),
           is_initialized_(false),
           last_timestamp_(-1.0)
@@ -775,7 +775,7 @@ private:
         
         // 奇异性保护
         double r = los_W.norm();
-        if (r < 5.0) {
+        if (r < 2.0) {
             double scale = 5.0 / (r + 1e-5);
             x_.segment<3>(12) = drone_pos + los_W * scale;
             los_W = x_.segment<3>(12) - drone_pos;

@@ -21,9 +21,9 @@ interceptor_node_quaternion:
     # Proportional Navigation (PN) Terminal Guidance
     pn:
       enabled: true
-      nav_constant: 5.0    # Navigation constant (N)
+      nav_constant: 3.5    # Navigation constant (N)
       switch_dist: 10.0       # Distance to switch to PN (meters)
-      fov_switch_deg: 2.0    # Switch only if target within this FOV (degrees)
+      fov_switch_deg: 3.0    # Switch only if target within this FOV (degrees)
       max_accel_xy: 25.0     # Max horizontal acceleration (m/s^2)
       max_accel_z: 15.0      # Max vertical acceleration (m/s^2)
     
@@ -69,9 +69,9 @@ interceptor_node_quaternion:
     
     # Cost function weights
     cost:
-      w_los: 100.0              # Line-of-sight error weight
-      w_align: 5.0             # Velocity alignment weight
-      w_closing_speed: 0.01     # Closing speed error weight
+      w_los: 200.0              # Line-of-sight error weight
+      w_align: 10.0             # Velocity alignment weight
+      w_closing_speed: 0.1     # Closing speed error weight
       w_rates: 0.001           # Body rate control effort weight
       w_tilt: 0.000001         # Tilt angle error weight
       w_u_alpha: 0.1           # Body rate change weight
