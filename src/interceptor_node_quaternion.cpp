@@ -778,7 +778,7 @@ void InterceptorNodeQuaternion::run_control_cycle(const Eigen::Vector3d &pos_est
             
             // 距离紧迫度: 越近越宽容 (在switch_dist处为1.0, 在half处为1.5)
             double dist_ratio = dist_to_target / pn_switch_dist_;
-            double urgency = 1.0 + 0.5 * std::max(0.0, 1.0 - dist_ratio);
+            double urgency = 1.0 + 0.5 * (1.0 - dist_ratio);
             
             // 加权评分 (FOV权重最高)
             double pn_score = (0.5 * fov_score + 0.25 * vz_score + 0.25 * los_rate_score) * urgency;
@@ -787,12 +787,12 @@ void InterceptorNodeQuaternion::run_control_cycle(const Eigen::Vector3d &pos_est
             // 硬性兜底: 距离 < 一半切换距离时, 只要目标可见就强制切换
             bool force_switch = (dist_to_target < pn_switch_dist_ * 0.5) && is_visible_;
             
-            RCLCPP_INFO_THROTTLE(this->get_logger(), *this->get_clock(), 200,
+            RCLCPP_INFO_THROTTLE(this->get_logger(), *this->get_clock(), 100,
                 "PN score: %.2f (fov=%.2f vz=%.2f los=%.2f urgency=%.2f) thresh=%.2f %s",
                 pn_score, fov_score, vz_score, los_rate_score, urgency, 
                 pn_switch_threshold, force_switch ? "[FORCE]" : "");
             
-            if ((dist_to_target < pn_switch_dist_ && pn_score >= pn_switch_threshold) || force_switch) {
+            if ((dist_to_target < pn_switch_dist_ * 2.0 && pn_score >= pn_switch_threshold) || force_switch) {
                 pn_vc_initial_ = closing_speed_est;
                 pn_active_ = 1; // Latch PN active
                 RCLCPP_INFO(this->get_logger(), 
