@@ -214,13 +214,13 @@ void InterceptorNodeQuaternion::setup_ekf()
                     bbox_size_std_dev_ * 0.1,  // std_size
                     bbox_size_std_dev_ * 0.5,  // std_size_vel
                     bbox_size_std_dev_ * 0.25, // std_accel_size
-                    0.005,                     // std_q_W (目标物理宽度随机游走)
-                    target_physical_size_est_ * 0.5, // std_pos_3d (米)
-                    target_physical_size_est_;       // std_vel_3d (米/秒)
+                    0.002,                           // std_q_W → q_W=4e-6 (对齐vs1_3d.py级别, 収敛后W更稳定)
+                    1.0,                             // sqrt(q_accel_3d) → 运动学CV加速度谱密度=1.0
+                    0.0;                             // std_vel_3d (运动学模型中不再使用)
     
     // 3维测量噪声: [std_meas_pos, std_meas_size, std_meas_angle]
     Eigen::Vector3d measurement_noise;
-    measurement_noise << bbox_pos_std_dev_, bbox_size_std_dev_, bbox_size_std_dev_ * 0.5;
+    measurement_noise << bbox_pos_std_dev_, bbox_size_std_dev_, bbox_size_std_dev_ * 0.1;
     
     const int predicted_imu_freq = 100;
     ekf_ = std::make_unique<DroneEKF>(cam_intrinsics_, process_noise, measurement_noise,
@@ -497,18 +497,23 @@ void InterceptorNodeQuaternion::bbox_callback(const vision_msgs::msg::Detection2
                 const double target_physical_size_est = coeff * target_physical_size_est_;
                 
                 Eigen::Matrix<double, 9, 1> process_noise;
+                // 接近阶段增大q_accel_3d: CV模型在机动时跟踪滞后,
+                // 增大3D过程噪声使EKF将alpha残差归因于位置而非W
+                const double q_accel_approach = std::max(1.0, coeff * coeff);
+                
                 process_noise << bbox_pos_std_dev * 0.1,   // std_pos_img
                                 bbox_pos_std_dev * 0.5,   // std_vel_img
                                 bbox_pos_std_dev * 0.25,  // std_accel_img
                                 bbox_size_std_dev  * 0.1,  // std_size
                                 bbox_size_std_dev * 0.5,  // std_size_vel
                                 bbox_size_std_dev * 0.25, // std_accel_size
-                                0.005 * coeff,            // std_q_W (W的过程噪声)
-                                target_physical_size_est * 0.5, // std_pos_3d (米)
-                                target_physical_size_est;       // std_vel_3d (米/秒)
+                                0.002,                    // std_q_W → q_W=4e-6 (对齐vs1_3d.py级别)
+                                std::sqrt(q_accel_approach), // sqrt(q_accel_3d): 接近时增大以匹配机动动态
+                                0.0;                      // std_vel_3d (运动学模型中不再使用)
                 
                 Eigen::Vector3d measurement_noise;
-                measurement_noise << bbox_pos_std_dev, bbox_size_std_dev, bbox_size_std_dev * 0.5;
+                // 注意: alpha噪声使用原始(未膨胀)值, 近距离alpha信号SNR更高不应降权
+                measurement_noise << bbox_pos_std_dev, bbox_size_std_dev, bbox_size_std_dev_ * 0.1;
                 
                 ekf_->set_covariance(process_noise, measurement_noise);
             }
@@ -745,8 +750,9 @@ void InterceptorNodeQuaternion::run_control_cycle(const Eigen::Vector3d &pos_est
             RCLCPP_INFO(this->get_logger(), "LOS angles (az,el): [%.2f, %.2f] deg, Off-boresight: %.2f deg, In FOV: %d", 
                 azimuth * 180.0 / M_PI, elevation * 180.0 / M_PI,
                 angle_off_boresight * 180.0 / M_PI, target_in_fov_center ? 1 : 0);
-            RCLCPP_INFO(this->get_logger(), "Distance to target: %.2f m, Closing speed: %.2f m/s, Estimated width: %.2f m", 
-                dist_to_target, closing_speed_est, ekf_->getEstimatedWidth());
+            RCLCPP_INFO(this->get_logger(), "Distance to target: %.2f m, Closing speed: %.2f m/s, Estimated width: %.2f m [W %s]", 
+                dist_to_target, closing_speed_est, ekf_->getEstimatedWidth(),
+                ekf_->isWidthObservable() ? "OBS" : "FROZEN");
             // Diagnostic: print EKF internal decomposition
             auto full_state = ekf_->getFullState();
             auto v_imu = ekf_->getImuFlowCache();

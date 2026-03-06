@@ -278,22 +278,26 @@ public:
         double std_size_vel = process_noise_std(4);
         double std_accel_size = process_noise_std(5);
         double std_q_W = process_noise_std(6);
-        double std_pos_3d = process_noise_std(7);
-        double std_vel_3d = process_noise_std(8);
+        double std_pos_3d = process_noise_std(7);  // 现在解释为 sqrt(q_accel_3d)
+        // double std_vel_3d = process_noise_std(8);  // 运动学模型中不再使用
+
+        // 存储运动学过程噪声参数 (在predict中动态构建含交叉协方差的Q矩阵)
+        q_accel_3d_ = std_pos_3d * std_pos_3d;  // 加速度谱密度 (m²/s⁴)
+        q_W_ = std_q_W * std_q_W;               // W随机游走方差率
 
         // 构建过程噪声协方差矩阵 Q (19x19)
+        // 仅填充图像空间部分; 3D部分在predict()中用运动学模型动态计算
         Vector19d q_diag;
-        // 图像空间 (12维)
         q_diag << std_pos_img*std_pos_img, std_pos_img*std_pos_img,           // cx, cy
                   std_size*std_size, std_size*std_size,                        // w, h
                   std_vel_img*std_vel_img, std_vel_img*std_vel_img,            // vx_img, vy_img
                   std_size_vel*std_size_vel, std_size_vel*std_size_vel,        // vw, vh
                   std_accel_img*std_accel_img, std_accel_img*std_accel_img,    // ax_img, ay_img
                   std_accel_size*std_accel_size, std_accel_size*std_accel_size,// aw, ah
-        // 3D空间 (7维)
-                  std_pos_3d*std_pos_3d, std_pos_3d*std_pos_3d, std_pos_3d*std_pos_3d,  // px, py, pz
-                  std_vel_3d*std_vel_3d, std_vel_3d*std_vel_3d, std_vel_3d*std_vel_3d,  // vx, vy, vz
-                  std_q_W*std_q_W;                                                     // W
+        // 3D空间: 置零, 在predict()中用运动学CV模型动态填充 (含位置-速度交叉协方差)
+                  0.0, 0.0, 0.0,   // px, py, pz
+                  0.0, 0.0, 0.0,   // vx, vy, vz
+                  0.0;             // W
         Q_ = q_diag.asDiagonal();
 
         // 测量噪声协方差 R (7x7): [cx, cy, w, h, az, el, alpha]
@@ -307,7 +311,7 @@ public:
         double sigma_alpha = std_meas_angle / f_avg;
         r_diag << std_meas_pos*std_meas_pos, std_meas_pos*std_meas_pos,
                   std_meas_size*std_meas_size, std_meas_size*std_meas_size,
-                  sigma_az*sigma_az, sigma_el*sigma_el, sigma_alpha*sigma_alpha * 2.0; // alpha_R_inflate = 2.0
+                  sigma_az*sigma_az, sigma_el*sigma_el, sigma_alpha*sigma_alpha * 2.0; // alpha_R_inflate = 2.0 (对齐Python target_ekf)
         R_ = r_diag.asDiagonal();
     }
 
@@ -459,12 +463,29 @@ public:
     x_(0) = std::clamp(x_(0), -3000.0, 4000.0);
     x_(1) = std::clamp(x_(1), -3000.0, 4000.0);
     
-    // 采用稳定缩放的 Q 矩阵，避免因为 ROS jitter 导致 dt 极小时 qa 趋于无限大从而引发 NaN 爆炸
+    // 构建含运动学交叉协方差的过程噪声矩阵
+    // 图像空间: 按dt_ratio线性缩放 (保持原有行为)
     double dt_ratio = dt / 0.01;
     if (dt_ratio < 0.01) dt_ratio = 0.01;
     if (dt_ratio > 10.0) dt_ratio = 10.0;
 
-    P_ = F * P_ * F.transpose() + Q_ * dt_ratio;
+    Matrix19d Q_full = Q_ * dt_ratio;  // 图像空间部分 (Q_的3D块已置零)
+
+    // 3D运动学CV过程噪声 (白噪声加速度积分, 含位置-速度交叉协方差)
+    // Q_3D = q_a * [dt³/3  dt²/2]  ⊗ I₃
+    //              [dt²/2  dt   ]
+    const double q_dt3_3 = q_accel_3d_ * dt * dt * dt / 3.0;
+    const double q_dt2_2 = q_accel_3d_ * dt * dt / 2.0;
+    const double q_dt1   = q_accel_3d_ * dt;
+    for (int i = 0; i < 3; ++i) {
+        Q_full(12 + i, 12 + i) = q_dt3_3;   // 位置方差
+        Q_full(12 + i, 15 + i) = q_dt2_2;   // 位置-速度交叉协方差
+        Q_full(15 + i, 12 + i) = q_dt2_2;   // 速度-位置交叉协方差
+        Q_full(15 + i, 15 + i) = q_dt1;     // 速度方差
+    }
+    Q_full(18, 18) = q_W_ * dt_ratio;        // W随机游走 (保持dt_ratio缩放)
+
+    P_ = F * P_ * F.transpose() + Q_full;
         
         // 强制对称性
         P_ = 0.5 * (P_ + P_.transpose());
@@ -644,6 +665,9 @@ public:
     /** @brief 兼容性接口：检查滤波器是否已初始化 */
     bool is_initialized() const { return is_initialized_; }
     
+    /** @brief W 是否在最近一次更新中可观测 */
+    bool isWidthObservable() const { return w_observable_; }
+    
     /** @brief 检查EKF状态是否健康 (无NaN) */
     bool is_healthy() const {
         if (x_.hasNaN() || P_.hasNaN()) return false;
@@ -665,6 +689,7 @@ public:
         imu_flow_filter_.reset();
         los_angle_initialized_ = false;
         last_gimbal_omega_frd_.setZero();
+        alpha_innov_ema_ = 0.0;
     }
 
     /** @brief 检查协方差矩阵健康状态 */
@@ -703,7 +728,11 @@ private:
         // 相机坐标系: X前, Y右, Z下
         // 图像坐标系: u = bbox.cx - px (正=右), v = bbox.cy - py (正=下)
         double bbox_size = std::max(bbox_w, bbox_h);
-        double est_dist_cam_x = intrinsics_.fx * target_size_est_ / bbox_size;
+        // range_init_bias=0.5: 故意将初始距离偏近, 打破 W/d 不可观测歧义
+        // 使得 alpha_pred > alpha_meas, 驱动 EKF 向下修正 W
+        // (参考 Python target_ekf.py 的 range_init_bias 机制)
+        constexpr double range_init_bias = 0.5;
+        double est_dist_cam_x = range_init_bias * intrinsics_.fx * target_size_est_ / bbox_size;
         
         // 限制估计距离在合理范围
         est_dist_cam_x = std::clamp(est_dist_cam_x, 1.0, 1000.0);
@@ -736,7 +765,17 @@ private:
         
         // 重置协方差
         P_ = Q_ * 10.0;
-        P_(18, 18) = 4.0;
+        
+        // 为3D距离/速度/宽度赋予巨大的初始不确定度
+        P_(12, 12) = 400.0; // px
+        P_(13, 13) = 400.0; // py
+        P_(14, 14) = 400.0; // pz
+        
+        P_(15, 15) = 25.0;  // vx
+        P_(16, 16) = 25.0;  // vy
+        P_(17, 17) = 25.0;  // vz
+        
+        P_(18, 18) = 5.0;   // W
         
         is_initialized_ = true;
         last_timestamp_ = -1.0;
@@ -853,11 +892,59 @@ private:
             return; // S矩阵不正定
         }
 
+        // χ² 创新门检测: 拒绝线性化误差过大的异常更新
+        // 7自由度χ²分布, 阈值24.3对应99.9%置信水平
+        Vector7d S_inv_y = llt_S.solve(y);
+        double chi2 = y.dot(S_inv_y);
+        if (chi2 > 24.3) {
+            return;
+        }
+
         Eigen::Matrix<double, 19, 7> K = PH_T * llt_S.solve(Matrix7d::Identity());
         
         // 检查K是否有效
         if (K.hasNaN()) {
             return;
+        }
+
+        // ============================================================
+        // W 可观测度评估 — 组合评分机制
+        //
+        // Test 1: α 方差分解 (随机不确定度检测)
+        //   W 方差贡献占比 ρ = σ²_W / (σ²_pos + σ²_R)
+        //   ρ < 0.5 → 位置 + 噪声主导, W 不可观
+        //
+        // Test 2: α 创新系统性偏差检测 (CV模型滞后检测)
+        //   跟踪 α 创新的指数加权均值
+        //   如果 |EMA(α_innov)| > 2·√(S_αα), 说明模型有系统性偏差
+        //   (CV模型滞后导致的位置偏差), 此时冻结 W
+        //
+        // 两个条件必须同时通过才更新 W
+        // ============================================================
+        const double H_alpha_W = H(6, 18);
+        const Eigen::RowVector3d H_alpha_p = H.block<1, 3>(6, 12);
+        
+        const double alpha_var_from_pos = (H_alpha_p * P_.block<3, 3>(12, 12) * H_alpha_p.transpose())(0, 0);
+        const double alpha_var_from_W   = H_alpha_W * H_alpha_W * P_(18, 18);
+        const double alpha_var_noise    = R_(6, 6);
+        
+        const double w_contribution_ratio = alpha_var_from_W / (alpha_var_from_pos + alpha_var_noise + 1e-20);
+        const bool variance_test_pass = (w_contribution_ratio > 0.5);
+
+        // Test 2: α 创新偏差跟踪
+        const double alpha_innov = y(6);                  // 本次 α 创新
+        const double alpha_innov_std = std::sqrt(S(6, 6)); // 创新的理论标准差
+        // EMA (alpha ≈ 0.05, 满帧约20次更新稳定)
+        alpha_innov_ema_ = 0.05 * alpha_innov + 0.95 * alpha_innov_ema_;
+        // 归一化偏差: |EMA| / σ, 超过 2 表示 95% 置信下存在系统偏差
+        const double normalized_bias = std::abs(alpha_innov_ema_) / (alpha_innov_std + 1e-20);
+        const bool bias_test_pass = (normalized_bias < 2.0);
+        
+        w_observable_ = variance_test_pass && bias_test_pass;
+
+        if (!w_observable_) {
+            // 冻结 W: 将 K 的第 18 行置零
+            K.row(18).setZero();
         }
         
         x_ = x_ + K * y;
@@ -911,6 +998,14 @@ private:
     double prev_azimuth_ = 0.0;
     double prev_elevation_ = 0.0;
     bool los_angle_initialized_ = false;
+
+    // 3D运动学过程噪声参数 (在predict中动态构建含交叉协方差的Q矩阵)
+    double q_accel_3d_ = 1.0;     // 加速度谱密度 (m²/s⁴), 对齐Python target_ekf q_accel=1.0
+    double q_W_ = 2.5e-5;        // W随机游走方差率, 对齐Python q_W≈0.002 级
+
+    // W 可观测度标志和创新偏差跟踪
+    bool w_observable_ = true;
+    double alpha_innov_ema_ = 0.0;  // α 创新的指数加权均值 (检测系统偏差)
 
     // EMA滤波器
     EMAFilterTemplate<2> ema_filter_;
