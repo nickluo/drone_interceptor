@@ -23,8 +23,8 @@
 
 using VectorX = Eigen::Matrix<double, 16, 1>;
 using VectorU = Eigen::Matrix<double, 4, 1>;
-using VectorP = Eigen::Matrix<double, 18, 1>;
-using VectorWcost = Eigen::Matrix<double, 7, 1>;
+using VectorP = Eigen::Matrix<double, 19, 1>;
+using VectorWcost = Eigen::Matrix<double, 8, 1>;
 
 // ACADOS - 使用四元数版本的求解器
 extern "C" {
@@ -112,6 +112,7 @@ private:
         this->declare_parameter<double>("cost.w_tilt", 1.0);
         this->declare_parameter<double>("cost.w_u_alpha", 50.0);
         this->declare_parameter<double>("cost.w_u_thrust", 0.1);
+        this->declare_parameter<double>("cost.w_zem", 5.0);
     }
     void load_parameters();
     void setup_ekf();
@@ -161,6 +162,13 @@ private:
     uint8_t pn_active_ = 0; // Latched state for PN 0: off, 1: on 2: pure inertial
     double pn_vc_initial_ {0.0}; // 切换到PN时body系x轴速度
     VectorU pn_last_u_pn_ {0.0, 0.0, 0.0, 9.81}; // Last computed PN control command
+    Eigen::Vector3d pn_last_omega_los_ {0.0, 0.0, 0.0}; // omega_los帧间变化率限制用
+    
+    // Augmented PN: 目标速度差分用于估计目标加速度
+    Eigen::Vector3d pn_last_target_vel_ {0.0, 0.0, 0.0};
+    bool pn_target_vel_valid_ {false};
+    Eigen::Vector3d pn_target_accel_filtered_ {0.0, 0.0, 0.0};  // EMA滤波后的目标加速度估计
+    int pn_apn_warmup_counter_ {0};  // APN warmup帧计数器
 
     
     // PN Filters

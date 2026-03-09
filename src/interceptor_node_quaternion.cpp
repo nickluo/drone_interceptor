@@ -176,7 +176,7 @@ void InterceptorNodeQuaternion::load_parameters()
     }
 
     // 代价函数权重
-    std::vector<double> cost_weights_vec(7);
+    std::vector<double> cost_weights_vec(8);
     this->get_parameter("cost.w_los", cost_weights_vec[0]);
     this->get_parameter("cost.w_align", cost_weights_vec[1]);
     this->get_parameter("cost.w_closing_speed", cost_weights_vec[2]);
@@ -184,7 +184,9 @@ void InterceptorNodeQuaternion::load_parameters()
     this->get_parameter("cost.w_tilt", cost_weights_vec[4]);
     this->get_parameter("cost.w_u_alpha", cost_weights_vec[5]);
     this->get_parameter("cost.w_u_thrust", cost_weights_vec[6]);
-    for (int i=0; i < 7; ++i) w_cost_(i) = std::sqrt(cost_weights_vec[i]);
+    this->get_parameter("cost.w_zem", cost_weights_vec[7]);
+    
+    for (int i=0; i < 8; ++i) w_cost_(i) = std::sqrt(cost_weights_vec[i]);
     if (TRACKING_DISTANCE_ > 0.001) {
         auto coeff = std::sqrt(10);
         auto los_coeff = std::sqrt(TRACKING_DISTANCE_ * 0.1);
@@ -316,10 +318,10 @@ void InterceptorNodeQuaternion::gimbal_callback(const sensor_msgs::msg::Imu::Sha
             // 使用angular_velocity字段获取角速度 (FLU坐标系: roll, pitch, yaw)
             Eigen::Vector3d current_gimbal_rate;
             current_gimbal_rate << msg->angular_velocity.x, msg->angular_velocity.y, msg->angular_velocity.z;
-            RCLCPP_INFO_THROTTLE(this->get_logger(), *this->get_clock(), 500,
-                "Gimbal IMU (FLU): roll=%.3f pitch=%.3f yaw=%.3f rad/s (%.1f %.1f %.1f deg/s)",
-                current_gimbal_rate(0), current_gimbal_rate(1), current_gimbal_rate(2),
-                current_gimbal_rate(0) * 180.0/M_PI, current_gimbal_rate(1) * 180.0/M_PI, current_gimbal_rate(2) * 180.0/M_PI);
+            // RCLCPP_INFO_THROTTLE(this->get_logger(), *this->get_clock(), 500,
+            //     "Gimbal IMU (FLU): roll=%.3f pitch=%.3f yaw=%.3f rad/s (%.1f %.1f %.1f deg/s)",
+            //     current_gimbal_rate(0), current_gimbal_rate(1), current_gimbal_rate(2),
+            //     current_gimbal_rate(0) * 180.0/M_PI, current_gimbal_rate(1) * 180.0/M_PI, current_gimbal_rate(2) * 180.0/M_PI);
             ekf_->predict(rclcpp::Time(msg->header.stamp).nanoseconds() / 1000, current_gimbal_rate);
         }
     }
@@ -772,35 +774,47 @@ void InterceptorNodeQuaternion::run_control_cycle(const Eigen::Vector3d &pos_est
             double los_rate_check = std::sqrt(los_state(2)*los_state(2) + 
                                               los_state(3)*los_state(3));
             double los_rate_check_deg = los_rate_check * 180.0 / M_PI;
-            double max_los_rate_deg = 5.0 * pn_fov_switch_deg_;
+            
+            // ============================================================
+            // 距离自适应FOV阈值: 近距离时MPC无法维持紧指向
+            // MPC在机动目标上的off-boresight约为: 3-5° @ 10m
+            // 因此近距离应放宽FOV要求
+            // ============================================================
+            double dist_factor = std::clamp((pn_switch_dist_ * 1.5 - dist_to_target) / pn_switch_dist_, 0.0, 1.5);
+            double effective_fov_deg = pn_fov_switch_deg_ * (1.0 + dist_factor);  // 2° → 最大5° at close range
+            double max_los_rate_deg = 3.0 * effective_fov_deg;  // LOS rate阈值也自适应
             
             // 各因子评分 (0=差, 1=好), 使用平滑sigmoid
-            // FOV评分: off-boresight在fov_switch以内得满分, 超出后平滑衰减
-            double fov_score = 1.0 / (1.0 + std::exp(4.0 * (angle_off_boresight_deg / pn_fov_switch_deg_ - 1.0)));
+            // FOV评分: 使用距离自适应阈值
+            double fov_score = 1.0 / (1.0 + std::exp(4.0 * (angle_off_boresight_deg / effective_fov_deg - 1.0)));
             // 垂直速度评分
             double vz_score = 1.0 / (1.0 + std::exp(4.0 * (vertical_speed / max_vertical_speed_for_pn - 1.0)));
-            // LOS角速度评分
+            // LOS角速度评分: 使用自适应阈值
             double los_rate_score = 1.0 / (1.0 + std::exp(4.0 * (los_rate_check_deg / max_los_rate_deg - 1.0)));
             
-            // 距离紧迫度: 越近越宽容 (在switch_dist处为1.0, 在half处为1.5)
-            double dist_ratio = dist_to_target / pn_switch_dist_;
+            // 距离紧迫度: 越近越宽容 (在1.5*switch_dist处为1.0, 在switch_dist处为1.33)
+            double dist_ratio = dist_to_target / (pn_switch_dist_ * 1.5);
             double urgency = 1.0 + 0.5 * (1.0 - dist_ratio);
             
             // 加权评分 (FOV权重最高)
             double pn_score = (0.5 * fov_score + 0.25 * vz_score + 0.25 * los_rate_score) * urgency;
-            const double pn_switch_threshold = 0.6;
+            const double pn_switch_threshold = 0.60;
             
-            // 硬性兜底: 距离 < 一半切换距离时, 只要目标可见就强制切换
-            bool force_switch = (dist_to_target < pn_switch_dist_ * 0.5) && is_visible_;
+            // 硬性兜底: 距离 < switch_dist时, 只要目标可见就强制切换
+            // 不等到0.5*switch_dist, 因为那时MPC已经严重偏离
+            bool force_switch = (dist_to_target < pn_switch_dist_) && is_visible_;
             
             RCLCPP_INFO_THROTTLE(this->get_logger(), *this->get_clock(), 100,
-                "PN score: %.2f (fov=%.2f vz=%.2f los=%.2f urgency=%.2f) thresh=%.2f %s",
-                pn_score, fov_score, vz_score, los_rate_score, urgency, 
+                "PN score: %.2f (fov=%.2f[eff=%.1f°] vz=%.2f los=%.2f urgency=%.2f) thresh=%.2f %s",
+                pn_score, fov_score, effective_fov_deg, vz_score, los_rate_score, urgency, 
                 pn_switch_threshold, force_switch ? "[FORCE]" : "");
             
-            if ((dist_to_target < pn_switch_dist_ * 2.0 && pn_score >= pn_switch_threshold) || force_switch) {
+            if ((dist_to_target < pn_switch_dist_ * 1.5 && pn_score >= pn_switch_threshold) || force_switch) {
                 pn_vc_initial_ = closing_speed_est;
                 pn_active_ = 1; // Latch PN active
+                pn_target_vel_valid_ = false;  // 重置APN的目标速度历史
+                pn_target_accel_filtered_ = Eigen::Vector3d::Zero();  // 重置APN滤波器
+                pn_apn_warmup_counter_ = 0;  // 重置warmup计数器
                 RCLCPP_INFO(this->get_logger(), 
                     "Switching to IMAGE-BASED PN (Latch Active, score=%.2f%s), Thrust Efficiency: %.3f", 
                     pn_score, force_switch ? " FORCED" : "", thrust_efficiency_);
@@ -1071,6 +1085,21 @@ VectorU InterceptorNodeQuaternion::calculate_pn_controls_image_based(const Vecto
             "PN: Invalid LOS rates (NaN), returning hover");
         return u_pn;
     }
+    
+    // ============================================================================
+    // Miss检测: 目标偏离视轴过大时进入末段惯性飞行
+    // 在追击阶段如果目标大幅偏离视轴，说明已经miss，继续PN只会发散
+    // ============================================================================
+    double off_boresight_rad = std::sqrt(azimuth * azimuth + elevation * elevation);
+    double off_boresight_deg = off_boresight_rad * 180.0 / M_PI;
+    if (off_boresight_deg > 30.0 && pn_active_ == 1) {
+        pn_active_ = 2;
+        pn_last_u_pn_.head<3>() *= 0.3;  // 大幅降低角速度指令
+        RCLCPP_WARN(this->get_logger(), 
+            "PN: Miss detected! Off-boresight=%.1f° > 30°, switching to terminal coast", 
+            off_boresight_deg);
+        return pn_last_u_pn_;
+    }
 
     // ============================================================================
     // 3D True Proportional Navigation (TPN) - 直接在世界系中计算
@@ -1102,9 +1131,9 @@ VectorU InterceptorNodeQuaternion::calculate_pn_controls_image_based(const Vecto
     // 接近速度 (正=靠近)
     double closing_speed = -rel_pos.dot(rel_vel) / dist_to_target;
     
-    // 确保接近速度为正
+    // 确保接近速度为正 (使用合理的下限，避免PN增益放大)
     if (closing_speed < 1.0) {
-        closing_speed = pn_vc_initial_ > 1.0 ? pn_vc_initial_ : 1.0;
+        closing_speed = 3.0;  // 固定下限，不使用pn_vc_initial_以免过度放大
     }
     
     // 估计拦截时间
@@ -1114,7 +1143,7 @@ VectorU InterceptorNodeQuaternion::calculate_pn_controls_image_based(const Vecto
     // 末制导切换
     // ============================================================================
     const double terminal_dist_threshold = ekf_->getEstimatedWidth() * 2.5;
-    const double terminal_tti_threshold = 0.1;
+    const double terminal_tti_threshold = 0.2;
     if ((dist_to_target < terminal_dist_threshold || tti < terminal_tti_threshold) && pn_active_ == 1) {
         pn_active_ = 2;
         pn_last_u_pn_.head<3>() *= 0.5; // Retain partial correction instead of coasting blind
@@ -1138,11 +1167,12 @@ VectorU InterceptorNodeQuaternion::calculate_pn_controls_image_based(const Vecto
         adaptive_N = base_N * (10.0 / closing_speed);
     }
     
-    // 末段渐弱: TTI < 0.3s 时线性降低N, 防止近距离剧烈振荡
-    // 0.3s 对应约3m距离(Vc=10m/s), 此时目标已非常近, 检测噪声大
-    // if (tti < 0.3) {
-    //     adaptive_N *= std::max(0.2, tti / 0.3);  // 最低降到20%
-    // }
+    // 末段渐弱: TTI < 0.4s 时线性降低N, 防止近距离剧烈振荡
+    // 0.4s 对应约4m距离(Vc=10m/s), 此时目标已非常近, 检测噪声大
+    // 注意: 对于机动目标，不能过早衰减，否则末段修正能力不足
+    if (tti < 0.4) {
+        adaptive_N *= std::max(0.3, tti / 0.4);  // 最低降到30%
+    }
     
     adaptive_N = std::max(2.0, adaptive_N); // 保证最小制导增益
     
@@ -1181,10 +1211,19 @@ VectorU InterceptorNodeQuaternion::calculate_pn_controls_image_based(const Vecto
     }
     
     // 限制omega_los的大小，避免噪声放大
-    const double max_omega_for_pn = 30.0 * M_PI / 180.0;
+    const double max_omega_for_pn = 20.0 * M_PI / 180.0;  // 降低上限，减少检测跳变的影响
     if (omega_los.norm() > max_omega_for_pn) {
         omega_los = omega_los.normalized() * max_omega_for_pn;
     }
+    
+    // 帧间omega_los变化率限制: 防止检测跳变导致的瞬间大修正
+    // 允许较大变化率以适应机动目标 (120°/s^2)
+    const double max_omega_change_per_step = 120.0 * M_PI / 180.0 * dt_;
+    Eigen::Vector3d omega_los_diff = omega_los - pn_last_omega_los_;
+    if (omega_los_diff.norm() > max_omega_change_per_step && pn_last_omega_los_.norm() > 1e-6) {
+        omega_los = pn_last_omega_los_ + omega_los_diff.normalized() * max_omega_change_per_step;
+    }
+    pn_last_omega_los_ = omega_los;
     
     // PN加速度 = N * Vc * (omega_los × los_unit)
     // 这个加速度垂直于LOS方向，指向需要转向的方向
@@ -1192,18 +1231,81 @@ VectorU InterceptorNodeQuaternion::calculate_pn_controls_image_based(const Vecto
     Eigen::Vector3d a_pn = adaptive_N * capped_closing_speed * omega_los.cross(los_unit);
     
     // ============================================================================
+    // Augmented PN: 目标加速度补偿项
+    // 
+    // 标准PN对匀速目标有效, 对机动(圆周运动)目标存在系统性LOS角速率残差。
+    // APN公式: a_cmd = N*Vc*omega_los×r_hat + (N/3)*a_T_perp  (降低增益以适应噪声)
+    // 其中 a_T_perp 是目标加速度在垂直于LOS方向的分量。
+    //
+    // 通过差分vel_est估计目标加速度，经过EMA滤波后使用。
+    // 前0.3s为warmup期，不应用APN，避免初始瀐变冲击。
+    // ============================================================================
+    if (pn_target_vel_valid_ && !vel_est.hasNaN()) {
+        Eigen::Vector3d a_target_raw = (vel_est - pn_last_target_vel_) / dt_;
+        
+        // 限制目标加速度估计的幅值 (防止噪声)
+        const double max_target_accel = 15.0;  // m/s^2, 圆周运动v²/R, 10²/10=10
+        if (a_target_raw.norm() > max_target_accel) {
+            a_target_raw = a_target_raw.normalized() * max_target_accel;
+        }
+        
+        // EMA滤波: tau=0.3s, 平滑目标加速度估计
+        const double tau_accel = 0.3;
+        const double alpha_accel = dt_ / (tau_accel + dt_);
+        pn_target_accel_filtered_ = (1.0 - alpha_accel) * pn_target_accel_filtered_ + alpha_accel * a_target_raw;
+        pn_apn_warmup_counter_++;
+        
+        // Warmup期结束后才应用APN (约 0.3s = 15帧@50Hz)
+        const int apn_warmup_frames = static_cast<int>(0.3 / dt_);
+        if (pn_apn_warmup_counter_ >= apn_warmup_frames) {
+            // 投影到垂直于LOS的平面
+            Eigen::Vector3d a_target_perp = pn_target_accel_filtered_ - 
+                pn_target_accel_filtered_.dot(los_unit) * los_unit;
+            
+            // APN增强项: (N/3) * a_T_perp  (理论値N/2, 因噪声降低为N/3)
+            a_pn += (adaptive_N / 3.0) * a_target_perp;
+            
+            RCLCPP_DEBUG_THROTTLE(this->get_logger(), *this->get_clock(), 200,
+                "APN: a_filtered=[%.1f,%.1f,%.1f] a_perp=[%.1f,%.1f,%.1f]",
+                pn_target_accel_filtered_.x(), pn_target_accel_filtered_.y(), pn_target_accel_filtered_.z(),
+                a_target_perp.x(), a_target_perp.y(), a_target_perp.z());
+        }
+    }
+    // 更新目标速度历史
+    if (!vel_est.hasNaN()) {
+        pn_last_target_vel_ = vel_est;
+        pn_target_vel_valid_ = true;
+    }
+    
+    // ============================================================================
     // 添加前向加速度分量 (沿LOS方向)
     // 用于维持或增加接近速度
     // ============================================================================
-    double desired_closing_speed = pn_vc_initial_ > V_DESIRED_ * 0.5 ? pn_vc_initial_ : V_DESIRED_;
+    // 始终以V_DESIRED_和初始Vc中的较大值作为期望接近速度
+    double desired_closing_speed = std::max(pn_vc_initial_, V_DESIRED_);
     double closing_speed_error = desired_closing_speed - closing_speed;
-    double ax_forward = std::clamp(2.0 * closing_speed_error, -5.0, 10.0);
+    double ax_forward = std::clamp(1.5 * closing_speed_error, -3.0, 8.0);
+    
+    // PN优先级: 当PN侧向修正较大时，缩减前向加速度以避免抢占加速度预算
+    // 这防止了大前向加速(大倾角)干扰PN的精确制导
+    double a_pn_mag = a_pn.norm();
+    if (a_pn_mag > 2.0) {
+        double pn_priority_scale = std::max(0.2, 2.0 / a_pn_mag);
+        ax_forward *= pn_priority_scale;
+    }
     
     // 沿LOS方向的加速度 (朝向目标为正)
     Eigen::Vector3d a_forward = ax_forward * los_unit;
     
     // 总PN加速度 (世界系)
     Eigen::Vector3d a_world = a_pn + a_forward;
+    
+    // ============================================================================
+    // 重力补偿保护: 限制a_world.z下限，确保最低安全推力
+    // a_total.z = a_world.z + G, 允许俯冲但不允许完全自由落体
+    // 限制a_world.z >= -0.85*G, 保证 a_total.z >= 0.15*G (允许积极俯冲)
+    // ============================================================================
+    a_world.z() = std::max(a_world.z(), -0.85 * G_);
     
     // 限制水平和垂直加速度 (统一缩放以保持向量方向)
     double a_xy = std::sqrt(a_world.x() * a_world.x() + a_world.y() * a_world.y());
@@ -1239,6 +1341,7 @@ VectorU InterceptorNodeQuaternion::calculate_pn_controls_image_based(const Vecto
     // 推力大小 (为了达到a_total的实际物理加速度，指令需除以推力效率; 比如效率0.84，需要指令更大)
     double eff = std::clamp(thrust_efficiency_, 0.5, 1.0);
     double thrust = a_total.norm() / eff;
+    // 推力下限: 允许低于G以实现俯冲机动，但保持最低安全推力
     thrust = std::clamp(thrust, ControlLimits::THRUST_MIN, ControlLimits::THRUST_MAX);
     
     // 期望的机体Z轴方向 = 推力方向
@@ -1260,9 +1363,11 @@ VectorU InterceptorNodeQuaternion::calculate_pn_controls_image_based(const Vecto
     double sin_angle = rotation_axis.norm();
     double cos_angle = z_body_current.dot(z_body_desired);
 
-    // 对于attitude角速度，同样使用自适应N来避免响应过激
-    const double attitude_gain = adaptive_N * 1.5;
-    const double yaw_gain = adaptive_N * 0.75;
+    // 内环姿态跟踪增益: 固定值，与PN导航常数解耦
+    // 过高会导致姿态振荡; 过低会导致跟踪滞后
+    // 4.0对应~25°误差时产生~1.75 rad/s角速度，响应时间约0.07s
+    const double attitude_gain = 4.0;
+    const double yaw_gain = 2.5;
     
     Eigen::Vector3d omega_world = Eigen::Vector3d::Zero();
     if (sin_angle > 1e-6) {

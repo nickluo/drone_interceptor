@@ -50,7 +50,7 @@ DRONE_INITIAL_STATE = np.array([0.0, 0.0, 10.0,     # Position (p_x, p_y, p_z)
                                 0.0, 0.0, 0.0,     # Omega (wx, wy, wz)
                                 0.0, 0.0, 0.0])    # Gimbal (r, p, y)
 TARGET_INITIAL_POS = np.array([100.0, 20.0, 15.0])
-TARGET_VELOCITY = np.array([-10.0, 5.0, 0.5]) # 目标做匀速直线运动
+TARGET_VELOCITY = np.array([-5.0, 5.0, 0.5]) # 目标做匀速直线运动
 # TARGET_INITIAL_POS = np.array([100.0, 20.0, 15.0])
 # TARGET_VELOCITY = np.array([0.0, 0.0, 0.0]) # 目标静止
 
@@ -69,12 +69,13 @@ CAM_FOCAL_LENGTH = CAM_FOCAL_LENGTH_PHYSICAL * 1000 / CAM_PIXEL_SIZE # 焦距 (i
 # ======== 代价函数 (Cost Function) ========
 # --- 权重 ---
 W_LOS = 100.0             # 视线误差权重
-W_ALIGN = 0.1             # 速度对齐权重
+W_ALIGN = 10.0             # 速度对齐权重
 W_CLOSING_SPEED = 0.1     # 接近速度权重
-W_RATES = 0.00001        # 角速度控制量权重
-W_TILT = 0.000001         # 倾斜角误差权重
-W_U_ALPHA = 0.001        # 角速度变化率权重
+W_RATES = 0.001        # 角速度控制量权重
+W_TILT = 0.0001         # 倾斜角误差权重
+W_U_ALPHA = 0.1        # 角速度变化率权重
 W_U_THRUST = 0.0001       # 油门控制量权重
+W_ZEM = 0.0               # Zero Effort Miss 权重
 
 # ======== 3D PN 导引律参数 (3D PN Guidance Parameters) ========
 PN_ENABLED = True
@@ -246,7 +247,8 @@ W_COST = np.array([np.sqrt(W_LOS),
                     np.sqrt(W_RATES),
                     np.sqrt(W_TILT),
                     np.sqrt(W_U_ALPHA),
-                    np.sqrt(W_U_THRUST)])
+                    np.sqrt(W_U_THRUST),
+                    np.sqrt(W_ZEM)])
 
 # ------------------------------------------------------------------------------
 # 主仿真循环 (Main Simulation Loop)

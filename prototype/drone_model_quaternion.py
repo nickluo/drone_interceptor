@@ -19,13 +19,13 @@ class DroneModelQuaternion:
         # 其中 q = [qw, qx, qy, qz] 是四元数 (scalar-first convention)
         x = ca.SX.sym('x', 16)      # type: ignore # 状态: [px, py, pz, vx, vy, vz, qw, qx, qy, qz, wx, wy, wz, gimbal_r, gimbal_p, gimbal_y]
         u = ca.SX.sym('u', 4)       # type: ignore # 控制: [u_wx, u_wy, u_wz, thrust] (机体角速度 + 推力加速度)
-        params = ca.SX.sym('p', 18) # type: ignore # 参数: [p_target, v_target, drag_coeff, v_desired, rate_tc, w_cost, gimbal_omega_coeff]
+        params = ca.SX.sym('p', 19) # type: ignore # 参数: [p_target, v_target, drag_coeff, v_desired, rate_tc, w_cost(8), gimbal_omega_coeff]
 
         drag_coeff = params[6]
         v_desired = params[7]
         rate_tc = params[8]
-        gimbal_RP_coeff = params[16]
-        gimbal_Y_coeff = params[17]
+        gimbal_RP_coeff = params[17]
+        gimbal_Y_coeff = params[18]
 
         # --- 权重 ---
         W_los = params[9]  # 视线误差权重
@@ -34,7 +34,8 @@ class DroneModelQuaternion:
         W_rates = params[12]        # 角速度控制量权重
         W_tilt = params[13]         # 倾斜角误差权重
         W_u_alpha = params[14]      # 角速度变化率权重
-        W_u_thrust = params[15]     # 油门控制量权重
+        W_u_thrust = params[15]
+        W_zem = params[16]          # Zero Effort Miss 权重     # 油门控制量权重
         
         # --- 提取状态变量 ---
         pos = x[0:3]        # 位置
@@ -230,6 +231,33 @@ class DroneModelQuaternion:
         # # 或
         tilt_error = W_tilt * tilt_ratio * ca.exp(tilt_ratio - 1)  # 指数增长
 
+        # ========= Zero Effort Miss (ZEM) 代价项 =========
+        # ZEM 估计如果没有进一步修正，目标的最终脱靶量
+        # ZEM = v_perp * tgo, v_perp 是垂直于LOS方向的相对速度分量
+        # 为 pitch/roll 提供直接梯度，解决近距离过度依赖 yaw 的问题
+        #
+        # 注意: 只使用无人机自身速度的垂直分量作为主要修正信号，
+        # 目标速度贡献通过一个衰减因子降低权重，以应对估计误差
+        tgo_raw = dist_to_target / (ca.fmax(closing_speed_x, 0.5))
+        tgo = ca.fmin(tgo_raw, 3.0)  # 限制最大 tgo 避免远距离误差放大
+
+        # 垂直于LOS方向的无人机速度分量 (导致脱靶的主要可控量)
+        drone_vel_along_los = ca.dot(vel, los_norm) * los_norm
+        drone_v_perp = vel - drone_vel_along_los
+
+        # 目标速度的垂直分量 (估计不准，使用衰减因子)
+        target_vel_along_los = ca.dot(target_vel, los_norm) * los_norm
+        target_v_perp = target_vel - target_vel_along_los
+        # 目标速度衰减因子: 近距离(tgo小)时降低目标速度的影响，
+        # 因为此时剩余修正时间短，目标速度估计误差影响被放大
+        target_vel_trust = ca.fmin(tgo / 2.0, 1.0)  # tgo < 2s 时线性衰减
+
+        # 综合 ZEM: 无人机需要消除自身的垂直速度分量，同时补偿(可信的)目标横向运动
+        zem = (drone_v_perp - target_vel_trust * target_v_perp) * tgo
+
+        # 除以 (dist + 1) 使其尺度无关，penalty_coeff 在近距离自动增大权重
+        zem_error = W_zem * penalty_coeff * zem / (dist_to_target + 1.0)
+
 
         cost_expr_y = ca.vertcat(
             los_error, 
@@ -237,6 +265,7 @@ class DroneModelQuaternion:
             closing_speed_error,
             radial_speed_error,
             tilt_error,
+            zem_error,
             rates_constraint,
             u_alpha,
             thrust_accel_error
@@ -248,6 +277,7 @@ class DroneModelQuaternion:
             closing_speed_error,
             radial_speed_error,
             tilt_error,
+            zem_error,
             rates_constraint
         )
         
@@ -274,7 +304,8 @@ class DroneModelQuaternion:
         ocp.cost.cost_type_e = 'NONLINEAR_LS'
         ocp.cost.W = np.eye(self.model.cost_y_expr.shape[0])       # type: ignore
         # ocp.cost.W_e = np.eye(self.model.cost_y_expr_e.shape[0])   # type: ignore
-        ocp.cost.W_e = np.diag([np.sqrt(10), np.sqrt(10), np.sqrt(5), np.sqrt(5), np.sqrt(5), np.sqrt(10),np.sqrt(5), np.sqrt(5), np.sqrt(5)])
+        # W_e 对角线: los(2) + align(1) + closing(1) + radial(1) + tilt(1) + zem(3) + rates(3) = 12
+        ocp.cost.W_e = np.diag([np.sqrt(10), np.sqrt(10), np.sqrt(5), np.sqrt(5), np.sqrt(5), np.sqrt(10), np.sqrt(10), np.sqrt(10), np.sqrt(10), np.sqrt(5), np.sqrt(5), np.sqrt(5)])
         ocp.cost.yref = np.zeros((self.model.cost_y_expr.shape[0],))       # type: ignore
         ocp.cost.yref_e = np.zeros((self.model.cost_y_expr_e.shape[0],))   # type: ignore
 
