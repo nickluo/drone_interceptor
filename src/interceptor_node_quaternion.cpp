@@ -127,7 +127,6 @@ void InterceptorNodeQuaternion::load_parameters()
     this->get_parameter("perception.bbox_pos_std_dev", bbox_pos_std_dev_);
     this->get_parameter("perception.bbox_size_std_dev", bbox_size_std_dev_);
     this->get_parameter("perception.target_physical_size_est", target_physical_size_est_);
-    this->get_parameter("perception.perspective_compensation", perspective_compensation_);
     this->get_parameter("perception.detection_latency", detection_latency_);
     this->get_parameter("control.execution_delay", control_execution_delay_);
     this->get_parameter("control.rate_tc", RATE_TC_);
@@ -227,7 +226,7 @@ void InterceptorNodeQuaternion::setup_ekf()
     const int predicted_imu_freq = 100;
     ekf_ = std::make_unique<DroneEKF>(cam_intrinsics_, process_noise, measurement_noise,
                                         predicted_imu_freq, detection_latency_,
-                                        target_physical_size_est_, perspective_compensation_);
+                                        target_physical_size_est_);
 }
 
 void InterceptorNodeQuaternion::mission_launch_callback(const std_msgs::msg::Header::SharedPtr msg)
@@ -496,8 +495,7 @@ void InterceptorNodeQuaternion::bbox_callback(const vision_msgs::msg::Detection2
                 const double coeff = std::exp((detection_ratio_ - 0.1) * 2); // 指数加权以增强近距离检测的影响
                 const double bbox_pos_std_dev = coeff * bbox_pos_std_dev_;
                 const double bbox_size_std_dev = coeff * bbox_size_std_dev_;
-                const double target_physical_size_est = coeff * target_physical_size_est_;
-                
+
                 Eigen::Matrix<double, 9, 1> process_noise;
                 // 接近阶段增大q_accel_3d: CV模型在机动时跟踪滞后,
                 // 增大3D过程噪声使EKF将alpha残差归因于位置而非W

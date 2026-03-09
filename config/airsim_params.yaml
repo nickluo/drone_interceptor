@@ -40,7 +40,6 @@ interceptor_node_quaternion:
       bbox_pos_std_dev: 3.0
       bbox_size_std_dev: 3.0
       target_physical_size_est: 1.0
-      perspective_compensation: 0.0  # 透视补偿因子 (0.5-1.0)
     
     # Control execution delay compensation
     control:

@@ -233,13 +233,11 @@ public:
              const Eigen::Vector3d& measurement_noise_std,
              int estimated_imu_freq,
              double estimated_detection_latency,
-             double target_size_est = 0.5,
-             double perspective_compensation = 1.0)
+             double target_size_est)
         : intrinsics_(intrinsics),
           max_buffer_size_(static_cast<size_t>(estimated_imu_freq * estimated_detection_latency * 2)),
           dt_(1.0 / estimated_imu_freq),
           target_size_est_(target_size_est),
-          perspective_compensation_(perspective_compensation),
           ema_filter_(estimated_imu_freq / 20),
           imu_flow_filter_(estimated_imu_freq / 20),
           is_initialized_(false),
@@ -741,14 +739,9 @@ private:
         double u = bbox_measurement(0) - intrinsics_.px;  // 水平偏移
         double v = bbox_measurement(1) - intrinsics_.py;  // 垂直偏移
         
-        // 透视补偿 (与TargetEKF相同)
-        double v_sq = v * v;
-        double f_sq = intrinsics_.fx * intrinsics_.fx;
-        double v_compensated = v - perspective_compensation_ * target_size_est_ * v * intrinsics_.fx / (f_sq + v_sq) / (intrinsics_.fx * target_size_est_ / bbox_size);
-        
         // 相机系LOS向量 (注意负号 - 匹配FLU中Y为左, Z为上)
         double est_los_C_y = -u * est_dist_cam_x / intrinsics_.fx;
-        double est_los_C_z = -v_compensated * est_dist_cam_x / intrinsics_.fy;
+        double est_los_C_z = -v * est_dist_cam_x / intrinsics_.fy;
         Eigen::Vector3d los_C(est_dist_cam_x, est_los_C_y, est_los_C_z);
         
         Eigen::Matrix3d R_C_W = q_C_W.toRotationMatrix();
@@ -979,7 +972,6 @@ private:
     // 相机参数
     CameraIntrinsics intrinsics_;
     double target_size_est_;
-    double perspective_compensation_;
 
     // 历史缓冲区
     std::deque<StateHistory> history_buffer_;

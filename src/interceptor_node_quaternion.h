@@ -82,7 +82,6 @@ private:
         this->declare_parameter<double>("perception.bbox_pos_std_dev", 2.0);
         this->declare_parameter<double>("perception.bbox_size_std_dev", 5.0);
         this->declare_parameter<double>("perception.target_physical_size_est", 1.0);
-        this->declare_parameter<double>("perception.perspective_compensation", 1.0);  // 透视补偿因子
         this->declare_parameter<double>("perception.detection_latency", 0.08);  // 检测延迟估计
 
         this->declare_parameter<double>("control.execution_delay", 0.05);
@@ -181,7 +180,6 @@ private:
     
     double bbox_pos_std_dev_, bbox_size_std_dev_;
     double target_physical_size_est_;
-    double perspective_compensation_;  // 透视补偿因子
     double detection_latency_;  // 检测延迟估计
     double control_execution_delay_;
     double ctrl_coeff_;
