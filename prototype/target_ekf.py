@@ -21,7 +21,9 @@ class TargetEKF:
     def __init__(self, dt, cam_focal_length, pos_dev, size_dev,
                  initial_width_est,
                  range_init_bias=0.5,
-                 q_accel=1.0, q_W=0.002, alpha_R_inflate=2.0):
+                 q_accel=1.0, q_W=0.002, alpha_R_inflate=2.0,
+                 W_max=2.0,
+                 tau_W=15):
         self.focal_length = cam_focal_length
         self.dt_nominal = dt
 
@@ -35,23 +37,26 @@ class TargetEKF:
         self.x = np.zeros(self.n)
 
         # 初始状态协方差
-        # 使用 range_init_bias 后, 初始距离误差显著降低 (约 σ=30m 量级),
-        # P_pos 相应设为 900;
-        # P_W=4 (σ=2m) — 覆盖 W_init 可能偏离真值 0.5~2 倍的不确定性
         self.P = np.diag([
             900.0, 900.0, 900.0,    # 位置 σ≈30m
             100.0, 100.0, 100.0,    # 速度 σ=10m/s
             4.0                     # 宽度 σ=2m
         ])
 
-        # 运动学过程噪声参数 (白噪声加速度谱密度)
-        # Q 矩阵在 predict() 中按照运动学 CV 模型构建,
-        # 包含位置-速度交叉协方差项, 物理上更准确
-        self.q_accel = q_accel   # (m²/s⁴)/Hz — 吸收未建模加速度
-        self.q_W = q_W           # (m²/s) — W 随机游走
+        # 过程噪声参数
+        self.q_accel = q_accel
+        self.q_W = q_W
+
+        # W 过程噪声指数衰减时间常数 (单位: 更新次数)
+        # Q_W(k) = q_W * exp(-k / tau_W) * dt
+        # W 是目标物理常量, 随着观测积累 Q_W 衰减 → P_WW 收缩 → K[6,:] 自然变小
+        # tau_W 越小衰减越快, 越大则 W 保持更长时间的可调性
+        self.tau_W = tau_W
+
+        # W 物理约束上限
+        self.W_max = W_max
 
         # 测量噪声协方差
-        # 视角测量噪声额外膨胀, 补偿 bbox 尺寸估计与线性化误差
         self.R = np.diag([
             self.sigma_az**2,
             self.sigma_el**2,
@@ -61,6 +66,7 @@ class TargetEKF:
         self.initial_width_est = initial_width_est
         self.range_init_bias = range_init_bias
         self.is_initialized = False
+        self.update_count = 0
     
     def initialize(self, bbox, drone_pos, psi, gimbal_r, gimbal_p, gimbal_y):
         """使用首次观测初始化滤波器"""
@@ -88,8 +94,6 @@ class TargetEKF:
         F[1, 4] = dt
         F[2, 5] = dt
 
-        # 运动学过程噪声: 白噪声加速度积分
-        # 位置-速度交叉协方差保证物理一致性, 避免独立对角 Q 导致的滤波器不稳定
         qa = self.q_accel
         dt2 = dt * dt
         dt3 = dt2 * dt
@@ -100,7 +104,10 @@ class TargetEKF:
             Q[i, i+3] = qa * dt2 / 2.0      # 位置-速度协方差
             Q[i+3, i] = qa * dt2 / 2.0      # 速度-位置协方差
             Q[i+3, i+3] = qa * dt            # 速度方差
-        Q[6, 6] = self.q_W * dt              # W 随机游走
+
+        # W 过程噪声指数衰减: 随观测积累 W 越来越确定
+        w_decay = np.exp(-self.update_count / self.tau_W)
+        Q[6, 6] = self.q_W * w_decay * dt
 
         self.x = F @ self.x
         self.P = F @ self.P @ F.T + Q
@@ -175,26 +182,29 @@ class TargetEKF:
         # === 卡尔曼增益与状态更新 ===
         S = H @ self.P @ H.T + self.R
 
-        # 创新门检测: 拒绝线性化误差过大的异常更新 (chi² 阈值, 3-DOF)
         try:
             S_inv = np.linalg.inv(S)
         except np.linalg.LinAlgError:
             return
+        # 创新门检测 (chi² 阈值, 3-DOF)
         chi2 = y @ S_inv @ y
-        if chi2 > 20.0:  # 99.99% 门限, 仅拒绝极端异常值
+        if chi2 > 20.0:
             return
 
         K = self.P @ H.T @ S_inv
 
+        self.update_count += 1
         self.x = self.x + K @ y
 
-        # Joseph 形式更新协方差 (数值更稳定)
+        # Joseph 形式更新协方差
         I_KH = np.eye(self.n) - K @ H
         self.P = I_KH @ self.P @ I_KH.T + K @ self.R @ K.T
 
-        # 物理约束: 目标宽度 W ≥ 0.1m
+        # 物理约束: W_min ≤ W ≤ W_max
         if self.x[6] < 0.1:
             self.x[6] = 0.1
+        elif self.x[6] > self.W_max:
+            self.x[6] = self.W_max
     
     def get_target_position(self):
         """返回当前估计的目标位置"""
