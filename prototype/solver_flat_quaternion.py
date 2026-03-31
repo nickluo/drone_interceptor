@@ -271,7 +271,7 @@ def main():
     estimator = TargetEKF(dt, CAM_FOCAL_LENGTH, BBOX_POS_STD_DEV, BBOX_SIZE_STD_DEV,
                            initial_width_est=TARGET_WIDTH_INITIAL_EST,
                            range_init_bias=0.6,
-                           q_accel=3.0, q_W=0.0002)
+                           q_accel=3.0, q_W=0.01, alpha_R_inflate=1.0)
     output_filter = EMAFilter(int(N_HORIZON/TF*0.1), channels=4)
 
     perceptor = PerceptionSim(camera, PERCEPTION_DELAY, dt)

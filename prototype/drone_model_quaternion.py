@@ -143,7 +143,7 @@ class DroneModelQuaternion:
         relative_vel_sq = relative_vel_W.T @ relative_vel_W
         relative_vel = ca.sqrt(relative_vel_sq + 1e-6)
         time_to_arrival = dist_to_target / relative_vel
-        penalty_coeff = 1.0 + 10.0 * ca.exp(2.0 - time_to_arrival)
+        penalty_coeff = 1.0 + ca.fmin(10.0 * ca.exp(2.0 - time_to_arrival), 30.0)
         
         los_error = W_los * penalty_coeff * ca.vertcat(
             los_C[1] / los_C_x_safe, 
@@ -182,12 +182,9 @@ class DroneModelQuaternion:
         # closing_speed_error = 1 - closing_speed_cam_x / v_desired
         # closing_speed_error = W_closing_speed * (1 - closing_speed_x / v_desired)
         
-        # 当接近速度超过期望速度时(差值为负)，增加惩罚系数
-        # 使用 1 + max(0, (closing_speed_x - v_desired) / v_desired) 作为超速惩罚
+        # 接近速度误差 (简单二次代价)
         speed_diff = v_desired - closing_speed_x
-        # overspeed_penalty = 1.0 + 100.0 * ca.fmax(0, -speed_diff / v_desired)  # 超速时惩罚系数增大
-        overspeed_penalty = 1.0 + 10.0 / (1.0 + ca.exp(20.0 * speed_diff / v_desired))  # 使用平滑函数避免不连续
-        closing_speed_error = W_closing_speed * overspeed_penalty * speed_diff
+        closing_speed_error = W_closing_speed * speed_diff
         radial_speed_error = W_closing_speed * radial_speed_sq
 
         # 4. 控制量误差 (Control Effort)
@@ -296,7 +293,7 @@ class DroneModelQuaternion:
     # ------------------------------------------------------------------------------
     def setup_ocp(self) -> AcadosOcp:
         """配置并返回ACADOS OCP对象。"""
-        ocp = AcadosOcp('/usr/local')
+        ocp = AcadosOcp()
         ocp.model = self.model
         
         # --- 代价函数配置 ---
@@ -368,6 +365,7 @@ class DroneModelQuaternion:
         # 对于高频控制(50Hz+)，可以考虑：
         ocp.solver_options.qp_solver_warm_start = 2  # 热启动级别
         ocp.solver_options.regularize_method = 'PROJECT'  # QP正则化
+        ocp.solver_options.levenberg_marquardt = 5.0  # LM阻尼: 平滑控制输出
         ocp.solver_options.globalization = 'FIXED_STEP'  # RTI固定步长
 
         # 如果四元数动力学需要更高精度：
