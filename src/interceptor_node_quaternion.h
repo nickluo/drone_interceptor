@@ -73,6 +73,7 @@ private:
         this->declare_parameter<double>("pn.fov_switch_deg", 15.0);
         this->declare_parameter<double>("pn.max_accel_xy", 20.0);
         this->declare_parameter<double>("pn.max_accel_z", 20.0);
+        this->declare_parameter<double>("pn.drag_ff_coeff", 0.5);
         
         // Simulation Only
         this->declare_parameter<double>("sim.interception_dist", 1.0);
@@ -157,6 +158,7 @@ private:
     double pn_fov_switch_deg_;
     double pn_max_accel_xy_;     // Max horizontal acceleration (m/s^2)
     double pn_max_accel_z_;      // Max vertical acceleration (m/s^2)
+    double pn_drag_ff_coeff_;    // PN drag feedforward coefficient (1/s), independent of MPC drag_coeff
 
     uint8_t pn_active_ = 0; // Latched state for PN 0: off, 1: on 2: pure inertial
     double pn_vc_initial_ {0.0}; // 切换到PN时body系x轴速度
@@ -172,6 +174,11 @@ private:
     
     // PN Filters
     std::unique_ptr<EMAFilter> pn_accel_filter_;
+    std::unique_ptr<EMAFilter> pn_omega_los_filter_;  // omega_los EMA低通滤波
+    
+    // PN碰撞检测 (debug): 基于陀螺仪角速度突变
+    Eigen::Vector3d pn_last_cmd_rates_ {0.0, 0.0, 0.0};
+    bool pn_collision_detected_ {false};
     
     // 自适应推力效率估计 (MPC阶段学习)
     double thrust_efficiency_ {1.0};  // 推力效率系数 (T_actual = efficiency * T_cmd)

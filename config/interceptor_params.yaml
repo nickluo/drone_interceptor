@@ -21,11 +21,12 @@ interceptor_node_quaternion:
     # Proportional Navigation (PN) Terminal Guidance
     pn:
       enabled: true
-      nav_constant: 3.5      # Navigation constant (N)
+      nav_constant: 5.0      # Navigation constant (N)
       switch_dist: 10.0      # Distance to switch to PN (meters)
       fov_switch_deg: 3.0    # Switch only if target within this FOV (degrees)
       max_accel_xy: 25.0     # Max horizontal acceleration (m/s^2)
       max_accel_z: 15.0      # Max vertical acceleration (m/s^2)
+      drag_ff_coeff: 0.5     # PN drag feedforward coefficient (1/s), matches actual flight drag
     
     # Simulation parameters
     sim:

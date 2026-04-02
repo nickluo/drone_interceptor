@@ -21,11 +21,12 @@ interceptor_node_quaternion:
     # Proportional Navigation (PN) Terminal Guidance
     pn:
       enabled: true
-      nav_constant: 3.5      # Navigation constant (N)
+      nav_constant: 5.0      # Navigation constant (N)
       switch_dist: 10.0      # Distance to switch to PN (meters)
       fov_switch_deg: 3.0    # Switch only if target within this FOV (degrees)
       max_accel_xy: 25.0     # Max horizontal acceleration (m/s^2)
       max_accel_z: 15.0      # Max vertical acceleration (m/s^2)
+      drag_ff_coeff: 0.5     # PN drag feedforward coefficient (1/s), matches actual flight drag
     
     # Simulation parameters
     sim:
@@ -70,12 +71,12 @@ interceptor_node_quaternion:
     cost:
       w_los: 100.0              # Line-of-sight error weight
       w_align: 10.0             # Velocity alignment weight
-      w_closing_speed: 0.01     # Closing speed error weight
+      w_closing_speed: 0.1     # Closing speed error weight
       w_rates: 0.001            # Body rate control effort weight
       w_tilt: 0.0001            # Tilt angle error weight
       w_u_alpha: 0.1            # Body rate change weight
       w_u_thrust: 0.0001        # Thrust control effort weight
-      w_zem: 10.0               # Zero Effort Miss weight (path correction via pitch/roll)
+      w_zem: 1.0               # Zero Effort Miss weight (path correction via pitch/roll)
 
 # W_LOS = 10.0               # 视线误差权重
 # W_ALIGN = 1.0             # 速度对齐权重

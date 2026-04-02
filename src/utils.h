@@ -233,11 +233,15 @@ public:
              const Eigen::Vector3d& measurement_noise_std,
              int estimated_imu_freq,
              double estimated_detection_latency,
-             double target_size_est)
+             double target_size_est,
+             double tau_W = 15.0,
+             double alpha_R_inflate = 1.0)
         : intrinsics_(intrinsics),
           max_buffer_size_(static_cast<size_t>(estimated_imu_freq * estimated_detection_latency * 2)),
           dt_(1.0 / estimated_imu_freq),
           target_size_est_(target_size_est),
+          tau_W_(tau_W),
+          alpha_R_inflate_(alpha_R_inflate),
           ema_filter_(estimated_imu_freq / 20),
           imu_flow_filter_(estimated_imu_freq / 20),
           is_initialized_(false),
@@ -309,7 +313,7 @@ public:
         double sigma_alpha = std_meas_angle / f_avg;
         r_diag << std_meas_pos*std_meas_pos, std_meas_pos*std_meas_pos,
                   std_meas_size*std_meas_size, std_meas_size*std_meas_size,
-                  sigma_az*sigma_az, sigma_el*sigma_el, sigma_alpha*sigma_alpha * 2.0; // alpha_R_inflate = 2.0 (对齐Python target_ekf)
+                  sigma_az*sigma_az, sigma_el*sigma_el, sigma_alpha*sigma_alpha * alpha_R_inflate_; // configurable alpha_R_inflate
         R_ = r_diag.asDiagonal();
     }
 
@@ -481,7 +485,9 @@ public:
         Q_full(15 + i, 12 + i) = q_dt2_2;   // 速度-位置交叉协方差
         Q_full(15 + i, 15 + i) = q_dt1;     // 速度方差
     }
-    Q_full(18, 18) = q_W_ * dt_ratio;        // W随机游走 (保持dt_ratio缩放)
+    // W随机游走 + tau_W指数衰减: 初期允许W快速收敛, 后期冻结防漂移
+    double w_decay = (tau_W_ > 0.0) ? std::exp(-static_cast<double>(update_count_) / tau_W_) : 1.0;
+    Q_full(18, 18) = q_W_ * w_decay * dt_ratio;
 
     P_ = F * P_ * F.transpose() + Q_full;
         
@@ -688,6 +694,7 @@ public:
         los_angle_initialized_ = false;
         last_gimbal_omega_frd_.setZero();
         alpha_innov_ema_ = 0.0;
+        update_count_ = 0;
     }
 
     /** @brief 检查协方差矩阵健康状态 */
@@ -951,6 +958,9 @@ private:
         // 物理约束: 目标宽度 W >= 0.1m
         if (x_(18) < 0.1) x_(18) = 0.1;
 
+        // 更新计数 (用于tau_W衰减)
+        update_count_++;
+
         // 最终NaN检查
         if (x_.hasNaN() || P_.hasNaN()) {
             // 恢复到更新前状态并重置
@@ -994,6 +1004,11 @@ private:
     // 3D运动学过程噪声参数 (在predict中动态构建含交叉协方差的Q矩阵)
     double q_accel_3d_ = 1.0;     // 加速度谱密度 (m²/s⁴), 对齐Python target_ekf q_accel=1.0
     double q_W_ = 2.5e-5;        // W随机游走方差率, 对齐Python q_W≈0.002 级
+
+    // W估计参数 (对齐Python TargetEKF: tau_W=15, alpha_R_inflate=1.0)
+    double tau_W_ = 15.0;          // W指数衰减时间常数 (>0启用, 0=禁用)
+    double alpha_R_inflate_ = 1.0; // alpha测量噪声膨胀因子
+    int update_count_ = 0;         // 更新计数 (用于tau_W衰减)
 
     // W 可观测度标志和创新偏差跟踪
     bool w_observable_ = true;
