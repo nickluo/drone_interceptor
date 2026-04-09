@@ -128,11 +128,13 @@ def dq_kinematic_eq(dq, twist):
     qr = dq[0:4]
     qd = dq[4:8]
 
-    # Baumgarte 稳定化 (保持单位范数)
+    # Baumgarte 稳定化 (保持单位范数 + 正交约束)
     K_quat = 10
     norm_r = ca.norm_2(qr)
     quat_error = 1 - norm_r
-    aux = ca.vertcat(qr * (K_quat * quat_error), qd * 0)
+    # 对偶部分: 强制 qr · qd = 0 (单位DQ正交约束)
+    qr_dot_qd = ca.dot(qr, qd)
+    aux = ca.vertcat(qr * (K_quat * quat_error), -K_quat * qr_dot_qd * qr)
 
     # H+(Q) 矩阵
     H_r_plus = ca.vertcat(
@@ -365,52 +367,80 @@ class DroneModelDQ:
         cos_tilt_limit = ca.cos(constants['ATT_LIMIT'])
         tilt_ratio = 2 * (q[1]**2 + q[2]**2) / (1 - cos_tilt_limit + 1e-8)
 
-        # =================== 代价函数 (EXTERNAL, 精确Hessian) ===================
+        # =================== 代价残差 (NONLINEAR_LS, GN Hessian) ===================
+        # NONLINEAR_LS: 残差向量 y, 代价 = ||W(y - yref)||^2
+        # GN Hessian = J^T J 始终半正定, 避免EXTERNAL在hover时零控制梯度→MINSTEP
 
         # 距离自适应因子: 近距离降低横向修正 (ZEM)
-        # 原因: Bearing-Angle EKF的位置误差在近距离时约2-5m,
-        # ZEM在近距离用penalty_coeff放大横向修正会导致无人机飞向错误方向
         zem_dist_scale = dist_sq / (dist_sq + 10.0**2)  # 10m处50%, 3m处8%
 
-        # 1. 相机帧LOS误差 (保留penalty_coeff: 始终需要跟踪目标)
-        los_cost = w_los * penalty_coeff * (
-            (los_C[1] / los_C_x_safe)**2 + (los_C[2] / los_C_x_safe)**2)
+        # 1. 相机帧LOS误差 (2D) — sqrt(penalty): 平方后恢复线性penalty
+        los_error = ca.sqrt(w_los) * ca.sqrt(penalty_coeff) * ca.vertcat(
+            los_C[1] / los_C_x_safe,
+            los_C[2] / los_C_x_safe)
 
-        # 2. ZEM (近距离衰减: 避免基于不准确估计的强横向修正)
-        zem_cost = w_zem * zem_dist_scale * penalty_coeff * ca.dot(zem_normalized, zem_normalized)
+        # 2. ZEM (3D) — 近距离衰减, sqrt(penalty)保持EXTERNAL等价
+        zem_error = ca.sqrt(w_zem * zem_dist_scale) * ca.sqrt(penalty_coeff) * zem_normalized
 
-        # 3. FOV栅栏 (近距离减弱, 远距离主导)
-        fov_cost = w_fov * fov_dist_scale * fov_ratio**4
+        # 3. FOV栅栏 (1D) — fov_ratio in residual → quadratic in cost (避免quartic主导Hessian)
+        fov_error = ca.sqrt(w_fov * fov_dist_scale) * fov_ratio
 
-        # 4. 接近速度误差
-        closing_cost = w_closing * (v_desired - v_closing)**2
+        # 4. 接近速度误差 (1D)
+        closing_error = ca.sqrt(w_closing) * (v_desired - v_closing)
 
-        # 5. 速度对齐
-        align_cost = w_align * (1 - alignment)**2
+        # 4b. 横向速度惩罚 (1D) — 抑制垂直于LOS的速度分量, 提供横向阻尼
+        radial_speed_sq = rel_speed_sq - v_closing**2
+        radial_error = ca.sqrt(w_closing) * radial_speed_sq
 
-        # 6. 控制正则化
-        u_hover = ca.vertcat(0, 0, 0, G)
-        u_error = u - u_hover
-        R_u = ca.diag(ca.vertcat(
-            w_control_tau / rp_rate_max**2,
-            w_control_tau / rp_rate_max**2,
-            w_control_tau / y_rate_max**2,
-            w_control_F / G**2))
-        control_cost = u_error.T @ R_u @ u_error
+        # 5. 速度对齐 (1D)
+        align_error = ca.sqrt(w_align) * (1 - alignment)
 
-        # 7. 倾斜角软约束
-        tilt_cost = w_tilt * tilt_ratio * ca.exp(tilt_ratio - 1)
+        # 6. 倾斜角软约束 (1D)
+        tilt_error = ca.sqrt(w_tilt) * tilt_ratio * ca.exp(tilt_ratio - 1)
 
-        # 8. 角速度正则化
-        omega_cost = w_omega * ca.dot(omega, omega)
+        # 7. 角速度正则化 (3D)
+        omega_reg = ca.sqrt(w_omega) * omega
 
-        # 总代价
-        cost_stage = (los_cost + zem_cost + fov_cost + closing_cost
-                      + align_cost + control_cost + tilt_cost + omega_cost)
-        # 终端代价: 强调拦截精度
-        cost_terminal = (3 * (los_cost + zem_cost + fov_cost)
-                         + 2 * (closing_cost + align_cost)
-                         + tilt_cost + omega_cost)
+        # 8. 角加速度惩罚 (3D) — KEY: omega_dot提供直接u_omega梯度, 平滑角速度指令
+        control_omega_res = ca.vertcat(
+            ca.sqrt(w_control_tau) / rp_rate_max * omega_dot[0],
+            ca.sqrt(w_control_tau) / rp_rate_max * omega_dot[1],
+            ca.sqrt(w_control_tau) / y_rate_max * omega_dot[2])
+
+        # 9. 推力加速度误差 (1D) — KEY: 直接u_az梯度
+        thrust_error = ca.sqrt(w_control_F) / G * (u_az - G)
+
+        # 10. 角速度约束 (3D)
+        rates_constraint = ca.sqrt(w_omega) * ca.vertcat(
+            omega[0] / rp_rate_max,
+            omega[1] / rp_rate_max,
+            omega[2] / y_rate_max)
+
+        # Stage残差 (20D)
+        cost_y_expr = ca.vertcat(
+            los_error,          # 2D
+            zem_error,          # 3D
+            fov_error,          # 1D
+            closing_error,      # 1D
+            radial_error,       # 1D — 横向速度阻尼
+            align_error,        # 1D
+            tilt_error,         # 1D
+            omega_reg,          # 3D
+            control_omega_res,  # 3D — u-coupled
+            thrust_error,       # 1D — u-coupled
+            rates_constraint)   # 3D
+
+        # Terminal残差 (16D) — 无控制项, 增强拦截权重通过W_e
+        cost_y_expr_e = ca.vertcat(
+            los_error,          # 2D
+            zem_error,          # 3D
+            fov_error,          # 1D
+            closing_error,      # 1D
+            radial_error,       # 1D — 横向速度阻尼
+            align_error,        # 1D
+            tilt_error,         # 1D
+            omega_reg,          # 3D
+            rates_constraint)   # 3D
 
         # =================== 构建 ACADOS 模型 ===================
         self.model = AcadosModel()
@@ -420,9 +450,9 @@ class DroneModelDQ:
         self.model.f_expl_expr = f_expl
         self.model.name = model_name
 
-        # EXTERNAL代价 (提供精确Hessian, 近距离收敛性更好)
-        self.model.cost_expr_ext_cost = cost_stage
-        self.model.cost_expr_ext_cost_e = cost_terminal
+        # NONLINEAR_LS代价 (GN Hessian = J^T J, 始终PSD)
+        self.model.cost_y_expr = cost_y_expr
+        self.model.cost_y_expr_e = cost_y_expr_e
 
     # ------------------------------------------------------------------
     # OCP 配置
@@ -431,9 +461,31 @@ class DroneModelDQ:
         ocp = AcadosOcp()
         ocp.model = self.model
 
-        # 代价类型: EXTERNAL (精确Hessian + MIRROR正则化)
-        ocp.cost.cost_type = 'EXTERNAL'
-        ocp.cost.cost_type_e = 'EXTERNAL'
+        # 代价类型: NONLINEAR_LS (GN Hessian = J^T J, 避免EXTERNAL零控制梯度)
+        ny = self.model.cost_y_expr.shape[0]      # 19
+        ny_e = self.model.cost_y_expr_e.shape[0]  # 15
+
+        ocp.cost.cost_type = 'NONLINEAR_LS'
+        ocp.cost.cost_type_e = 'NONLINEAR_LS'
+
+        # Stage权重: identity (权重已嵌入残差表达式)
+        ocp.cost.W = np.eye(ny)
+        # Terminal权重: 增强拦截精度项 (对应EXTERNAL中3x/2x终端乘数)
+        #   los(2) zem(3) fov(1) closing(1) radial(1) align(1) tilt(1) omega(3) rates(3)
+        w_e_diag = np.array([
+            np.sqrt(3), np.sqrt(3),                    # los_error (3x)
+            np.sqrt(3), np.sqrt(3), np.sqrt(3),        # zem_error (3x)
+            np.sqrt(3),                                 # fov_error (3x)
+            np.sqrt(2),                                 # closing_error (2x)
+            np.sqrt(2),                                 # radial_error (2x)
+            np.sqrt(2),                                 # align_error (2x)
+            1.0,                                        # tilt_error (1x)
+            1.0, 1.0, 1.0,                             # omega_reg (1x)
+            1.0, 1.0, 1.0])                            # rates_constraint (1x)
+        ocp.cost.W_e = np.diag(w_e_diag)
+
+        ocp.cost.yref = np.zeros(ny)
+        ocp.cost.yref_e = np.zeros(ny_e)
 
         # 参数默认值
         ocp.parameter_values = np.zeros(self.model.p.size()[0])
@@ -473,7 +525,7 @@ class DroneModelDQ:
         # 热启动与正则化
         ocp.solver_options.qp_solver_cond_N = 5
         ocp.solver_options.qp_solver_warm_start = 2
-        ocp.solver_options.regularize_method = 'MIRROR'
+        ocp.solver_options.regularize_method = 'PROJECT'
         ocp.solver_options.globalization = 'FIXED_STEP'
         ocp.solver_options.levenberg_marquardt = 5.0
 

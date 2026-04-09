@@ -88,15 +88,15 @@ GIMBAL_DISTURBANCE_COEFF = 0.5
 # ==============================================================================
 # DQ-NMPC 代价权重
 # ==============================================================================
-W_LOS = 40.0              # 相机帧LOS误差权重 (提升: 保持目标在FOV内)
+W_LOS = 80.0              # 相机帧LOS误差权重 (2x: 平衡z轴跟踪与追击速度)
 W_ZEM = 35.0              # 零效果脱靶量(ZEM)权重
-W_CLOSING = 1.0           # 接近速度权重 (降低: 避免主导初始阶段)
+W_CLOSING = 0.5           # 接近速度权重 (适度降低: 保持追击能力)
 W_ALIGN = 5.0             # 速度对齐权重 (vel方向沿LOS)
-W_CONTROL_F = 0.0005      # 推力加速度正则化权重
-W_CONTROL_TAU = 0.005     # 角速度命令正则化权重
+W_CONTROL_F = 0.005       # 推力加速度正则化权重
+W_CONTROL_TAU = 0.05      # 角速度命令正则化权重 (含1/tc²放大)
 W_TILT = 0.0005           # 倾斜角惩罚权重
 W_OMEGA = 0.003           # 角速度正则化权重
-W_FOV = 120.0             # 相机FOV栏栅代价权重 (距离自适应, quartic)
+W_FOV = 100.0             # 相机FOV栏栅代价权重 (适度降低)
 
 # 权重向量 (直接值, EXTERNAL代价类型直接使用)
 W_COST = np.array([
@@ -300,15 +300,22 @@ def _dq_state_derivative(dq_state, u_ctrl, mass):
         [wz,  wy, -wx,  0]])
     q_dot = 0.5 * omega_mat @ q
 
-    # DQ导数: 位置部分
-    v_world = R_mat @ v_body
-    # dual部分导数由四元数导数和速度给出
+    # DQ导数: dual部分需要角速度 + 速度两项
+    # d_dot = 0.5 * (Omega(omega) @ d + H_r_plus(q) @ [0, v_body])
     d = dq[4:8]
-    d_dot = 0.5 * (np.array([
+    omega_mat_d = np.array([
         [0, -wx, -wy, -wz],
         [wx,  0,  wz, -wy],
         [wy, -wz,  0,  wx],
-        [wz,  wy, -wx,  0]]) @ d)
+        [wz,  wy, -wx,  0]])
+    # H+(qr) 矩阵: qr ⊗ [0, v_body]
+    H_r = np.array([
+        [q[0], -q[1], -q[2], -q[3]],
+        [q[1],  q[0], -q[3],  q[2]],
+        [q[2],  q[3],  q[0], -q[1]],
+        [q[3], -q[2],  q[1],  q[0]]])
+    v_quat = np.array([0, v_body[0], v_body[1], v_body[2]])
+    d_dot = 0.5 * (omega_mat_d @ d + H_r @ v_quat)
 
     dq_dot = np.hstack([q_dot, d_dot])
 
@@ -719,7 +726,7 @@ def plot_results(hist, dt):
         axs[4].plot(time_u, hist['u'][:, 1], label='wy (body-y rate)')
         axs[4].plot(time_u, hist['u'][:, 2], label='wz (body-z rate)')
         axs[4].set_ylabel('Body Ang. Vel [rad/s]')
-        axs[5].plot(time_u, hist['u'][:, 3], label='Thrust [N]'); axs[5].set_ylabel('Thrust [N]'); axs[5].set_xlabel('Time [s]')
+        axs[5].plot(time_u, hist['u'][:, 3] * MASS, label='Thrust [N]'); axs[5].set_ylabel('Thrust [N]'); axs[5].set_xlabel('Time [s]')
 
     for ax in axs:
         ax.grid(True); ax.legend()
