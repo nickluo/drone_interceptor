@@ -1020,7 +1020,7 @@ private:
 };
 
 // Helper to normalize quaternion
-Eigen::Vector4d normalize_quaternion(const Eigen::Vector4d& quat) {
+inline Eigen::Vector4d normalize_quaternion(const Eigen::Vector4d& quat) {
     double norm = quat.norm();
     if (norm > 1e-8) {
         return quat / norm;
@@ -1031,7 +1031,7 @@ Eigen::Vector4d normalize_quaternion(const Eigen::Vector4d& quat) {
 }
 
 // Helper to get yaw angle from quaternion
-double get_yaw_from_quaternion(const Eigen::Vector4d& quat) {
+inline double get_yaw_from_quaternion(const Eigen::Vector4d& quat) {
     double qw = quat(0), qx = quat(1), qy = quat(2), qz = quat(3);
     double siny_cosp = 2 * (qw * qz + qx * qy);
     double cosy_cosp = 1 - 2 * (qy * qy + qz * qz);
@@ -1039,7 +1039,7 @@ double get_yaw_from_quaternion(const Eigen::Vector4d& quat) {
 }
 
 // 四元数积分函数
-Eigen::Vector4d integrate_quaternion(const Eigen::Vector4d& quat, const Eigen::Vector3d& body_rates, double dt) {
+inline Eigen::Vector4d integrate_quaternion(const Eigen::Vector4d& quat, const Eigen::Vector3d& body_rates, double dt) {
     // 使用四元数微分方程进行积分
     double p = body_rates(0), q = body_rates(1), r = body_rates(2);
     

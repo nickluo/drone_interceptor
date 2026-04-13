@@ -1,0 +1,76 @@
+interceptor_node_dq:
+  ros__parameters:
+    use_simulation: false
+    
+    # Physics parameters
+    physics:
+      g: 9.80665
+      drag_coeff: 0.1625  # Linear drag coefficient
+    
+    # Control limits  
+    limits:
+      att_warning_deg: 45.0       # pi/4 rad (45 degrees)
+    
+    # MPC parameters (DQ: EXTERNAL cost, N=40, tf=0.8s)
+    mpc:
+      ctrl_rate: 50
+      tf: 0.8
+      v_desired: 10.0
+      tracking_distance: 0.0   # Desired tracking distance, interception only if 0.0
+
+    # Proportional Navigation (PN) Terminal Guidance
+    pn:
+      enabled: true
+      nav_constant: 5.0      # Navigation constant (N)
+      switch_dist: 7.0       # Distance to switch to PN (v7c: reduced from 10, MPC handles approach better than PN)
+      fov_switch_deg: 3.0    # Switch only if target within this FOV (degrees)
+      max_accel_xy: 25.0     # Max horizontal acceleration (m/s^2)
+      max_accel_z: 15.0      # Max vertical acceleration (m/s^2)
+      drag_ff_coeff: 0.5     # PN drag feedforward coefficient (1/s), matches actual flight drag
+      tau_attitude: 0.4      # PN attitude controller time constant (v7c: reverted from 0.25, lower caused PN oscillation/saturation)
+    
+    # Simulation parameters
+    # sim:
+    #   interception_dist: 0.8
+    #   initial_conditions:
+    #     target_pos: [0.0, 8.0, 42.0]
+    #     target_vel: [0.0, 0.0, 0.0]
+    
+    # Perception parameters
+    perception:
+      bbox_pos_std_dev: 3.0
+      bbox_size_std_dev: 3.0
+      target_physical_size_est: 1.0
+      detection_latency: 0.08   # Detection pipeline latency (seconds)
+    
+    # Control execution delay compensation
+    control:
+      execution_delay: 0.01  # 10ms delay compensation for AirSim
+      rate_tc: 0.02          # First-order response time constant for body rates
+      max_history_time_factor: 2.0
+      rate_control_enabled: true
+    
+    # Camera parameters (AirSim)
+    camera:
+      width_px: 960
+      height_px: 960
+      fov_deg: 30.0
+
+    gimbal:
+      rp_coeff: 12.0
+      y_coeff: 10.0
+    
+    # DQ cost function weights (passed as parameters, weights embedded in NONLINEAR_LS residual)
+    # NOTE: effective ω_dot cost = w_control_tau / rp_rate_max² × ω_dot²
+    #   w_control_tau=1.0 → 0.025×ω_dot², allows ~0.5-0.7 rad/s pitch at boot
+    #   v5 was too conservative (200-500× quat control penalties). v6 rebalances.
+    cost:
+      w_los: 100.0             # Camera-frame LOS error weight (unchanged)
+      w_zem: 10.0              # Zero Effort Miss weight (unchanged)
+      w_closing: 0.3           # Closing speed weight (v6: 2× v5, 3× quat — stronger closing incentive)
+      w_align: 5.0             # Velocity alignment weight (v7c: reverted from 10, competes with closing in DQ body-frame)
+      w_control_F: 0.001       # Thrust acceleration regularization
+      w_control_tau: 1.0       # Angular rate command regularization (v6: halved, allow faster rotation)
+      w_tilt: 0.01             # Tilt angle penalty (v6: 5× reduction, allow tilting for accel)
+      w_omega: 0.001           # Angular velocity regularization (v7: match quaternion rates penalty, was 0.05)
+      w_fov: 10.0              # Camera FOV barrier cost (unchanged)

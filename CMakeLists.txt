@@ -106,6 +106,7 @@ include_directories(
     
 # Quaternion version
 add_executable(interceptor_node_quaternion
+    src/interceptor_node_base.cpp
     src/interceptor_node_quaternion.cpp
 
     ${ACADOS_GENERATED_CODE_DIR}/drone_interceptor_mpc_quat_model/drone_interceptor_mpc_quat_expl_ode_fun.c
@@ -148,9 +149,55 @@ target_link_libraries(interceptor_node_quaternion
 )
 
 
+# Dual Quaternion version (NONLINEAR_LS cost)
+add_executable(interceptor_node_dq
+    src/interceptor_node_base.cpp
+    src/interceptor_node_dq.cpp
+
+    ${ACADOS_GENERATED_CODE_DIR}/drone_interceptor_dq_model/drone_interceptor_dq_expl_ode_fun.c
+    ${ACADOS_GENERATED_CODE_DIR}/drone_interceptor_dq_model/drone_interceptor_dq_expl_vde_forw.c
+    ${ACADOS_GENERATED_CODE_DIR}/drone_interceptor_dq_model/drone_interceptor_dq_expl_vde_adj.c
+
+    ${ACADOS_GENERATED_CODE_DIR}/drone_interceptor_dq_cost/drone_interceptor_dq_cost_y_0_fun.c
+    ${ACADOS_GENERATED_CODE_DIR}/drone_interceptor_dq_cost/drone_interceptor_dq_cost_y_0_fun_jac_ut_xt.c
+    ${ACADOS_GENERATED_CODE_DIR}/drone_interceptor_dq_cost/drone_interceptor_dq_cost_y_0_hess.c
+    ${ACADOS_GENERATED_CODE_DIR}/drone_interceptor_dq_cost/drone_interceptor_dq_cost_y_fun.c
+    ${ACADOS_GENERATED_CODE_DIR}/drone_interceptor_dq_cost/drone_interceptor_dq_cost_y_fun_jac_ut_xt.c
+    ${ACADOS_GENERATED_CODE_DIR}/drone_interceptor_dq_cost/drone_interceptor_dq_cost_y_hess.c
+    ${ACADOS_GENERATED_CODE_DIR}/drone_interceptor_dq_cost/drone_interceptor_dq_cost_y_e_fun.c
+    ${ACADOS_GENERATED_CODE_DIR}/drone_interceptor_dq_cost/drone_interceptor_dq_cost_y_e_fun_jac_ut_xt.c
+    ${ACADOS_GENERATED_CODE_DIR}/drone_interceptor_dq_cost/drone_interceptor_dq_cost_y_e_hess.c
+
+    ${ACADOS_GENERATED_CODE_DIR}/acados_solver_drone_interceptor_dq.c
+)
+
+ament_target_dependencies(interceptor_node_dq
+    rclcpp
+    geometry_msgs
+    nav_msgs
+    vision_msgs
+    quadrotor_msgs
+    sensor_msgs
+    std_msgs
+    mavros_msgs
+)
+
+target_link_directories(interceptor_node_dq PRIVATE
+    ${ACADOS_GENERATED_CODE_DIR}
+)
+
+target_link_libraries(interceptor_node_dq
+    acados
+    blasfeo
+    hpipm
+    m
+)
+
+
 install(TARGETS
 #   interceptor_node
   interceptor_node_quaternion
+  interceptor_node_dq
   DESTINATION lib/${PROJECT_NAME} 
 )
 

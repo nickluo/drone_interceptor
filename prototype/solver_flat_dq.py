@@ -87,16 +87,19 @@ GIMBAL_DISTURBANCE_COEFF = 0.5
 
 # ==============================================================================
 # DQ-NMPC 代价权重
+# NOTE: effective ω_dot cost = w_control_tau / rp_rate_max² × ω_dot²
+#   w_control_tau=0.5 → ~0.013×ω_dot², comparable to quat variant (0.01×ω_dot²)
+#   Too-weak regularization causes oscillation via ctrl_coeff_ model mismatch.
 # ==============================================================================
-W_LOS = 80.0              # 相机帧LOS误差权重 (2x: 平衡z轴跟踪与追击速度)
-W_ZEM = 35.0              # 零效果脱靶量(ZEM)权重
-W_CLOSING = 0.5           # 接近速度权重 (适度降低: 保持追击能力)
-W_ALIGN = 5.0             # 速度对齐权重 (vel方向沿LOS)
-W_CONTROL_F = 0.005       # 推力加速度正则化权重
-W_CONTROL_TAU = 0.05      # 角速度命令正则化权重 (含1/tc²放大)
-W_TILT = 0.0005           # 倾斜角惩罚权重
-W_OMEGA = 0.003           # 角速度正则化权重
-W_FOV = 100.0             # 相机FOV栏栅代价权重 (适度降低)
+W_LOS = 100.0             # 相机帧LOS误差权重 (increased: prioritize boresight alignment)
+W_ZEM = 10.0              # 零效果脱靶量(ZEM)权重 (reduced: less aggressive lateral correction)
+W_CLOSING = 0.3           # 接近速度权重 (v6: 2× v5, 3× quat — stronger closing incentive)
+W_ALIGN = 5.0             # 速度对齐权重 (v7c: reverted from 10, competes with closing in DQ body-frame)
+W_CONTROL_F = 0.001       # 推力加速度正则化权重
+W_CONTROL_TAU = 1.0       # 角速度命令正则化权重 (v6: halved, allow faster rotation)
+W_TILT = 0.01             # 倾斜角惩罚权重 (v6: 5× reduction, allow tilting for accel)
+W_OMEGA = 0.001           # 角速度正则化权重 (v7: match quaternion rates penalty, was 0.05)
+W_FOV = 10.0              # 相机FOV栏栅代价权重 (v4: soft, no snap-back oscillation)
 
 # 权重向量 (直接值, EXTERNAL代价类型直接使用)
 W_COST = np.array([
@@ -109,9 +112,9 @@ W_COST = np.array([
 # PN 导引律参数 (当前禁用: EKF位置误差大时PN发散)
 # ==============================================================================
 PN_ENABLED = False
-PN_NAV_CONSTANT = 4.0
-PN_SWITCH_DIST = 10.0
-PN_FOV_SWITCH_DEG = 10.0
+PN_NAV_CONSTANT = 5.0
+PN_SWITCH_DIST = 20.0
+PN_FOV_SWITCH_DEG = 8.0
 
 # ==============================================================================
 # 初始条件
