@@ -193,11 +193,30 @@ target_link_libraries(interceptor_node_dq
     m
 )
 
+# Relative IMM-UKF version
+add_executable(interceptor_node_relative_imm_ukf
+    src/interceptor_node_relative_imm_ukf.cpp
+)
+
+ament_target_dependencies(interceptor_node_relative_imm_ukf
+    rclcpp
+    geometry_msgs
+    nav_msgs
+    vision_msgs
+    quadrotor_msgs
+    sensor_msgs
+    std_msgs
+    mavros_msgs
+)
+
+target_link_libraries(interceptor_node_relative_imm_ukf
+    m
+)
 
 install(TARGETS
-#   interceptor_node
   interceptor_node_quaternion
   interceptor_node_dq
+  interceptor_node_relative_imm_ukf
   DESTINATION lib/${PROJECT_NAME} 
 )
 

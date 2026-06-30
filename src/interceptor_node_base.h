@@ -232,6 +232,8 @@ protected:
 
     // Gimbal
     double gimbal_rp_coeff_, gimbal_y_coeff_;
+    bool camera_fixed_ = false;
+    double camera_pitch_deg_ = 0.0;
 
     // ROS interfaces
     rclcpp::CallbackGroup::SharedPtr sub_callback_group_;

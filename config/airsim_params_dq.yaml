@@ -15,12 +15,12 @@ interceptor_node_dq:
     mpc:
       ctrl_rate: 50
       tf: 0.8
-      v_desired: 10.0
+      v_desired: 5.0
       tracking_distance: 0.0   # Desired tracking distance, interception only if 0.0
 
     # Proportional Navigation (PN) Terminal Guidance
     pn:
-      enabled: true
+      enabled: false
       nav_constant: 5.0      # Navigation constant (N)
       switch_dist: 7.0       # Distance to switch to PN (v7c: reduced from 10, MPC handles approach better than PN)
       fov_switch_deg: 3.0    # Switch only if target within this FOV (degrees)
@@ -52,9 +52,11 @@ interceptor_node_dq:
     
     # Camera parameters (AirSim)
     camera:
+      fixed: true
+      pitch_deg: 15.0
       width_px: 960
       height_px: 960
-      fov_deg: 30.0
+      fov_deg: 60.0
 
     gimbal:
       rp_coeff: 12.0

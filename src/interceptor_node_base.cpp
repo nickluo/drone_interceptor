@@ -194,6 +194,8 @@ void InterceptorNodeBase::declare_common_parameters()
 
     this->declare_parameter<double>("gimbal.rp_coeff", 1.2);
     this->declare_parameter<double>("gimbal.y_coeff", 1.5);
+    this->declare_parameter<bool>("camera.fixed", false);
+    this->declare_parameter<double>("camera.pitch_deg", 0.0);
 }
 
 void InterceptorNodeBase::load_common_parameters()
@@ -227,6 +229,8 @@ void InterceptorNodeBase::load_common_parameters()
 
     this->get_parameter("gimbal.rp_coeff", gimbal_rp_coeff_);
     this->get_parameter("gimbal.y_coeff", gimbal_y_coeff_);
+    this->get_parameter("camera.fixed", camera_fixed_);
+    this->get_parameter("camera.pitch_deg", camera_pitch_deg_);
 
     // Camera
     double cam_focal_mm, cam_pixel_um;
@@ -328,7 +332,16 @@ void InterceptorNodeBase::odom_callback(const nav_msgs::msg::Odometry::SharedPtr
         }
     }
 
-    if (!gimbal_received_) {
+    if (camera_fixed_) {
+        std::unique_lock<std::shared_mutex> lock(mtx_ekf_);
+        if (ekf_->is_initialized()) {
+            double pitch_rad = -camera_pitch_deg_ * M_PI / 180.0;
+            Eigen::Matrix3d R_B_C;
+            R_B_C = Eigen::AngleAxisd(pitch_rad, Eigen::Vector3d::UnitY());
+            Eigen::Vector3d w_cam = R_B_C * omega;
+            ekf_->predict(rclcpp::Time(msg->header.stamp).nanoseconds() / 1000, w_cam, true);
+        }
+    } else if (!gimbal_received_) {
         std::unique_lock<std::shared_mutex> lock(mtx_ekf_);
         if (ekf_->is_initialized()) {
             Eigen::Vector3d w_world = q * omega;
@@ -415,7 +428,12 @@ void InterceptorNodeBase::bbox_callback(const vision_msgs::msg::Detection2D::Sha
 
         Eigen::Vector3d drone_pos = get_position(curr_drone_state_for_ekf);
         Eigen::Quaterniond q_C_W;
-        if (gimbal_received_) {
+        if (camera_fixed_) {
+            Eigen::Vector4d quat = get_quaternion(curr_drone_state_for_ekf);
+            Eigen::Quaterniond q_B_W(quat(0), quat(1), quat(2), quat(3));
+            Eigen::Quaterniond q_C_B(Eigen::AngleAxisd(camera_pitch_deg_ * M_PI / 180.0, Eigen::Vector3d::UnitY()));
+            q_C_W = q_B_W * q_C_B;
+        } else if (gimbal_received_) {
             std::shared_lock<std::shared_mutex> lock(mtx_gimbal_);
             q_C_W = current_gimbal_orientation_;
         } else {
@@ -578,7 +596,12 @@ void InterceptorNodeBase::real_loop()
         curr_drone_state = drone_state_;
     }
 
-    if (gimbal_received_) {
+    if (camera_fixed_) {
+        Eigen::Vector4d quat = get_quaternion(curr_drone_state);
+        Eigen::Quaterniond q_B_W(quat(0), quat(1), quat(2), quat(3));
+        Eigen::Quaterniond q_C_B(Eigen::AngleAxisd(camera_pitch_deg_ * M_PI / 180.0, Eigen::Vector3d::UnitY()));
+        gimbal_orientation = q_B_W * q_C_B;
+    } else if (gimbal_received_) {
         std::shared_lock<std::shared_mutex> lock(mtx_gimbal_);
         gimbal_orientation = current_gimbal_orientation_;
     } else {

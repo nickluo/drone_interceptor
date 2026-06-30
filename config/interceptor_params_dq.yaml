@@ -52,6 +52,8 @@ interceptor_node_dq:
     
     # Camera parameters (real hardware — MV-IMX265M)
     camera:
+      fixed: true
+      pitch_deg: 15.0
       width_px: 960
       height_px: 960
       native_width_px: 1520

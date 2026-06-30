@@ -3,3 +3,8 @@ __pycache__/
 build/
 c_generated_code/
 prototype/*.json
+prototype/*.txt
+prototype/*.csv
+prototype/*.png
+.agents/
+skills-lock.json

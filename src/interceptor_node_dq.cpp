@@ -120,6 +120,29 @@ void InterceptorNodeDQ::encode_odom(Eigen::VectorXd& s,
     s.segment<4>(4) = d;
     s.segment<3>(8) = omega;
     s.segment<3>(11) = vel_body;  // DQ uses body-frame velocity directly
+
+    if (camera_fixed_) {
+        gimbal_received_ = true;
+        // Equivalent gimbal calculation: R_gimbal = R_C_B.transpose() * R_B_W.transpose() * R_yaw_W
+        double psi = get_yaw_from_quaternion(q);
+        Eigen::Matrix3d R_yaw_W = Eigen::AngleAxisd(psi, Eigen::Vector3d::UnitZ()).toRotationMatrix();
+        Eigen::Matrix3d R_B_W = q_eigen.toRotationMatrix();
+        Eigen::Matrix3d R_C_B = Eigen::AngleAxisd(camera_pitch_deg_ * M_PI / 180.0, Eigen::Vector3d::UnitY()).toRotationMatrix();
+        Eigen::Matrix3d R_gimbal = R_C_B.transpose() * R_B_W.transpose() * R_yaw_W;
+
+        // Extract roll, pitch, yaw from R_gimbal (Y-X-Z intrinsic sequence in drone_model_dq.py)
+        double roll = std::asin(std::clamp(R_gimbal(1, 2), -1.0, 1.0));
+        double yaw = std::atan2(-R_gimbal(1, 0), R_gimbal(1, 1));
+        double pitch = std::atan2(-R_gimbal(0, 2), R_gimbal(2, 2));
+
+        s.segment<3>(14) << roll, pitch, yaw;
+
+        // Update current_gimbal_orientation_ to full camera-to-world orientation
+        {
+            std::unique_lock<std::shared_mutex> lock(mtx_gimbal_);
+            current_gimbal_orientation_ = q_eigen * Eigen::Quaterniond(R_C_B);
+        }
+    }
 }
 
 // ============================================================================
@@ -167,6 +190,8 @@ void InterceptorNodeDQ::pack_and_set_mpc_params(
     // DQ parameter layout (19D):
     //   [target_pos(3), target_vel(3), v_desired, drag_coeff, W_cost(9), gimbal_rp_coeff, gimbal_y_coeff]
     VectorPDQ p_vec;
+    double rp_coeff = camera_fixed_ ? 0.0 : gimbal_rp_coeff_;
+    double y_coeff = camera_fixed_ ? 0.0 : gimbal_y_coeff_;
     for (int k = 0; k <= N_HORIZON_; ++k) {
         Eigen::Vector3d predicted_target_pos = pos_est + (k * dt_) * vel_est;
         double tracking_coeff = 1.0;
@@ -181,7 +206,7 @@ void InterceptorNodeDQ::pack_and_set_mpc_params(
         p_vec << predicted_target_pos, vel_est,
                  tracking_coeff * V_DESIRED_, DRAG_COEFF_,
                  w_cost_,
-                 gimbal_rp_coeff_, gimbal_y_coeff_;
+                 rp_coeff, y_coeff;
         drone_interceptor_dq_acados_update_params(acados_capsule_, k, p_vec.data(), p_vec.size());
     }
 }
