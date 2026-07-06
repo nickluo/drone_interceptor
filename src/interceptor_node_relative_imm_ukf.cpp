@@ -617,6 +617,13 @@ public:
     double last_axial_accel_ = 0.0;
     double last_t_ = -1.0;
     bool has_last_ = false;
+    // Vertical-accel slew-limit state (Fix C): bounds |da_z/dt|.
+    double last_a_z_ = 0.0;
+    double last_az_t_ = -1.0;
+    bool has_last_az_ = false;
+    double a_z_slew_ = 8.0;   // m/s^3, rate limit on the vertical accel command
+    double lateral_decay_floor_ = 0.4;  // Fix D: a_lat_mag floor at terminal_brake_range (close-range weave damp)
+    double lat_decay_start_ = 25.0;     // Fix F: range at which the close-range lateral attenuation begins (m)
     double max_body_rate_ = 3.0;
     double terminal_brake_range_ = 5.0;
     double terminal_brake_floor_ = 1.0;
@@ -678,7 +685,13 @@ public:
         has_last_att_ = false;
         last_phi_cmd_f_ = 0.0;
         last_theta_cmd_f_ = 0.0;
+        last_a_z_ = 0.0;
+        last_az_t_ = -1.0;
+        has_last_az_ = false;
     }
+    void set_a_z_slew(double v) { a_z_slew_ = (v > 0.0) ? v : 1e9; }  // <=0 disables the slew limit
+    void set_lateral_decay_floor(double v) { lateral_decay_floor_ = clamp(v, 0.0, 1.0); }
+    void set_lat_decay_start(double v) { lat_decay_start_ = std::max(v, terminal_brake_range_ + 1.0); }
 
     // Decoupled control. Inputs:
     //   r_est, v_est : target rel pos/vel in NAV frame (v_est noisy, used only for LOS rate)
@@ -703,14 +716,19 @@ public:
             omega_los = r_est.cross(v_est) / (r_norm * r_norm);
         }
         // LOS angular rate (lambda_dot) source. omega_los(2) = (r x v_est)_z / |r_xy|^2 is the
-        // textbook PN LOS rate, but at close range v_est is noisy (observed +/-12 m/s jumps in
-        // AirSim) and the 1/|r_xy| scaling blows it up -> violent banked turns. los_rate is the
-        // EMA-smoothed derivative of the *measured* bearing (los_az_world), algebraically equal to
-        // omega_los(2) when v_est is exact, but bounded and noise-robust. It is the primary source;
-        // omega_los(2) is kept only as a turn-direction fallback while the bearing-rate EMA warms.
+        // textbook PN LOS rate, but v_est is noisy (observed +/-12..18 m/s jumps in AirSim) and the
+        // 1/|r_xy| scaling blows it up -> violent banked turns. los_rate is the EMA-smoothed
+        // derivative of the *measured* bearing (los_az_world) — bounded and noise-robust — and is
+        // the ONLY source. The old `if (|lambda_dot| < 1e-4) lambda_dot = omega_los(2)` fallback was
+        // meant for warmup but fired whenever the bearing rate was small, injecting the noisy v_est
+        // term and sign-flipping lambda_dot -> a_lat sign-flip -> phi_cmd bang-bang -> the roll
+        // limit-cycle (omega_x saturating +-max_body_rate) seen in AirSim.
         double lambda_dot = los_rate;
-        if (std::abs(lambda_dot) < 1e-4) {
-            lambda_dot = omega_los(2);
+        // Deadband: a steady bearing (<0.02 rad/s) yields ZERO lateral lead. Stops residual bearing
+        // noise around zero from sign-flipping a_lat. Real bearing rates for a turning/moving target
+        // are well above this, so PN lead against maneuvering targets is preserved.
+        if (std::abs(lambda_dot) < 0.02) {
+            lambda_dot = 0.0;
         }
         const double omega_los_mag = std::min(std::abs(lambda_dot), 1.0);
         double N_eff = N;
@@ -739,6 +757,17 @@ public:
         const double az_excess = clamp((std::abs(los_az) - az_edge) /
                                        std::max(fov_half_h_ - az_edge, 1e-6), 0.0, 1.0);
         a_lat_mag *= (1.0 - az_excess);
+        // Close-range lateral attenuation (Fix D/F): at v_des=20 the full PN gain is a closed-loop
+        // instability — the bearing-rate loop over-corrects, lambda_dot sign-flips, phi_cmd rails
+        // ±max_tilt_terminal and omega_x saturates ±max_body_rate (the close-approach weave seen in
+        // AirSim, occurring as far out as ~26 m). GENTLY scale a_lat_mag down toward
+        // lateral_decay_floor_ over [terminal_brake_range, lat_decay_start_]. NOT a hard zero (the
+        // old zero trailed maneuvering targets); a 0.4 floor keeps enough PN lead to track a turn
+        // while damping the weave. Window widened 12 -> 25 m (Fix F) so the 22-27 m weave zone is
+        // covered. No-op at mid-course (r >= lat_decay_start_).
+        const double lat_f = clamp((r_norm - terminal_brake_range_) /
+                                   std::max(lat_decay_start_ - terminal_brake_range_, 1.0), 0.0, 1.0);
+        a_lat_mag *= lateral_decay_floor_ + (1.0 - lateral_decay_floor_) * lat_f;
         // Lateral direction in world horizontal plane: perpendicular to LOS projected to xy.
         Eigen::Vector2d e_los_xy(r_est(0), r_est(1));
         if (e_los_xy.norm() < 1e-3) e_los_xy << 1.0, 0.0;
@@ -816,6 +845,19 @@ public:
         // -K_zd*v_z term this is a pure spring (zeta=0) -> the +/-4 m z porpoising that caused
         // the AirSim miss (pursuer blasts through co-altitude at ~6 m/s). v_z is clean odom.
         double a_z = clamp(K_z_ * dz_target - K_zd_ * v_z, -4.0, 4.0);
+        // Slew limit |da_z/dt|: the z-estimate can jump O(10 m) in one cycle (monocular scale +
+        // estimator update), which would step a_z straight to +-4 and pitch the body over. Bound it
+        // like the axial jerk limit so vertical accel ramps instead of stepping.
+        if (has_last_az_ && t > last_az_t_) {
+            const double dt_az = t - last_az_t_;
+            if (dt_az > 0.0 && dt_az < 1.0) {
+                a_z = clamp(a_z, last_a_z_ - a_z_slew_ * dt_az,
+                            last_a_z_ + a_z_slew_ * dt_az);
+            }
+        }
+        last_a_z_ = a_z;
+        last_az_t_ = t;
+        has_last_az_ = true;
         // Soft vertical velocity limiter: linearly decay a_z toward zero as |v_z| grows from
         // v_z_soft_start (4) to v_z_hard_zero (8). Only attenuates the component that would
         // increase |v_z| (same sign as v_z), allowing braking accel to pass through.
@@ -979,14 +1021,18 @@ public:
         this->declare_parameter<double>("controller.terminal_range", 10.0);
         this->declare_parameter<double>("controller.terminal_N", 3.0);
         this->declare_parameter<double>("controller.v_pn_ref", 12.0);
-        this->declare_parameter<double>("controller.max_att_rate", 5.0);
+        this->declare_parameter<double>("controller.max_att_rate", 3.5);   // Fix G: clamp |d(phi/theta)_cmd/dt| (was 5)
         this->declare_parameter<double>("controller.att_ref_tc", 0.15);
         this->declare_parameter<double>("controller.max_tilt_terminal_deg", 45.0);
         this->declare_parameter<double>("controller.terminal_tilt_range", 15.0);
         this->declare_parameter<double>("controller.terminal_decel_range", 30.0);
         this->declare_parameter<double>("controller.v_terminal", 12.0);
+        this->declare_parameter<double>("controller.a_z_slew", 20.0);   // Fix C/E: |da_z/dt| limit (m/s^3)
+        this->declare_parameter<double>("controller.lateral_decay_floor", 0.4);  // Fix D: close-range a_lat floor
+        this->declare_parameter<double>("controller.lateral_decay_start", 25.0); // Fix F: range lateral attenuation begins (m)
         this->declare_parameter<double>("estimation.dt_cam", 0.033);
         this->declare_parameter<double>("estimation.W_guess", 1.5);
+        this->declare_parameter<double>("estimation.vel_smooth_tc", 0.25);  // Fix B: target-vel EMA (s, 0=off)
         this->declare_parameter<double>("system.control_rate", 100.0);
         this->declare_parameter<double>("control.rate_tc", 0.02);
         this->declare_parameter<bool>("control.rate_control_attenuation", true);
@@ -1005,6 +1051,11 @@ public:
 
         odom_sub_ = this->create_subscription<nav_msgs::msg::Odometry>(
             "/fpv/odom", rclcpp::SensorDataQoS(), std::bind(&InterceptorNodeRelativeIMMUKF::odom_callback, this, std::placeholders::_1), sub_options);
+
+        // IMU gyro for collision detection (AirSim/real HW). Subscribed always; only consumed for
+        // !use_simulation_. Prefer this over odom twist.angular (raw, higher rate).
+        imu_sub_ = this->create_subscription<sensor_msgs::msg::Imu>(
+            "/mavros/imu/data", rclcpp::SensorDataQoS(), std::bind(&InterceptorNodeRelativeIMMUKF::imu_callback, this, std::placeholders::_1), sub_options);
 
         bbox_sub_ = this->create_subscription<vision_msgs::msg::Detection2D>(
             "/fpv/target_bbox", 10, std::bind(&InterceptorNodeRelativeIMMUKF::bbox_callback, this, std::placeholders::_1), sub_options);
@@ -1025,6 +1076,7 @@ private:
         cam_fov_deg_ = this->get_parameter("camera.fov_deg").as_double();
         const double pitch_deg = this->get_parameter("camera.mount_pitch_deg").as_double();
         const bool use_simulation = this->get_parameter("use_simulation").as_bool();
+        use_simulation_ = use_simulation;   // mirrors InterceptorNodeBase; gates gyro collision detect
         std::vector<double> R_flat = this->get_parameter("extrinsics.body_to_camera_rotation").as_double_array();
         Eigen::Matrix3d R_b2c_base;
         for (int i = 0; i < 3; ++i) {
@@ -1089,6 +1141,10 @@ private:
             max_body_rate, terminal_brake_range, terminal_brake_floor, terminal_bbox_size, K_z, K_zd,
             v_pn_ref, max_att_rate, att_ref_tc,
             max_tilt_terminal_deg, terminal_tilt_range, terminal_decel_range, v_terminal);
+        controller_->set_a_z_slew(this->get_parameter("controller.a_z_slew").as_double());
+        controller_->set_lateral_decay_floor(this->get_parameter("controller.lateral_decay_floor").as_double());
+        controller_->set_lat_decay_start(this->get_parameter("controller.lateral_decay_start").as_double());
+        vel_smooth_tc_ = this->get_parameter("estimation.vel_smooth_tc").as_double();
 
     }
 
@@ -1149,6 +1205,21 @@ private:
 
         Eigen::Vector3d target_pos_now = result.second.segment<3>(0);
         Eigen::Vector3d target_vel_now = result.second.segment<3>(3);
+        // Output smoothing of the absolute target velocity (Fix B): the raw UKF velocity estimate
+        // swings +/-12..18 m/s cycle-to-cycle in AirSim. EMA it so the cached v_est / target_speed
+        // (which drive the speed-aware brake floor) are stable. vel_smooth_tc_<=0 disables it.
+        if (vel_smooth_tc_ > 1e-6) {
+            if (has_target_vel_smoothed_ && t_now > last_vel_smooth_t_ &&
+                (t_now - last_vel_smooth_t_) < 1.0) {
+                const double a = clamp((t_now - last_vel_smooth_t_) / vel_smooth_tc_, 0.0, 1.0);
+                target_vel_smoothed_ += a * (target_vel_now - target_vel_smoothed_);
+            } else {
+                target_vel_smoothed_ = target_vel_now;
+            }
+            last_vel_smooth_t_ = t_now;
+            has_target_vel_smoothed_ = true;
+            target_vel_now = target_vel_smoothed_;
+        }
 
         Eigen::Vector3d r_est;
         Eigen::Vector3d v_est;
@@ -1250,12 +1321,14 @@ private:
 
         Eigen::Matrix3d R_b2n;
         Eigen::Vector3d odom_vel = Eigen::Vector3d::Zero();
+        Eigen::Vector3d gyro = Eigen::Vector3d::Zero();
         double t_now = 0.0;
         double sim_start_time = -1.0;
         {
             std::lock_guard<std::mutex> odom_lock(odom_mtx_);
             R_b2n = latest_R_b2n_;
             odom_vel = latest_odom_vel_;
+            gyro = latest_gyro_;
             t_now = (last_imu_time_ > 0.0) ? last_imu_time_ : now.seconds();
             sim_start_time = sim_start_time_;
         }
@@ -1287,6 +1360,28 @@ private:
         prev_R_b2n_ = R_b2n;
         prev_attitude_t_ = t_now;
         has_prev_attitude_ = true;
+
+        // Collision detection (gyro spike) — AirSim / real HW only (mirror InterceptorNodeBase).
+        // The ROS2 Python sim (use_simulation_=true) has ground-truth range and judges the intercept
+        // externally (ros2_sim_node.py), so the gyro check is skipped there. On contact the body rate
+        // spikes well beyond what was commanded -> declare COMPLETED (intercept success) and stop.
+        if (!use_simulation_ && !collision_detected_) {
+            const Eigen::Vector3d rate_error = gyro - last_cmd_;
+            const double rate_error_norm = rate_error.norm();
+            if (rate_error_norm > 4.0) {
+                collision_detected_ = true;
+                RCLCPP_WARN(this->get_logger(),
+                    "[COLLISION] Gyro spike! |err|=%.1f rad/s gyro=[%.2f,%.2f,%.2f] "
+                    "cmd=[%.2f,%.2f,%.2f] vel=[%.1f,%.1f,%.1f]",
+                    rate_error_norm,
+                    gyro.x(), gyro.y(), gyro.z(),
+                    last_cmd_.x(), last_cmd_.y(), last_cmd_.z(),
+                    odom_vel.x(), odom_vel.y(), odom_vel.z());
+                transition_to_state(MissionState::COMPLETED, "Collision detected via gyro");
+                stop();
+                return;
+            }
+        }
 
         // Capture lockout: latch true once the UAV has intercepted, then BRAKE-TO-HOLD for the rest
         // of the mission. Resuming normal guidance after a close approach — bbox flickered back or
@@ -1330,12 +1425,10 @@ private:
             cmd->armed = true;
             cmd->control_mode = quadrotor_msgs::msg::ControlCommand::BODY_RATES;
             cmd->collective_thrust = g_hover / std::max(std::cos(tilt), 0.3);
-            cmd->bodyrates.x = clamp(-3.0 * roll, -3.0, 3.0);
-            cmd->bodyrates.y = clamp(5.0 * (theta_brake - pitch), -3.0, 3.0);
+            cmd->bodyrates.x = clamp(-3.0 * roll, -3.0, 3.0) * ctrl_coeff_;
+            cmd->bodyrates.y = clamp(5.0 * (theta_brake - pitch), -3.0, 3.0) * ctrl_coeff_;
             cmd->bodyrates.z = 0.0;
-            prev_bodyrate_x_ = cmd->bodyrates.x;
-            prev_bodyrate_y_ = cmd->bodyrates.y;
-            prev_bodyrate_z_ = cmd->bodyrates.z;
+            last_cmd_ = Eigen::Vector3d(cmd->bodyrates.x, cmd->bodyrates.y, cmd->bodyrates.z);
             control_pub_->publish(std::move(cmd));
             return;
         }
@@ -1373,13 +1466,11 @@ private:
                 constexpr double g_hover = 9.81;
                 const double tilt = std::sqrt(roll * roll + pitch * pitch);
                 cmd->collective_thrust = g_hover / std::max(std::cos(tilt), 0.3);
-                cmd->bodyrates.x = clamp(-3.0 * roll, -3.0, 3.0);
-                cmd->bodyrates.y = clamp(-3.0 * pitch, -3.0, 3.0);
+                cmd->bodyrates.x = clamp(-3.0 * roll, -3.0, 3.0) * ctrl_coeff_;
+                cmd->bodyrates.y = clamp(-3.0 * pitch, -3.0, 3.0) * ctrl_coeff_;
                 cmd->bodyrates.z = 0.0;
             }
-            prev_bodyrate_x_ = cmd->bodyrates.x;
-            prev_bodyrate_y_ = cmd->bodyrates.y;
-            prev_bodyrate_z_ = cmd->bodyrates.z;
+            last_cmd_ = Eigen::Vector3d(cmd->bodyrates.x, cmd->bodyrates.y, cmd->bodyrates.z);
             control_pub_->publish(std::move(cmd));
             RCLCPP_INFO_THROTTLE(this->get_logger(), *this->get_clock(), THROTTLE_INTERVAL_MS/2,
                 "%s (terminal dropout): age=%.2fs last_good_range=%.1fm",
@@ -1411,9 +1502,7 @@ private:
         cmd->bodyrates.x = ctrl_coeff_ * ctrl[1];
         cmd->bodyrates.y = ctrl_coeff_ * ctrl[2];
         cmd->bodyrates.z = ctrl_coeff_ * ctrl[3];
-        prev_bodyrate_x_ = cmd->bodyrates.x;
-        prev_bodyrate_y_ = cmd->bodyrates.y;
-        prev_bodyrate_z_ = cmd->bodyrates.z;
+        last_cmd_ = Eigen::Vector3d(cmd->bodyrates.x, cmd->bodyrates.y, cmd->bodyrates.z);
         // Capture the last good (detected) command for terminal coast-on-dropout. Stored AFTER the
         // EMA low-pass so coast reproduces the exact last-published attitude/thrust (straight-line
         // flight) rather than a raw guidance jump.
@@ -1465,9 +1554,7 @@ private:
             }
             last_imu_time_ = -1.0;
             sim_start_time_ = -1.0;
-            prev_bodyrate_x_ = 0.0;
-            prev_bodyrate_y_ = 0.0;
-            prev_bodyrate_z_ = 0.0;
+            last_cmd_ = Eigen::Vector3d::Zero();
             has_prev_attitude_ = false;
             has_prev_los_ = false;
             los_rate_ema_ = 0.0;
@@ -1477,6 +1564,7 @@ private:
             last_bbox_time_ = 0.0;
             captured_ = false;
             min_range_seen_ = 1e9;
+            collision_detected_ = false;
             transition_to_state(MissionState::INITIALIZING, "Mission launch command");
             publish_mission_state(true);
             start_control_timer();
@@ -1489,6 +1577,15 @@ private:
         header->stamp = this->get_clock()->now();
         header->frame_id = msg->data ? "MISSION" : "OFF";
         mission_launch_callback(header);
+    }
+
+    // IMU gyro for collision detection (AirSim/real HW). Body angular velocity, same frame as the
+    // ControlCommand bodyrates. Stored under odom_mtx_ so the control loop reads a consistent sample.
+    void imu_callback(const sensor_msgs::msg::Imu::SharedPtr msg) {
+        std::lock_guard<std::mutex> odom_lock(odom_mtx_);
+        latest_gyro_(0) = msg->angular_velocity.x;
+        latest_gyro_(1) = msg->angular_velocity.y;
+        latest_gyro_(2) = msg->angular_velocity.z;
     }
 
     void odom_callback(const nav_msgs::msg::Odometry::SharedPtr msg) {
@@ -1513,6 +1610,12 @@ private:
         latest_odom_vel_(0) = vel_world(0);
         latest_odom_vel_(1) = vel_world(1);
         latest_odom_vel_(2) = vel_world(2);
+        // Body angular velocity (gyro) for collision detection. mavros local_position/odom twist is
+        // in child_frame_id (base_link = body FLU), so twist.angular IS the body rate — same frame
+        // as the ControlCommand bodyrates we compare it against.
+        latest_gyro_(0) = msg->twist.twist.angular.x;
+        latest_gyro_(1) = msg->twist.twist.angular.y;
+        latest_gyro_(2) = msg->twist.twist.angular.z;
 
         yaw_align_init_ = true;
         has_odom_ = true;
@@ -1560,10 +1663,12 @@ private:
         }
         reset_control_cache();
         publish_mission_state(false);
+        constexpr double g_hover = 9.81;
         auto cmd = std::make_unique<quadrotor_msgs::msg::ControlCommand>();
         cmd->header.stamp = this->get_clock()->now();
-        cmd->armed = false;
-        cmd->control_mode = quadrotor_msgs::msg::ControlCommand::BODY_RATES;
+        cmd->armed = true;
+        cmd->control_mode = quadrotor_msgs::msg::ControlCommand::ATTITUDE;
+        cmd->collective_thrust = g_hover;
         control_pub_->publish(std::move(cmd));
     }
 
@@ -1585,6 +1690,7 @@ private:
     rclcpp::Subscription<std_msgs::msg::Bool>::SharedPtr mission_sub_;
     rclcpp::Subscription<std_msgs::msg::Header>::SharedPtr tracker_trigger_sub_;
     rclcpp::Subscription<nav_msgs::msg::Odometry>::SharedPtr odom_sub_;
+    rclcpp::Subscription<sensor_msgs::msg::Imu>::SharedPtr imu_sub_;
     rclcpp::Subscription<vision_msgs::msg::Detection2D>::SharedPtr bbox_sub_;
     rclcpp::Publisher<quadrotor_msgs::msg::ControlCommand>::SharedPtr control_pub_;
     rclcpp::Publisher<std_msgs::msg::Bool>::SharedPtr mission_state_pub_;
@@ -1621,6 +1727,12 @@ private:
     bool has_odom_ = false;
     Eigen::Vector3d latest_odom_pos_ = Eigen::Vector3d::Zero();
     Eigen::Vector3d latest_odom_vel_ = Eigen::Vector3d::Zero();
+    // Output smoothing of the estimator's absolute target velocity (Fix B): the raw UKF velocity
+    // swings +/-12..18 m/s in AirSim; EMA it (vel_smooth_tc_) before it drives v_est / target_speed.
+    Eigen::Vector3d target_vel_smoothed_ = Eigen::Vector3d::Zero();
+    bool has_target_vel_smoothed_ = false;
+    double last_vel_smooth_t_ = -1.0;
+    double vel_smooth_tc_ = 0.25;   // s, EMA time constant on the target-velocity estimate (0 = off)
     Eigen::Matrix3d latest_R_b2n_raw_ = Eigen::Matrix3d::Identity();
     Eigen::Matrix3d latest_R_b2n_ = Eigen::Matrix3d::Identity();
 
@@ -1647,6 +1759,12 @@ private:
     // the interceptor HOLDS (level-and-hold) for the rest of the mission — resuming normal guidance
     // on a reacquired-and-now-distant target is what flies the UAV off after a clean close approach.
     bool captured_ = false;
+    // Collision detection (AirSim/real HW only, mirror InterceptorNodeBase): a gyro spike vs the
+    // last commanded body rate signals physical contact -> intercept success -> COMPLETED. Gated on
+    // !use_simulation_: the ROS2 Python sim has ground-truth range and judges intercept externally.
+    bool collision_detected_ = false;
+    bool use_simulation_ = false;
+    Eigen::Vector3d latest_gyro_ = Eigen::Vector3d::Zero();   // body angular velocity from odom twist
     // Min estimated range seen this mission (reopen detection): once the range bottoms out and
     // reopens, the UAV flew past the target. More robust than los_az under a noisy close-range
     // estimate (high-noise scenario), where the bearing never cleanly flips past 90 deg.
@@ -1657,10 +1775,7 @@ private:
     double frozen_rate_z_ = 0.0;
 
     double ctrl_coeff_ = 1.0;
-    // Previous published body rates for EMA low-pass on rate output.
-    double prev_bodyrate_x_ = 0.0;
-    double prev_bodyrate_y_ = 0.0;
-    double prev_bodyrate_z_ = 0.0;
+    Eigen::Vector3d last_cmd_ = Eigen::Vector3d::Zero();
 };
 
 int main(int argc, char** argv) {

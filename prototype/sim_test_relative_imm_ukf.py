@@ -75,12 +75,16 @@ CTRL_TERM_BRAKE_RANGE = 5.0
 CTRL_TERM_BRAKE_FLOOR = 1.0
 # Iter 1-3 terminal-authority / oscillation params (mirror C++):
 CTRL_V_PN_REF = 12.0              # cap on v_fwd in PN lateral accel (iter 1)
-CTRL_MAX_ATT_RATE = 5.0           # attitude-reference slew governor |d(phi/theta)_cmd/dt| (iter 1)
+CTRL_MAX_ATT_RATE = 3.5           # attitude-reference slew governor |d(phi/theta)_cmd/dt| (Fix G: was 5)
 CTRL_ATT_REF_TC = 0.15            # attitude-reference EMA time constant [s] (iter 2)
 CTRL_MAX_TILT_TERMINAL_DEG = 45.0  # roll clamp relaxes to this inside terminal_tilt_range (iter 3)
 CTRL_TERMINAL_TILT_RANGE = 15.0   # m, roll-clamp relaxation gate (iter 3)
 CTRL_TERMINAL_DECEL_RANGE = 30.0  # m, start ramping v_des -> v_terminal here (sync C++ yaml)
 CTRL_V_TERMINAL = 12.0            # m/s, desired speed at the terminal phase (sync C++ yaml)
+CTRL_AZ_SLEW = 20.0               # m/s^3, |da_z/dt| slew limit (Fix C/E, mirror C++ yaml controller.a_z_slew)
+CTRL_LAT_DECAY_FLOOR = 0.4        # Fix D: a_lat_mag floor at terminal_brake_range (close-range weave damp)
+CTRL_LAT_DECAY_START = 25.0       # Fix F: range at which close-range lateral attenuation begins (m, was 12)
+VEL_SMOOTH_TC = 0.25              # s, EMA on target-velocity estimate (Fix B, mirror C++ estimation.vel_smooth_tc)
 COAST_RANGE = 12.0       # terminal coast-on-dropout engages below this range (mirror C++)
 COAST_MAX_DUR = 1.5      # coast on the last good cmd this long (lets a close intercept complete / bbox return)
 
@@ -567,6 +571,13 @@ class AdvancedHybridController:
         self.has_last_att = False
         self.last_phi_cmd_f = 0.0
         self.last_theta_cmd_f = 0.0
+        # Vertical-accel slew-limit state (Fix C, mirror C++).
+        self.last_a_z = 0.0
+        self.last_az_t = -1.0
+        self.has_last_az = False
+        self.a_z_slew = CTRL_AZ_SLEW
+        self.lateral_decay_floor = CTRL_LAT_DECAY_FLOOR
+        self.lat_decay_start = CTRL_LAT_DECAY_START
 
     def reset(self):
         self.last_axial_accel = 0.0
@@ -578,6 +589,9 @@ class AdvancedHybridController:
         self.has_last_att = False
         self.last_phi_cmd_f = 0.0
         self.last_theta_cmd_f = 0.0
+        self.last_a_z = 0.0
+        self.last_az_t = -1.0
+        self.has_last_az = False
 
     def compute_control(self, roll, pitch, yaw, r_est, v_est, los_az, los_el, t,
                         v_fwd_body=0.0, bbox_size=0.0, v_z=0.0, los_rate=0.0, target_speed=0.0):
@@ -585,9 +599,12 @@ class AdvancedHybridController:
         omega_los = np.zeros(3)
         if r_norm > 0.1:
             omega_los = np.cross(r_est, v_est) / (r_norm * r_norm)
-        # LOS rate from the measured bearing (clean, no 1/r blowup, no v_est noise); omega_los[2]
-        # is the same quantity algebraically but noisy at close range -> kept as warmup fallback.
-        lambda_dot = los_rate if abs(los_rate) >= 1e-4 else omega_los[2]
+        # LOS rate from the measured bearing ONLY (clean, no 1/r blowup, no v_est noise). The old
+        # warmup fallback onto omega_los[2] fired whenever the bearing rate was small and injected
+        # the noisy v_est term -> a_lat sign-flip -> roll limit-cycle. Deadband a steady bearing.
+        lambda_dot = los_rate
+        if abs(lambda_dot) < 0.02:
+            lambda_dot = 0.0
         omega_los_mag = min(abs(lambda_dot), 1.0)
         N_eff = self.N
         if r_norm > 15.0:
@@ -597,9 +614,14 @@ class AdvancedHybridController:
         # overheat lateral authority. No-op at the sim's v_des=5 (v < v_pn_ref).
         v_pn = min(v_fwd_safe, self.v_pn_ref)
         a_lat_mag = N_eff * v_pn * omega_los_mag
-        # No near-range lateral decay: the bearing-rate source is clean, so PN lead is kept all the
-        # way to close range to intercept turning targets (mirror C++). lambda_dot ~ 0 for a
-        # near-stationary target, so lateral is naturally idle there (no spurious banking).
+        # Close-range lateral attenuation (Fix D/F, mirror C++): gently scale a_lat_mag toward
+        # lateral_decay_floor over [terminal_brake_range, lat_decay_start] to damp the closed-loop
+        # close-approach PN weave (full N + v_des=20 over-corrects; seen as far out as ~26 m in
+        # AirSim). NOT a hard zero — a 0.4 floor keeps PN lead for turning targets. Window widened
+        # 12 -> 25 m (Fix F) so the 22-27 m weave zone is covered.
+        lat_f = clamp((r_norm - self.terminal_brake_range) /
+                      max(self.lat_decay_start - self.terminal_brake_range, 1.0), 0.0, 1.0)
+        a_lat_mag *= self.lateral_decay_floor + (1.0 - self.lateral_decay_floor) * lat_f
         e_los_xy = np.array([r_est[0], r_est[1]])
         if np.linalg.norm(e_los_xy) < 1e-3:
             e_los_xy = np.array([1.0, 0.0])
@@ -637,6 +659,16 @@ class AdvancedHybridController:
         # PD on vertical: K_z on position error, K_zd damps pursuer odom v_z so the climb rate
         # built up while dz_target was large is braked before the zero-crossing (mirror C++ fix).
         a_z = clamp(self.K_z * dz_target - self.K_zd * v_z, -4.0, 4.0)
+        # Slew limit |da_z/dt| (Fix C, mirror C++): z-estimate can jump O(10 m) in one cycle ->
+        # step a_z to +-4 -> pitch step. Ramp it instead.
+        if self.has_last_az and t > self.last_az_t:
+            dt_az = t - self.last_az_t
+            if 0.0 < dt_az < 1.0:
+                a_z = clamp(a_z, self.last_a_z - self.a_z_slew * dt_az,
+                            self.last_a_z + self.a_z_slew * dt_az)
+        self.last_a_z = a_z
+        self.last_az_t = t
+        self.has_last_az = True
         a_h_world = a_lat_world + a_fwd_world
         cy = np.cos(yaw)
         sy = np.sin(yaw)
@@ -842,6 +874,9 @@ def run_scenario(name, target_init_pos, target_vel_fn, uav_init_pos, uav_init_ya
     intercept_t = -1.0
     last_bbox = (0.0, 0.0, 0.0, False)
     cache = None  # (r_est, v_est, los_az_world, los_el, bbox_size, t_rel)
+    # Output smoothing of the estimator target velocity (Fix B, mirror C++).
+    target_vel_smoothed = None
+    last_tv_t = 0.0
     # Terminal coast-on-dropout state (mirror C++ control_timer_callback).
     last_meas_has_bbox = False
     has_frozen_cmd = False
@@ -884,7 +919,17 @@ def run_scenario(name, target_init_pos, target_vel_fn, uav_init_pos, uav_init_ya
             ok, x_est = estimator.process_camera(has_bbox, u, v, s, t, uav.pos.copy(), uav.R_b2n.copy())
             if ok and estimator.initialized:
                 r_est = x_est[0:3] - uav.pos
-                v_est = x_est[3:6] - uav.vel
+                # Fix B: EMA the absolute target velocity so the raw UKF swings don't reach guidance.
+                tgt_vel = x_est[3:6]
+                if VEL_SMOOTH_TC > 1e-6:
+                    if target_vel_smoothed is not None and t > last_tv_t and (t - last_tv_t) < 1.0:
+                        a_tv = clamp((t - last_tv_t) / VEL_SMOOTH_TC, 0.0, 1.0)
+                        target_vel_smoothed = target_vel_smoothed + a_tv * (tgt_vel - target_vel_smoothed)
+                    else:
+                        target_vel_smoothed = tgt_vel.copy()
+                    last_tv_t = t
+                    tgt_vel = target_vel_smoothed
+                v_est = tgt_vel - uav.vel
                 if has_bbox:
                     los_nav = pixel_to_los_nav(u, v, FOCAL_LENGTH, uav.R_b2n, R_B2C)
                     los_az_world = np.arctan2(los_nav[1], los_nav[0])

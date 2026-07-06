@@ -88,8 +88,9 @@ interceptor_node_relative_imm_ukf:
       v_pn_ref: 12.0      # m/s, cap on v_fwd in PN lateral accel
       # Attitude reference slew governor: max |d(phi_cmd)/dt|, |d(theta_cmd)/dt|. Prevents the
       # single-cycle +-max_tilt flips that bang omega_x/omega_y into +-max_body_rate saturation.
-      # Mirrors axial_jerk_max. Lower = smoother but more reference lag.
-      max_att_rate: 5.0   # rad/s
+      # Mirrors axial_jerk_max. Lower = smoother but more reference lag. Tightened 5 -> 3.5 (Fix G)
+      # to clamp the close-approach lateral weave (phi_cmd sign-flip -> omega_x saturation).
+      max_att_rate: 3.5   # rad/s
       # Attitude reference EMA low-pass (on phi_cmd/theta_cmd). Suppresses camera-rate content /
       # the close-range roll limit-cycle that the slew governor alone can't filter. Distinct from
       # the body-rate decay coefficient (control.rate_control_attenuation) — this filters the
@@ -109,6 +110,18 @@ interceptor_node_relative_imm_ukf:
       #     Floor is speed-aware (never stalls below target speed + margin).
       terminal_decel_range: 30.0   # m, start ramping desired speed down here
       v_terminal: 12.0             # m/s, desired speed at the terminal phase
+      # Vertical-accel slew limit (Fix C/E, AirSim jitter): bounds |da_z/dt| so a monocular z-estimate
+      # jump (O(10 m) in one cycle) cannot step a_z straight to +-4 and pitch the body over. Relaxed
+      # 8 -> 20 (8 lagged the vertical PD loop ~1 s; 20 still softens spikes without the lag).
+      a_z_slew: 20.0               # m/s^3, rate limit on the vertical accel command
+      # Close-range lateral attenuation (Fix D, AirSim terminal weave): at v_des=20 the full PN gain
+      # inside 15 m over-corrects -> lambda_dot sign-flips -> phi_cmd rails +-max_tilt_terminal ->
+      # omega_x saturates (the close-approach weave). Gently scale a_lat_mag toward this floor over
+      # [terminal_brake_range, lateral_decay_start]. NOT 0 (a hard zero trailed maneuvering targets).
+      lateral_decay_floor: 0.4     # a_lat_mag floor at terminal_brake_range (0..1)
+      # Fix F: range at which the close-range lateral attenuation begins. Widened 12 -> 25 m so the
+      # 22-27 m weave zone (observed in AirSim at v_des=20) is covered. Must be > terminal_brake_range.
+      lateral_decay_start: 25.0    # m, lateral attenuation begins here (ramps to floor by terminal_brake_range)
 
     # State estimation aiding
     estimation:
@@ -116,3 +129,7 @@ interceptor_node_relative_imm_ukf:
       # First valid fix hard-seeds the ego frame onto the odometry ENU frame. Disables lateral
       # dither when true (accurate parallax baseline makes the scale-observability dither redundant).
       use_odometry: true
+      # Output smoothing of the estimator's absolute target velocity (Fix B, AirSim jitter): the raw
+      # UKF velocity swings +/-12..18 m/s cycle-to-cycle; EMA it before it drives v_est / the
+      # speed-aware brake floor. 0 disables.
+      vel_smooth_tc: 0.25          # s, EMA time constant on the target-velocity estimate
