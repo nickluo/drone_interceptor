@@ -20,6 +20,7 @@ import numpy as np
 import sys
 import os
 from dataclasses import dataclass, field
+from collections import deque
 
 np.set_printoptions(precision=3, suppress=True, linewidth=140)
 
@@ -46,8 +47,15 @@ R_PITCH = np.array([[1.0, 0.0, 0.0],
                     [0.0, np.cos(_p), -np.sin(_p)],
                     [0.0, np.sin(_p), np.cos(_p)]])
 R_B2C = R_PITCH @ R_B2C_BASE
+GIMBAL_TAU = 0.1            # s, semi-strapdown cam-x pitch-gimbal servo lag (boresight → horizontal)
+# Boresight world elevation = -(own_pitch + gimbal_total); servo_cmd = -own_pitch + GIMBAL_BIAS
+# => elev = -GIMBAL_BIAS. POSITIVE bias = down-gaze. (Was -5.0 => 5 deg UP-gaze — sign bug that
+# cost 10 deg of bottom-of-frame margin exactly where the terminal brake-climb loses the target.)
+GIMBAL_BIAS = np.deg2rad(5.0)    # rad, fixed down-gaze bias (keeps nonzero image-v for co-altitude targets)
 
-DT_CAM = 0.033
+DT_CAM = 0.04            # actual camera period: cam_step=round(DT_CAM/dt_ctrl)=2, dt_ctrl=0.02 -> 0.04s.
+                          # Was 0.033 (30Hz nominal) but the discrete cam_step gives 0.04s; the mismatch
+                          # starves the relativized predict (ownship motion under-played by ~20%).
 W_GUESS = 1.5
 CONTROL_RATE = 50.0
 RATE_TC = 0.02
@@ -65,9 +73,9 @@ CTRL_K_ATT = 6.0      # was 9.0; lowered to damp the close-range roll limit-cycl
 CTRL_K_YAW = 5.0
 CTRL_K_Z = 2.0       # vertical proportional (a_z = K_z*dz - K_zd*vz)
 CTRL_K_ZD = 2.0      # vertical damping on pursuer odom v_z (K_z=2 -> zeta≈0.7)
-CTRL_V_DES = 5.0
-CTRL_MAX_TILT_DEG = 25.0
-CTRL_FOV_KEEP = 0.65
+CTRL_V_DES = 20.0
+CTRL_MAX_TILT_DEG = 45.0     # user req: pitch/roll authority 45 deg (gimbal decouples camera from pitch)
+CTRL_FOV_KEEP = 1.0
 CTRL_V_RAMP = 3.0
 CTRL_JERK = 30.0      # was 15; raised so the terminal decel can shed ~9 m/s (iter 3)
 CTRL_MAX_BODY_RATE = 3.0
@@ -78,7 +86,7 @@ CTRL_V_PN_REF = 12.0              # cap on v_fwd in PN lateral accel (iter 1)
 CTRL_MAX_ATT_RATE = 3.5           # attitude-reference slew governor |d(phi/theta)_cmd/dt| (Fix G: was 5)
 CTRL_ATT_REF_TC = 0.15            # attitude-reference EMA time constant [s] (iter 2)
 CTRL_MAX_TILT_TERMINAL_DEG = 45.0  # roll clamp relaxes to this inside terminal_tilt_range (iter 3)
-CTRL_TERMINAL_TILT_RANGE = 15.0   # m, roll-clamp relaxation gate (iter 3)
+CTRL_TERMINAL_TILT_RANGE = 30.0   # m, roll-clamp relaxation gate (iter 3)
 CTRL_TERMINAL_DECEL_RANGE = 30.0  # m, start ramping v_des -> v_terminal here (sync C++ yaml)
 CTRL_V_TERMINAL = 12.0            # m/s, desired speed at the terminal phase (sync C++ yaml)
 CTRL_AZ_SLEW = 20.0               # m/s^3, |da_z/dt| slew limit (Fix C/E, mirror C++ yaml controller.a_z_slew)
@@ -87,9 +95,18 @@ CTRL_LAT_DECAY_START = 25.0       # Fix F: range at which close-range lateral at
 VEL_SMOOTH_TC = 0.25              # s, EMA on target-velocity estimate (Fix B, mirror C++ estimation.vel_smooth_tc)
 COAST_RANGE = 12.0       # terminal coast-on-dropout engages below this range (mirror C++)
 COAST_MAX_DUR = 1.5      # coast on the last good cmd this long (lets a close intercept complete / bbox return)
+# Parallax-demod depth channel: DISABLED. During a fast closing the 2-cycle (4 s) demod window
+# spans a ~4x range change and the PN lateral accel leaks into the 0.5 Hz dither band, inflating
+# A_meas -> depth biased HIGH (measured 64 m at true 25 m, sigma accepted by the 5-sigma gate).
+# The biased depth drags v_rel to the +-30 clamp -> controller sees v_closing=+30 -> brakes/
+# reverses at 10 m -> false capture -> fly-away. With the channel OFF all 7 scenarios intercept
+# single-pass (incl. wrong_wguess: the size channel + q_w_dynamic resolves scale without it).
+# The lateral dither stays ON: its parallax still reaches the estimator through the bearing
+# channel (a_own predict + pixel update), which is where the scale observability actually comes from.
+ENABLE_PARALLAX_DEPTH = False
 
 G = 9.81
-DRAG_COEFF = 0.0    # no drag — the active brake-to-hold (capture) stops the UAV; drag blunts the close approach
+DRAG_COEFF = 0.1    # no drag — the active brake-to-hold (capture) stops the UAV; drag blunts the close approach
 
 
 def clamp(v, lo, hi):
@@ -124,68 +141,84 @@ def make_Q(q_pos, q_vel, q_acc, q_w):
     return Q
 
 
-def f_singer(x, dt):
+# Relative-state motion models. State x = [r(3), v_rel(3), a_t(3), W(1)] in a gravity-aligned
+# world frame G (origin arbitrary). r/v_rel are TARGET-OWNSHIP (relative); a_t is the target's
+# OWN acceleration; `a_own` is the ownship's world-frame acceleration over dt, supplied as an
+# exogenous input from IMU preintegration (Δv_own/dt, gravity-corrected). Ownship pos/vel are
+# NOT state — relative quantities are drift-free because each bbox update closes the loop on r.
+# Mirror of the C++ relativized estimator (see plan: fpv-odom-mavros-imu-data-imu-sequential-eich).
+def f_singer(x, dt, a_own):
     x_new = x.copy()
     decay = np.exp(-dt / 1.5)
-    x_new[6:9] = x[6:9] * decay
-    x_new[3:6] = x[3:6] + x[6:9] * dt
-    x_new[0:3] = x[0:3] + x[3:6] * dt + 0.5 * x[6:9] * dt * dt
+    a_rel = x[6:9] - a_own                          # relative accel = a_target - a_ownship
+    x_new[6:9] = x[6:9] * decay                      # target own accel decays (Singer)
+    x_new[3:6] = x[3:6] + a_rel * dt                 # v_rel
+    x_new[0:3] = x[0:3] + x[3:6] * dt + 0.5 * a_rel * dt * dt   # r (relative pos)
     x_new[9] = x[9]
     return x_new
 
 
-def f_ct(x, dt):
+def f_ct(x, dt, a_own):
     x_new = x.copy()
     p = x[0:3]
-    v = x[3:6]
-    a = x[6:9]
+    v = x[3:6]              # v_rel
+    a_t = x[6:9]            # target own accel
+    a_rel = a_t - a_own
     v_xy2 = max(v[0] ** 2 + v[1] ** 2, 1e-4)
-    omega = clamp((v[0] * a[1] - v[1] * a[0]) / v_xy2, -2.0, 2.0)
+    omega = clamp((v[0] * a_t[1] - v[1] * a_t[0]) / v_xy2, -2.0, 2.0)   # approx: v_rel stands in for target vel
     if abs(omega) < 1e-3:
-        x_new[0:3] = p + v * dt + 0.5 * a * dt * dt
-        x_new[3:6] = v + a * dt
+        x_new[0:3] = p + v * dt + 0.5 * a_rel * dt * dt
+        x_new[3:6] = v + a_rel * dt
     else:
         swt = np.sin(omega * dt)
         cwt = np.cos(omega * dt)
         x_new[0] = p[0] + (v[0] * swt - v[1] * (1.0 - cwt)) / omega
         x_new[1] = p[1] + (v[1] * swt + v[0] * (1.0 - cwt)) / omega
-        x_new[2] = p[2] + v[2] * dt + 0.5 * a[2] * dt * dt
+        x_new[2] = p[2] + v[2] * dt + 0.5 * a_rel[2] * dt * dt
         x_new[3] = v[0] * cwt - v[1] * swt
         x_new[4] = v[0] * swt + v[1] * cwt
-        x_new[5] = v[2] + a[2] * dt
-        x_new[6] = a[0] * cwt - a[1] * swt
-        x_new[7] = a[0] * swt + a[1] * cwt
-        x_new[8] = a[2]
+        x_new[5] = v[2] + a_rel[2] * dt
+        x_new[6] = a_t[0] * cwt - a_t[1] * swt      # target own accel rotates with the turn
+        x_new[7] = a_t[0] * swt + a_t[1] * cwt
+        x_new[8] = a_t[2]
     x_new[9] = x[9]
     return x_new
 
 
-def f_rotor(x, dt):
+def f_rotor(x, dt, a_own):
     x_new = x.copy()
-    v = x[3:6]
-    a_thrust = x[6:9]
-    k_drag = 0.05
-    a_real = a_thrust - k_drag * np.linalg.norm(v) * v
-    x_new[0:3] = x[0:3] + v * dt + 0.5 * a_real * dt * dt
-    x_new[3:6] = v + a_real * dt
-    x_new[6:9] = a_thrust * np.exp(-dt / 2.0)
+    v = x[3:6]              # v_rel
+    a_t = x[6:9]            # target own accel
+    a_rel = a_t - a_own
+    # NOTE: the original absolute-state f_rotor modeled target aerodynamic drag as
+    # a_real = a_thrust - k_drag*|v_target|*v_target. In relative coordinates v_target is
+    # UNOBSERVABLE (it would need ownship vel). Substituting v_rel is wrong: when the target is
+    # static but the ownship is moving, |v_rel| is large and the drag term spuriously brakes the
+    # RELATIVE velocity -> v_rel under-estimation that grows with ownship accel. Drop the drag
+    # term; rotor degrades to a target-accel-relaxation model (tau=2s), distinct from Singer (1.5s).
+    x_new[0:3] = x[0:3] + v * dt + 0.5 * a_rel * dt * dt
+    x_new[3:6] = v + a_rel * dt
+    x_new[6:9] = a_t * np.exp(-dt / 2.0)
     x_new[9] = x[9]
     return x_new
 
 
-def apply_model(x, dt, mode):
+def apply_model(x, dt, mode, a_own):
     if mode == 0:
-        return f_singer(x, dt)
+        return f_singer(x, dt, a_own)
     if mode == 1:
-        return f_ct(x, dt)
-    return f_rotor(x, dt)
+        return f_ct(x, dt, a_own)
+    return f_rotor(x, dt, a_own)
 
 
 # ============================================================================
 # Measurement model (mirror C++)
 # ============================================================================
-def h_meas_pixel(x, uav_pos, R_n2c, focal_length):
-    rel_p = x[0:3] - uav_pos
+def h_meas_pixel(x, R_n2c, focal_length):
+    # Relative-state form: x[0:3] IS the relative position (target - ownship) in world frame G.
+    # No uav_pos needed — the measurement is purely relative; R_n2c = R_b2c @ R_b2n^T carries the
+    # ownship ATTITUDE (from IMU orientation), which is all the projection requires.
+    rel_p = x[0:3]
     p_cam = R_n2c @ rel_p
     p_cam[2] = max(p_cam[2], 0.5)
     u = focal_length * p_cam[0] / p_cam[2]
@@ -219,7 +252,7 @@ class UKF10D:
         self.sigmas_f = [np.zeros(STATE_DIM) for _ in range(2 * STATE_DIM + 1)]
         self.predicted = False
 
-    def predict(self, dt):
+    def predict(self, dt, a_own):
         n = STATE_DIM
         Wi = 0.5 / n
         L = robust_cholesky(n * self.P)
@@ -228,7 +261,8 @@ class UKF10D:
         for i in range(n):
             sigmas[i + 1] = self.x + L[:, i]
             sigmas[i + 1 + n] = self.x - L[:, i]
-        self.sigmas_f = [apply_model(sigmas[i], dt, self.mode) for i in range(2 * n + 1)]
+        # a_own is a deterministic exogenous input — same value applied to every sigma point (not augmented).
+        self.sigmas_f = [apply_model(sigmas[i], dt, self.mode, a_own) for i in range(2 * n + 1)]
         x_pred = np.zeros(n)
         for i in range(1, 2 * n + 1):
             x_pred += Wi * self.sigmas_f[i]
@@ -241,7 +275,7 @@ class UKF10D:
         self.P = (P_pred + P_pred.T) * 0.5
         self.predicted = True
 
-    def update(self, z_pixel, uav_pos, R_n2c, focal_length):
+    def update(self, z_pixel, R_n2c, focal_length):
         n = STATE_DIM
         Wi = 0.5 / n
         if not self.predicted:
@@ -252,7 +286,7 @@ class UKF10D:
                 self.sigmas_f[i + 1] = self.x + L[:, i]
                 self.sigmas_f[i + 1 + n] = self.x - L[:, i]
         self.predicted = False
-        sigmas_h = [h_meas_pixel(self.sigmas_f[i], uav_pos, R_n2c, focal_length)
+        sigmas_h = [h_meas_pixel(self.sigmas_f[i], R_n2c, focal_length)
                     for i in range(2 * n + 1)]
         z_pred = np.zeros(3)
         for i in range(1, 2 * n + 1):
@@ -279,6 +313,55 @@ class UKF10D:
         det = max(abs(np.linalg.det(P_zz)), 1e-30)
         exponent = -0.5 * y @ np.linalg.solve(P_zz, y)
         likelihood = np.exp(clamp(exponent, -80.0, 80.0)) / np.sqrt((2.0 * np.pi) ** 3 * det)
+        if not np.isfinite(likelihood) or likelihood < 1e-30:
+            likelihood = 1e-30
+        return likelihood
+
+    def update_depth(self, z_depth, R_depth):
+        # Scalar parallax-depth update (h_depth(x) = ||x[0:3]||). Runs AFTER the pixel update as a
+        # sequential scalar pass. Re-sigmas from the current (post-pixel) x/P so the depth and size
+        # channels both see the post-pixel covariance. h_depth is along-LOS range; depth measurement
+        # is independent of W -> breaks the size = fx*W/r degeneracy and anchors range, which makes
+        # the along-LOS v_rel observable through range change. Returns likelihood but the caller does
+        # NOT use it for IMM mode re-weighting (depth is mode-independent geometry).
+        n = STATE_DIM
+        Wi = 0.5 / n
+        if self.P[9, 9] < 1e-3:
+            return 1e-30                      # W pinned -> size channel sufficient, skip
+        L = robust_cholesky(n * self.P)
+        h_vals = []
+        dx_list = []
+        for i in range(n):
+            sp = self.x + L[:, i]
+            sm = self.x - L[:, i]
+            h_vals.append(np.linalg.norm(sp[0:3]))
+            dx_list.append(sp - self.x)
+            h_vals.append(np.linalg.norm(sm[0:3]))
+            dx_list.append(sm - self.x)
+        z_pred = sum(Wi * h for h in h_vals)
+        if not np.isfinite(z_pred) or z_pred < 0.1:
+            return 1e-30
+        P_xz = np.zeros(n)
+        P_zz = 0.0
+        for dx, h in zip(dx_list, h_vals):
+            dh = h - z_pred
+            P_xz += Wi * dx * dh
+            P_zz += Wi * dh * dh
+        P_zz += R_depth
+        if P_zz < 1e-9:
+            return 1e-30
+        K = P_xz / P_zz                       # n-vector
+        y = z_depth - z_pred
+        if not np.all(np.isfinite(K)) or not np.isfinite(y):
+            return 1e-30
+        self.x = self.x + K * y
+        # Joseph form for PSD safety
+        I_KH = np.eye(n) - np.outer(K, P_xz) / max(P_zz, 1e-12)
+        self.P = I_KH @ self.P @ I_KH.T + np.outer(K, K) * R_depth
+        self.P = (self.P + self.P.T) * 0.5
+        det = max(abs(P_zz), 1e-30)
+        exponent = -0.5 * (y * y) / P_zz
+        likelihood = np.exp(clamp(exponent, -80.0, 80.0)) / np.sqrt(2.0 * np.pi * det)
         if not np.isfinite(likelihood) or likelihood < 1e-30:
             likelihood = 1e-30
         return likelihood
@@ -311,7 +394,7 @@ class IMMEstimator10D:
             for j in range(MODE_COUNT):
                 self.omega[i, j] = (self.M[i, j] * self.mu[i]) / self.cbar[j]
 
-    def predict(self, dt):
+    def predict(self, dt, a_own):
         xs = [np.zeros(STATE_DIM) for _ in range(MODE_COUNT)]
         Ps = [np.zeros((STATE_DIM, STATE_DIM)) for _ in range(MODE_COUNT)]
         for j in range(MODE_COUNT):
@@ -323,14 +406,14 @@ class IMMEstimator10D:
         for j in range(MODE_COUNT):
             self.filters[j].x = xs[j]
             self.filters[j].P = (Ps[j] + Ps[j].T) * 0.5
-            self.filters[j].predict(dt)
+            self.filters[j].predict(dt, a_own)
         self.compute_mixing_probabilities()
         self.compute_state_estimate()
 
-    def update(self, z_pixel, uav_pos, R_n2c, focal_length):
+    def update(self, z_pixel, R_n2c, focal_length):
         likelihoods = np.zeros(3)
         for j in range(MODE_COUNT):
-            likelihoods[j] = self.filters[j].update(z_pixel, uav_pos, R_n2c, focal_length)
+            likelihoods[j] = self.filters[j].update(z_pixel, R_n2c, focal_length)
         self.mu = self.cbar * likelihoods
         mu_sum = self.mu.sum()
         if not np.isfinite(mu_sum) or mu_sum < 1e-30:
@@ -338,6 +421,14 @@ class IMMEstimator10D:
         else:
             self.mu /= mu_sum
         self.compute_mixing_probabilities()
+        self.compute_state_estimate()
+
+    def update_depth(self, z_depth, R_depth):
+        # Scalar parallax-depth update across all filters. Does NOT update mode probabilities (mu) —
+        # depth is mode-independent geometry; letting it re-weight mu would over-commit to whichever
+        # mode has the smallest P_zz_depth. Only state/P are updated.
+        for j in range(MODE_COUNT):
+            self.filters[j].update_depth(z_depth, R_depth)
         self.compute_state_estimate()
 
     def compute_state_estimate(self):
@@ -370,6 +461,12 @@ class RelativeIMMUKFEstimator:
         self.width_freeze_range = 15.0  # freeze monocular scale below this range (mirror C++)
         self.size_gate_lo = 0.6         # reject bbox if measured size < lo*predicted (mirror C++)
         self.size_gate_hi = 1.8         #   or > hi*predicted
+        # The size-plausibility gate exists to reject CLOSE-RANGE mis-detections (a huge garbage
+        # bbox that corrupts the monocular scale). Applied at long range it starves the relative
+        # estimator: r_est lags the true range during a closing -> s_pred is too small -> good
+        # measurements get rejected -> r never corrects (deadlock). Gate it to close range only.
+        self.size_gate_range = 12.0
+        self.last_los_nav = None        # cached LOS unit vector (world) for divergence reset
 
     def update_process_noise(self, r_norm, W_est, bbox_s=0.0):
         q_scale = 1.0
@@ -377,14 +474,21 @@ class RelativeIMMUKFEstimator:
         snr_factor = clamp(bbox_s / 40.0, 0.1, 1.0) if bbox_s > 0.0 else 1.0
         q_w_scale = clamp((r_norm - r_freeze) / 20.0, 0.0, 1.0) ** 2
         q_w_dynamic = 0.005 * q_w_scale * snr_factor
-        self.imm_ukf.filters[0].Q = make_Q(0.05 * q_scale, 0.05 * q_scale, 1.0 * q_scale, q_w_dynamic * q_scale)
-        self.imm_ukf.filters[1].Q = make_Q(0.05 * q_scale, 0.05 * q_scale, 0.5 * q_scale, q_w_dynamic * q_scale)
-        self.imm_ukf.filters[2].Q = make_Q(0.05 * q_scale, 0.05 * q_scale, 1.0 * q_scale, q_w_dynamic * q_scale)
+        # Relative-state: v_rel is driven by the a_own predict (high-quality, IMU preintegration).
+        # The monocular measurement constrains v_rel only weakly (depth is noisy), so a large Q_vel
+        # makes the update TRUST the lagged measurement and pull v_rel back toward it (under-playing
+        # the closing speed). Keep Q_vel SMALL so K_vvel stays small and the a_own predict dominates.
+        q_vel = 0.02 * q_scale
+        self.imm_ukf.filters[0].Q = make_Q(0.05 * q_scale, q_vel, 1.0 * q_scale, q_w_dynamic * q_scale)
+        self.imm_ukf.filters[1].Q = make_Q(0.05 * q_scale, q_vel, 0.5 * q_scale, q_w_dynamic * q_scale)
+        self.imm_ukf.filters[2].Q = make_Q(0.05 * q_scale, q_vel, 1.0 * q_scale, q_w_dynamic * q_scale)
 
-    def sanitize_filters(self, uav_pos):
+    def sanitize_filters(self):
+        # Relative-state form: r_norm is just |f.x[0:3]| (no uav_pos subtraction). On divergence,
+        # reset along the last observed LOS direction (cached by process_camera) at a nominal range.
         should_freeze = False
         for f in self.imm_ukf.filters:
-            r_norm = np.linalg.norm(f.x[0:3] - uav_pos)
+            r_norm = np.linalg.norm(f.x[0:3])
             r_freeze = self.width_freeze_range
             if r_norm < r_freeze:
                 should_freeze = True
@@ -394,6 +498,7 @@ class RelativeIMMUKFEstimator:
         elif not self.has_frozen_width:
             self.frozen_width = clamp(self.imm_ukf.x[9], 1.0, 1.8)
             self.has_frozen_width = True
+        los_dir = self.last_los_nav if self.last_los_nav is not None else np.array([1.0, 0.0, 0.0])
         for f in self.imm_ukf.filters:
             diverged = (not np.all(np.isfinite(f.x))) or (not np.all(np.isfinite(f.P)))
             if not diverged:
@@ -403,15 +508,15 @@ class RelativeIMMUKFEstimator:
                         break
             if diverged:
                 f.x = np.zeros(STATE_DIM)
-                f.x[0:3] = uav_pos + np.array([10.0, 0.0, 0.0])
+                f.x[0:3] = 10.0 * los_dir                    # relative pos along last LOS
                 f.x[9] = self.W_guess
                 f.P = np.zeros((STATE_DIM, STATE_DIM))
                 f.P[np.diag_indices(STATE_DIM)] = [100, 100, 100, 25, 25, 25, 10, 10, 10, 1.0]
                 continue
-            rel_p = f.x[0:3] - uav_pos
+            rel_p = f.x[0:3]
             r_norm = np.linalg.norm(rel_p)
             if r_norm > 200.0:
-                f.x[0:3] = uav_pos + rel_p / max(r_norm, 1e-6) * 120.0
+                f.x[0:3] = rel_p / max(r_norm, 1e-6) * 120.0
             for i in range(3, 6):
                 f.x[i] = clamp(f.x[i], -30.0, 30.0)
             for i in range(6, 9):
@@ -439,35 +544,44 @@ class RelativeIMMUKFEstimator:
         else:
             self.imm_ukf.x[9] = clamp(self.imm_ukf.x[9], 1.2, 1.8)
 
-    def process_camera(self, has_bbox, bbox_u, bbox_v, bbox_s, t_now, uav_pos_cur, R_b2n_cur):
+    def process_camera(self, has_bbox, bbox_u, bbox_v, bbox_s, t_now, R_b2n_cur, dv_own,
+                       z_depth=np.nan, R_depth=np.inf):
+        # Relative-state estimator. Inputs that replaced ownship pos/vel:
+        #   R_b2n_cur — ownship ATTITUDE (from IMU orientation), used for cam projection + LOS ray.
+        #   dv_own    — ownship velocity change over [last_cam, now] in world frame G, from IMU
+        #               preintegration (Δv_own = ∫(R_b2n·(f_imu − bias) − g)dτ). Pure relative
+        #               quantity, recomputed each window — NOT a drifting integrated velocity.
+        # No uav_pos/uav_vel anywhere; r in the state IS the relative position.
         if not has_bbox:
             if not self.initialized:
                 return False, np.full(STATE_DIM, np.nan)
             w_prev = self.imm_ukf.x[9]
-            r_norm = np.linalg.norm(self.imm_ukf.x[0:3] - uav_pos_cur)
-            if r_norm < 25.0:
-                for f in self.imm_ukf.filters:
-                    f.x[3:6] = 0.0
-                    f.x[6:9] = 0.0
-                    f.x[9] = w_prev
-                self.imm_ukf.compute_state_estimate()
-                self.imm_ukf.x[9] = w_prev
-                return True, self.imm_ukf.x
+            r_norm = np.linalg.norm(self.imm_ukf.x[0:3])
+            a_own = dv_own / max(self.dt_cam, 1e-3)
             self.update_process_noise(r_norm, w_prev)
-            self.imm_ukf.predict(self.dt_cam)
+            # ALWAYS predict r forward using ownship motion (a_own). The original absolute-state
+            # estimator could skip the predict here because a stationary target's ABSOLUTE position
+            # does not move; the RELATIVE position r = target - own DOES move, by the ownship's
+            # motion every frame. Skipping the predict freezes r while the ownship keeps flying ->
+            # unbounded drift the moment the target leaves the FOV.
+            self.imm_ukf.predict(self.dt_cam, a_own)
+            # Coast: assume the target stops ACCELERATING (a_t->0, constant-velocity target) but
+            # DO NOT touch v_rel. In relative coordinates v_rel = v_target - v_own; zeroing or
+            # decaying it would erase the ownship's ongoing motion from r's predict (r is propagated
+            # by v_rel*dt above) -> r freezes while the ownship flies on. Keep v_rel; let the
+            # a_own-driven predict carry the ownship motion, the retained v_rel carry target motion.
             for f in self.imm_ukf.filters:
-                f.x[3:6] *= np.exp(-self.dt_cam / 3.0)
                 f.x[6:9] = 0.0
                 f.x[9] = w_prev
                 f.P[9, 9] = max(0.001, f.P[9, 9])
             self.imm_ukf.compute_state_estimate()
             self.imm_ukf.x[9] = w_prev
-            self.sanitize_filters(uav_pos_cur)
+            self.sanitize_filters()
             self.first_meas_after_dropout = True
             return True, self.imm_ukf.x
-        uav_pos_cap = uav_pos_cur
         R_b2n_cap = R_b2n_cur
         los_nav = pixel_to_los_nav(bbox_u, bbox_v, self.focal_length, R_b2n_cap, self.R_b2c)
+        self.last_los_nav = los_nav.copy()
         z_pixel = np.array([bbox_u, bbox_v, bbox_s])
         R_n2c = self.R_b2c @ R_b2n_cap.T
         R_k = np.zeros((3, 3))
@@ -478,16 +592,17 @@ class RelativeIMMUKFEstimator:
         if self.first_meas_after_dropout:
             R_k *= 5.0
         if self.initialized:
-            dt_meas = clamp(t_now - self.last_cap_time, 0.001, self.dt_cam) if self.has_last_cap_time else self.dt_cam
-            self.update_process_noise(np.linalg.norm(self.imm_ukf.x[0:3] - uav_pos_cap), self.imm_ukf.x[9], bbox_s)
-            self.imm_ukf.predict(dt_meas)
+            dt_meas = clamp(t_now - self.last_cap_time, 0.001, 0.1) if self.has_last_cap_time else self.dt_cam
+            a_own = dv_own / max(dt_meas, 1e-3)
+            self.update_process_noise(np.linalg.norm(self.imm_ukf.x[0:3]), self.imm_ukf.x[9], bbox_s)
+            self.imm_ukf.predict(dt_meas, a_own)
             # Size-plausibility gate (mirror C++): reject detections whose bbox size is wildly
             # inconsistent with predicted range/width -> predict-only, mark soft-recovery. Stops a
             # garbage close-range size from corrupting scale/position (phantom-target dive).
-            r_pred = np.linalg.norm(self.imm_ukf.x[0:3] - uav_pos_cap)
+            r_pred = np.linalg.norm(self.imm_ukf.x[0:3])
             s_pred = self.focal_length * max(0.1, self.imm_ukf.x[9]) / max(0.5, r_pred)
             size_ratio = bbox_s / max(1.0, s_pred)
-            if size_ratio < self.size_gate_lo or size_ratio > self.size_gate_hi:
+            if r_pred < self.size_gate_range and (size_ratio < self.size_gate_lo or size_ratio > self.size_gate_hi):
                 self.imm_ukf.compute_state_estimate()
                 self.first_meas_after_dropout = True
                 self.last_cap_time = t_now
@@ -495,19 +610,28 @@ class RelativeIMMUKFEstimator:
                 return True, self.imm_ukf.x
             for f in self.imm_ukf.filters:
                 f.R = R_k
-            self.imm_ukf.update(z_pixel, uav_pos_cap, R_n2c, self.focal_length)
+            self.imm_ukf.update(z_pixel, R_n2c, self.focal_length)
             self.last_cap_time = t_now
             self.has_last_cap_time = True
             self.first_meas_after_dropout = False
-            self.sanitize_filters(uav_pos_cap)
-            for i in range(3):
-                self.imm_ukf.x[3 + i] = clamp(self.imm_ukf.x[3 + i], -15.0, 15.0)
+            # Parallax-depth scalar update (sequential, after pixel+size). Gates: finite depth,
+            # reasonable R, W not yet pinned, innovation within 5 sigma. Skip silently otherwise.
+            if np.isfinite(z_depth) and R_depth < 1e6 and self.imm_ukf.P[9, 9] > 1e-3:
+                z_pred_d = float(np.linalg.norm(self.imm_ukf.x[0:3]))
+                P_zz_d = max(float(np.trace(self.imm_ukf.P[0:3, 0:3])), 1e-6) + R_depth
+                if abs(z_depth - z_pred_d) < 5.0 * np.sqrt(P_zz_d):
+                    self.imm_ukf.update_depth(z_depth, R_depth)
+            self.sanitize_filters()
+            # (was: clamp fused v_rel to [-15,15] — an absolute-state target-speed limit. In relative
+            # coordinates v_rel = v_target - v_ownship easily exceeds 15 m/s during a high-speed
+            # closing, so clamping here caps the closing-speed estimate and starves the controller.
+            # sanitize_filters already bounds v_rel to [-30,30]; no extra clamp needed.)
             return True, self.imm_ukf.x
         else:
             W_init = clamp(self.W_guess, 0.5, 4.0)
             r0 = clamp(self.focal_length * W_init / max(1.0, bbox_s), 10.0, 300.0)
             x0 = np.zeros(STATE_DIM)
-            x0[0:3] = uav_pos_cap + r0 * los_nav
+            x0[0:3] = r0 * los_nav                      # relative pos = range * LOS (no uav_pos)
             x0[9] = W_init
             P0 = np.zeros((STATE_DIM, STATE_DIM))
             P0[np.diag_indices(STATE_DIM)] = [100, 100, 100, 25, 25, 25, 10, 10, 10, 0.09]
@@ -521,8 +645,98 @@ class RelativeIMMUKFEstimator:
             self.initialized = True
             self.last_cap_time = t_now
             self.has_last_cap_time = True
-            self.sanitize_filters(uav_pos_cap)
+            self.sanitize_filters()
             return True, self.imm_ukf.x
+
+
+# ============================================================================
+# ParallaxDemodulator: active-dither synchronous-demodulation depth (NO VIO)
+# ============================================================================
+class ParallaxDemodulator:
+    """Synchronous-demodulation parallax depth. Ownship vel is NOT a state.
+
+    The ownship lateral dither (controller, freq omega) produces a parallax baseline. Demodulating
+    the IMU lateral accel AND the bbox bearing at omega coherently sums N samples (per-frame SNR
+    ~2.8 -> demod SNR ~20) and rejects target low-freq motion + IMU DC drift. The dither-frequency
+    lateral displacement amplitude `baseline = A_meas/omega^2` is DC-free — the sin(omega*t) multiply
+    kills v_own_avg, so NO ownship-velocity state is needed. `depth = baseline / dtheta`, returned
+    as an extra scalar UKF measurement that anchors along-LOS range (independent of W), making the
+    along-LOS v_rel observable.
+
+    push() every camera step; compute_depth() returns (depth, R_depth, eta).
+    """
+    def __init__(self, dither_freq, dither_amp, focal_length, dt_cam,
+                 window_cycles=2.0, eta_tau=5.0, eta_min=0.7,
+                 r_depth_floor=1.0, pixel_noise=1.5, imu_accel_noise=0.05):
+        self.omega = 2.0 * np.pi * dither_freq
+        self.A_cmd = float(dither_amp)
+        self.focal_length = focal_length
+        self.dt_cam = dt_cam
+        self.N = max(int(round(window_cycles / dither_freq / dt_cam)), 8)
+        self.samples = deque(maxlen=self.N)      # (t, a_lat, theta_perp or None)
+        self.eta_tau = eta_tau
+        self.eta_filt = 1.0
+        self.eta_t_last = -1.0
+        self.eta_min = eta_min
+        self.r_depth_floor = r_depth_floor
+        self.pixel_noise = pixel_noise
+        self.imu_accel_noise = imu_accel_noise
+        self.min_bearing_frac = 0.75
+
+    def reset(self):
+        self.samples.clear()
+        self.eta_filt = 1.0
+        self.eta_t_last = -1.0
+
+    def push(self, t, a_lat, theta_perp, has_bbox):
+        # theta_perp = LOS lateral angle (rad) along the dither axis (e_perp_xy); None during dropout.
+        self.samples.append((t, a_lat, theta_perp if has_bbox else None))
+
+    def compute_depth(self, t_now):
+        N = len(self.samples)
+        if N < int(0.75 * self.N):
+            return np.nan, np.inf, self.eta_filt
+        bearing = [s for s in self.samples if s[2] is not None]
+        if len(bearing) < int(self.min_bearing_frac * self.N):
+            return np.nan, np.inf, self.eta_filt
+        # accel I/Q demod -> ownship dither displacement amplitude (DC-free baseline)
+        I_a = sum(s[1] * np.sin(self.omega * s[0]) for s in self.samples)
+        Q_a = sum(s[1] * np.cos(self.omega * s[0]) for s in self.samples)
+        A_meas = (2.0 / N) * np.hypot(I_a, Q_a)
+        phi_a = np.arctan2(Q_a, I_a)
+        # eta = tracking fidelity gate (LPF of measured vs commanded dither amplitude)
+        eta_raw = A_meas / max(self.A_cmd, 1e-6)
+        if self.eta_t_last > 0.0 and t_now > self.eta_t_last:
+            a_lpf = clamp((t_now - self.eta_t_last) / self.eta_tau, 0.0, 1.0)
+            self.eta_filt += a_lpf * (eta_raw - self.eta_filt)
+        else:
+            self.eta_filt = eta_raw
+        self.eta_t_last = t_now
+        if self.eta_filt < self.eta_min:
+            return np.nan, np.inf, self.eta_filt
+        # bearing I/Q demod -> parallax bearing amplitude
+        Nb = len(bearing)
+        I_t = sum(s[2] * np.sin(self.omega * s[0]) for s in bearing)
+        Q_t = sum(s[2] * np.cos(self.omega * s[0]) for s in bearing)
+        dtheta = (2.0 / Nb) * np.hypot(I_t, Q_t)
+        phi_t = np.arctan2(Q_t, I_t)
+        if dtheta < 1e-5:
+            return np.nan, np.inf, self.eta_filt
+        # sign: front-facing target -> bearing rotates opposite to ownship lateral motion -> phi_t-phi_a ~ pi
+        # Parallax depth: both A_meas/omega^2 (ownship dither displacement amplitude) and dtheta
+        # (bearing dither amplitude) are positive magnitudes. accel integrates twice to displacement
+        # (180 deg), and bearing follows displacement, so accel and bearing are 180 deg apart — but
+        # we only use the amplitudes here, so no sign/phase gate is needed.
+        baseline = A_meas / (self.omega ** 2)
+        depth = baseline / dtheta
+        if not np.isfinite(depth) or depth < 2.0 or depth > 200.0:
+            return np.nan, np.inf, self.eta_filt
+        sigma_theta = self.pixel_noise / self.focal_length
+        sigma_dtheta = sigma_theta / np.sqrt(max(Nb / 2.0, 1.0))
+        sigma_A = self.imu_accel_noise / np.sqrt(max(N / 2.0, 1.0))
+        rel_err = np.hypot(sigma_A / max(A_meas, 1e-6), sigma_dtheta / dtheta)
+        R_depth = max((depth * rel_err) ** 2, self.r_depth_floor)
+        return depth, R_depth, self.eta_filt
 
 
 # ============================================================================
@@ -553,6 +767,8 @@ class AdvancedHybridController:
         self.K_zd = CTRL_K_ZD
         self.K_fwd = 2.0
         self.terminal_bbox_size = 80.0
+        self.has_gimbal = True                  # semi-strapdown pitch gimbal: boresight decoupled from theta
+        self.gimbal_bias = GIMBAL_BIAS          # boresight elev = -gimbal_bias (down-gaze positive)
         self.last_axial_accel = 0.0
         self.last_t = -1.0
         self.has_last = False
@@ -578,6 +794,33 @@ class AdvancedHybridController:
         self.a_z_slew = CTRL_AZ_SLEW
         self.lateral_decay_floor = CTRL_LAT_DECAY_FLOOR
         self.lat_decay_start = CTRL_LAT_DECAY_START
+        # Active monocular-observability dither (scale-observability dither, per yaml use_odometry
+        # comment): a small lateral sinusoidal acceleration that gives the ownship a horizontal
+        # parallax baseline. With x != 0 the pinhole u=fx*x/z becomes sensitive to z (depth), so the
+        # depth/width degeneracy (size=fx*W/z) is broken and the along-LOS v_rel — otherwise only
+        # weakly observable via the noisy size channel — becomes observable through the bearing
+        # channel. The IMU preintegration already captures the dither motion as a_own, so the
+        # estimator predict carries it; the measurement update then resolves depth from the parallax.
+        self.dither_amp = 0.8          # m/s^2, lateral dither amplitude (lowered: 1.5 contaminates PN turn_sign on v20)
+        self.dither_freq = 0.5         # Hz, lateral dither frequency
+        self.dither_min_range = 10.0   # m, suppress dither inside this range (don't disturb terminal)
+        self.K_apn = 0.8               # Geometric-APN gain on bearing-derived a_t_perp (turning-target lead)
+        self.K_apn_min_at = 0.5       # m/s^2, gate |a_t_perp_geom| (ydot EMA rejects noise on static/CV; maneuvering a_t_perp~1 passes)
+        # lambda_dot 2nd-derivative (ydot) EMA state for geometric APN — bearing curvature is noisy.
+        self.prev_los_rate = 0.0
+        self.prev_lr_t = -1.0
+        self.has_prev_lr = False
+        self.ydot_ema = 0.0
+        self.atp_ema = 0.0
+        self.aown_perp_ema = 0.0
+        self.los_rate_slow = 0.0
+        self.ydot_tc = 0.8             # s, EMA time constant on d(lambda_dot)/dt (smooth bearing curvature noise)
+        self.atp_ema = 0.0            # EMA of a_t_perp_geom (sustained turn vs pixel-noise spike)
+        self.atp_tc = 0.6             # s, EMA time constant on a_t_perp_geom
+        self.aown_perp_ema = 0.0
+        self.los_rate_slow = 0.0      # EMA of a_own_perp matched to ydot_tc (so dither cancels in a_t_perp_geom)
+        self.los_rate_slow = 0.0      # slow EMA of lambda_dot (rejects 0.5Hz dither for turn_sign)
+        self.los_rate_slow_tc = 1.5   # s
 
     def reset(self):
         self.last_axial_accel = 0.0
@@ -592,9 +835,17 @@ class AdvancedHybridController:
         self.last_a_z = 0.0
         self.last_az_t = -1.0
         self.has_last_az = False
+        self.prev_los_rate = 0.0
+        self.prev_lr_t = -1.0
+        self.has_prev_lr = False
+        self.ydot_ema = 0.0
+        self.atp_ema = 0.0
+        self.aown_perp_ema = 0.0
+        self.los_rate_slow = 0.0
 
     def compute_control(self, roll, pitch, yaw, r_est, v_est, los_az, los_el, t,
-                        v_fwd_body=0.0, bbox_size=0.0, v_z=0.0, los_rate=0.0, target_speed=0.0):
+                        v_fwd_body=0.0, bbox_size=0.0, v_z=0.0, los_rate=0.0, target_speed=0.0,
+                        a_own_world=None):
         r_norm = np.linalg.norm(r_est)
         omega_los = np.zeros(3)
         if r_norm > 0.1:
@@ -610,9 +861,12 @@ class AdvancedHybridController:
         if r_norm > 15.0:
             N_eff = self.N - (self.N - 2.0) * clamp((r_norm - 15.0) / 35.0, 0.0, 1.0)
         v_fwd_safe = clamp(v_fwd_body, 0.5, 20.0)
-        # Speed-scheduled PN (iter 1): cap v_fwd in a_lat = N*v*lambda_dot so high v_des doesn't
-        # overheat lateral authority. No-op at the sim's v_des=5 (v < v_pn_ref).
-        v_pn = min(v_fwd_safe, self.v_pn_ref)
+        # Speed-scheduled PN: use v_des (OPEN-LOOP) for the v in a_lat = N*v*lambda_dot, NOT the
+        # measured v_closing (v_fwd_body). v_closing is under-observable along-LOS until the parallax
+        # demod anchors scale (~4s); using it here starves PN lead in the first seconds and lets a
+        # crossing target escape the FOV before the demod converges. v_des is the intended ownship
+        # speed — the correct PN proxy — and is available from t=0. Capped by v_pn_ref as before.
+        v_pn = min(self.v_des, self.v_pn_ref)
         a_lat_mag = N_eff * v_pn * omega_los_mag
         # Close-range lateral attenuation (Fix D/F, mirror C++): gently scale a_lat_mag toward
         # lateral_decay_floor over [terminal_brake_range, lat_decay_start] to damp the closed-loop
@@ -629,6 +883,39 @@ class AdvancedHybridController:
         e_perp_xy = np.array([-e_los_xy[1], e_los_xy[0]])
         turn_sign = 1.0 if lambda_dot >= 0.0 else -1.0
         a_lat_world = turn_sign * a_lat_mag * e_perp_xy
+        # Active observability dither (mid-course only): lateral sinusoid for monocular scale/depth.
+        if self.dither_amp > 0.0 and r_norm > self.dither_min_range:
+            a_dither = self.dither_amp * np.sin(2.0 * np.pi * self.dither_freq * t)
+            a_lat_world = a_lat_world + a_dither * e_perp_xy
+        # Geometric APN: classic PN (a_lat = N*v_pn*lambda_dot) assumes constant bearing, so it lags
+        # a turning target — the ownship flies through the target's initial position while the target
+        # has already turned (the maneuvering-ct failure). Recover the target lateral accel a_t_perp
+        # from TRUE-PN geometry + IMU (NOT the estimator a_t state — that is unobservable with a single
+        # bbox): a_t_perp = range*ydot + lambda_dot*v_range + a_own_perp, where ydot = d(lambda_dot)/dt.
+        # Lead a_lat with it so the ownship turns WITH the target.
+        if self.has_prev_lr and t > self.prev_lr_t:
+            dt_lr = t - self.prev_lr_t
+            if dt_lr > 1e-3 and dt_lr < 1.0:
+                ydot_raw = (los_rate - self.prev_los_rate) / dt_lr
+                a_ydot = clamp(dt_lr / self.ydot_tc, 0.0, 1.0)
+                self.ydot_ema += a_ydot * (ydot_raw - self.ydot_ema)
+        self.prev_los_rate = los_rate
+        self.prev_lr_t = t
+        self.has_prev_lr = True
+        a_own_perp = float(np.dot(a_own_world[0:2], e_perp_xy)) if a_own_world is not None else 0.0
+        # EMA a_own_perp with the SAME tc as ydot_ema so the ownship-dither component cancels in
+        # a_t_perp_geom (range*ÿ and a_own_perp delayed equally) for a static/CV target.
+        a_ao = clamp(0.02 / self.ydot_tc, 0.0, 1.0)
+        self.aown_perp_ema += a_ao * (a_own_perp - self.aown_perp_ema)
+        # True-PN geometry: a_t_perp = range·ÿ + 2·λ̇·v_range + a_own_perp (2x Coriolis). The 2x and
+        # the matched-lag aown_perp_ema make ownship dither cancel for a static target.
+        a_t_perp_geom = r_norm * self.ydot_ema + 2.0 * los_rate * v_fwd_body + self.aown_perp_ema
+        # EMA a_t_perp_geom: a sustained turn (maneuvering) keeps |atp_ema| large; pixel-noise spikes
+        # (high_noise) average toward 0. Use atp_ema for the floor gate to reject noise.
+        a_atp = clamp(0.02 / self.atp_tc, 0.0, 1.0)
+        self.atp_ema += a_atp * (a_t_perp_geom - self.atp_ema)
+        if abs(a_t_perp_geom) > self.K_apn_min_at:
+            a_lat_world = a_lat_world + self.K_apn * a_t_perp_geom * e_perp_xy
         v_des_eff = self.v_des
         # Range-based terminal decel schedule (iter 3): arrive at the terminal phase ~v_terminal so
         # the same bank gives ~2x turn rate. Feedforward schedule on the monocular range estimate
@@ -645,7 +932,21 @@ class AdvancedHybridController:
             moving_floor = (target_speed + 1.5) if target_speed > 1.0 else self.terminal_brake_floor
             floor_eff = min(max(self.terminal_brake_floor, moving_floor), self.v_des)
             v_des_eff = v_des_eff + (floor_eff - v_des_eff) * prox
-        a_fwd = self.K_fwd * (v_des_eff - v_fwd_body)
+        # v_fwd_body (= v_closing) is under-observable along-LOS until the parallax demod anchors
+        # scale (~4s); a low v_closing inflates a_fwd -> ownship over-accelerates ON-AXIS, starving
+        # the lateral PN lead -> a crossing target escapes the FOV (the regression vs the absolute-
+        # state version, which used true own_vel here and held a_fwd ~= 0). Floor v_closing at
+        # 0.8*v_des_eff so the ownship holds near v_des instead of blasting through. Braking passes.
+        # Scene-adaptive v_closing floor: raise it only for a clearly turning target (|a_t_perp_geom|
+        # large) so the ownship slows and doesn't blast THROUGH a circular target; keep 0.8 otherwise so
+        # CV/static/crossing closing speed isn't starved. a_t_perp_geom from the geometric-APN block.
+        # 3-level floor: turning target (|atp_ema| large) → 0.88 (don't blast through circle);
+        # moving target (lateral v_perp > 1 m/s, e.g. crossing/dropout) → 0.82 (avoid blast-through
+        # on a mutually-closing target); static/slow → 0.8 (close fast, noise-robust).
+        v_perp = abs(r_norm * los_rate)
+        floor = 0.88 if abs(self.atp_ema) > 0.5 else (0.82 if v_perp > 1.0 else 0.8)
+        v_fwd_for_afwd = max(v_fwd_body, floor * v_des_eff)
+        a_fwd = self.K_fwd * (v_des_eff - v_fwd_for_afwd)
         if self.has_last and t > self.last_t:
             dt = t - self.last_t
             if dt > 0.0 and dt < 1.0:
@@ -677,16 +978,33 @@ class AdvancedHybridController:
         # Thrust-vector cascade (mirror C++ fix): forward accel -> nose-down pitch.
         # theta_cmd positive = nose down = forward thrust (FLU body, pitch>0 tilts body-z +x).
         theta_cmd = clamp(np.arctan2(fx_h, a_z + G), -self.max_tilt_rad, self.max_tilt_rad)
-        # Roll clamp relaxes inside the terminal phase (iter 3): a maneuvering target needs more
-        # bank at close range. Pitch/FOV keep the conservative max_tilt.
+        # Roll clamp relaxes inside the terminal phase: a maneuvering target needs more bank at
+        # close range. Pitch/FOV keep the conservative max_tilt.
         max_tilt_roll = self.max_tilt_terminal_rad if r_norm < self.terminal_tilt_range else self.max_tilt_rad
         phi_cmd = clamp(-np.arctan2(fy_h, a_z + G), -max_tilt_roll, max_tilt_roll)
         target_behind = abs(los_az) > (M_PI / 2.0)
-        if self.enable_fov_clamp and not target_behind:
+        if self.enable_fov_clamp and not self.has_gimbal and not target_behind:
+            # Fixed-mount only: boresight elev = theta + mount_pitch, so clamp theta to keep the
+            # target within fov_keep vertically. With the semi-strapdown gimbal the boresight is
+            # DECOUPLED from body pitch (gimbal cancels it, elev ~= -GIMBAL_BIAS), so this clamp is
+            # geometry-stale and only throttles pitch authority — skip it (has_gimbal=True).
             fov_keep = self.fov_half_v * self.fov_keep_margin
-            theta_hi = min(self.max_tilt_rad, self.mount_pitch + fov_keep - los_el)
-            theta_lo = max(-self.max_tilt_rad, self.mount_pitch - fov_keep - los_el)
+            theta_hi = min(self.max_tilt_rad, los_el - self.mount_pitch + fov_keep)
+            theta_lo = max(-self.max_tilt_rad, los_el - self.mount_pitch - fov_keep)
             theta_cmd = clamp(theta_cmd, min(theta_lo, theta_hi), max(theta_lo, theta_hi))
+        elif self.enable_fov_clamp and self.has_gimbal and not target_behind:
+            # Gimbal vertical keep-in-frame: pitch cannot move the boresight, ALTITUDE can. If the
+            # target approaches the bottom edge (los_el << boresight elev = -gimbal bias), command
+            # a descent so the frame re-centers; symmetric for the top edge. Overrides the PD a_z
+            # only near the edge (outer 30% of the half-FOV).
+            fov_keep = self.fov_half_v * self.fov_keep_margin
+            boresight_el = -self.gimbal_bias
+            el_err = los_el - boresight_el          # negative = target below boresight
+            edge = 0.7 * fov_keep
+            if el_err < -edge:
+                a_z = min(a_z, -2.0 * clamp((-el_err - edge) / max(fov_keep - edge, 1e-3), 0.0, 1.0) * 4.0)
+            elif el_err > edge:
+                a_z = max(a_z, 2.0 * clamp((el_err - edge) / max(fov_keep - edge, 1e-3), 0.0, 1.0) * 4.0)
         # Attitude-reference EMA low-pass (iter 2): suppress camera-rate content / roll limit-cycle.
         if self.has_last_att and self.att_ref_tc > 1e-6:
             dt_att = t - self.last_att_t
@@ -707,11 +1025,12 @@ class AdvancedHybridController:
         self.last_theta_cmd = theta_cmd
         self.last_att_t = t
         self.has_last_att = True
-        a_h_mag = np.sqrt(fx_h ** 2 + fy_h ** 2)
-        tilt = np.arctan2(a_h_mag, a_z + G)
-        if tilt > self.max_tilt_rad:
-            tilt = self.max_tilt_rad
-        throttle = clamp((a_z + G) / np.cos(tilt), 2.0, 25.0)
+        # Throttle from the ACTUAL attitude, not the commanded tilt: during a hard brake the
+        # attitude lags theta_cmd, and (a_z+G)/cos(theta_cmd) then over-thrusts vertically ->
+        # brake-climb -> target exits the bottom of the (gimbal-horizontal) frame at 5-7 m.
+        # T*cos(actual tilt) = a_z + G  =>  vertical accel tracks a_z regardless of the lag.
+        cos_tilt_actual = max(np.cos(roll) * np.cos(pitch), np.cos(self.max_tilt_rad + 0.2))
+        throttle = clamp((a_z + G) / cos_tilt_actual, 2.0, 25.0)
         omega_x = clamp(self.K_att * (phi_cmd - roll), -self.max_body_rate, self.max_body_rate)
         omega_y = clamp(self.K_att * (theta_cmd - pitch), -self.max_body_rate, self.max_body_rate)
         omega_z = clamp(self.K_yaw * los_az, -self.max_body_rate, self.max_body_rate)
@@ -721,6 +1040,12 @@ class AdvancedHybridController:
 # ============================================================================
 # Quadrotor dynamics (simplified, for sim)
 # ============================================================================
+def Rx(p):
+    """Rotation about the x-axis (cam-x in R_B2C, same physical elev axis as body-y pitch)."""
+    c, s = np.cos(p), np.sin(p)
+    return np.array([[1.0, 0.0, 0.0], [0.0, c, -s], [0.0, s, c]])
+
+
 def skew(w):
     return np.array([[0, -w[2], w[1]],
                      [w[2], 0, -w[0]],
@@ -750,11 +1075,13 @@ class QuadrotorState:
     vel: np.ndarray = field(default_factory=lambda: np.zeros(3))
     R_b2n: np.ndarray = field(default_factory=lambda: np.eye(3))
     omega: np.ndarray = field(default_factory=lambda: np.zeros(3))
+    gimbal_pitch: float = 0.0   # camera pitch servo (sim gimbal; tracks target elevation)
 
 
 def step_quadrotor(state, throttle, omega_cmd, dt, rate_tau=0.05):
     """Integrate quadrotor. throttle = collective accel (m/s^2) along body z.
-    omega_cmd tracked with first-order lag tau."""
+    omega_cmd tracked with first-order lag tau. Returns the world-frame acceleration a_world
+    (gravity-corrected free accel) so the main loop can accumulate Δv_own for IMU preintegration."""
     # body-rate tracking (first-order lag)
     state.omega = state.omega + (omega_cmd - state.omega) * (dt / rate_tau)
     # rotation integration (exponential map)
@@ -772,6 +1099,23 @@ def step_quadrotor(state, throttle, omega_cmd, dt, rate_tau=0.05):
     a_world = a_world - DRAG_COEFF * state.vel
     state.vel = state.vel + a_world * dt
     state.pos = state.pos + state.vel * dt
+    return a_world
+
+
+def update_gimbal(state, dt, tau):
+    """Semi-strapdown single-axis (cam-x pitch) gimbal servo. NO fixed mount — the gimbal directly
+    drives the camera boresight to HORIZONTAL in the world frame, compensating ownship pitch-down
+    for closing. cam-x is the same physical elevation axis as body-y pitch (R_B2C_BASE maps
+    body-x→cam-z, so a body-y rotation of the boresight becomes a cam y-z plane rotation = cam-x).
+    Boresight world elev = own_pitch + gimbal_total; setting gimbal_total = -own_pitch → elev 0.
+    First-order lag: boresight trails own_pitch by ~tau*d(pitch)/dt (residual fully captured since
+    we use the lagged angle). Returns gimbal_total (the cam-x rotation actually applied = g_servo).
+    """
+    own_pitch = R_to_euler(state.R_b2n)[1]              # nose-down positive
+    servo_cmd = -own_pitch + GIMBAL_BIAS                # gimbal_total → -own_pitch+bias → boresight near-horizontal (slight down-gaze)
+    alpha = 1.0 - np.exp(-dt / tau)
+    state.gimbal_pitch += alpha * (servo_cmd - state.gimbal_pitch)
+    return state.gimbal_pitch                           # gimbal_total (actual, lagged)
 
 
 # ============================================================================
@@ -839,6 +1183,8 @@ def run_scenario(name, target_init_pos, target_vel_fn, uav_init_pos, uav_init_ya
     np.random.seed(seed)
     estimator = RelativeIMMUKFEstimator(dt_cam, FOCAL_LENGTH, W_GUESS, R_B2C)
     controller = AdvancedHybridController()
+    demod = ParallaxDemodulator(controller.dither_freq, controller.dither_amp, FOCAL_LENGTH, dt_cam)
+    r_est_xy_lp = None    # lowpass r_est horizontal -> dither-free LOS reference for the demod axis
     if v_des_override is not None:
         controller.v_des = v_des_override   # exercise the iter-3 terminal-authority path at high speed
     fov_half = np.deg2rad(CAM_FOV_DEG / 2.0)
@@ -866,7 +1212,7 @@ def run_scenario(name, target_init_pos, target_vel_fn, uav_init_pos, uav_init_ya
     n_steps = int(sim_time / dt_ctrl)
     cam_step = max(1, int(round(dt_cam / dt_ctrl)))
     log = {'t': [], 'range': [], 'los_rate': [], 'est_pos_err': [], 'est_vel_err': [],
-           'est_w_err': [], 'mu': [], 'uav_pos': [], 'tgt_pos': [], 'est_pos': [],
+           'est_w_err': [], 'mu': [], 'uav_pos': [], 'tgt_pos': [], 'est_pos': [], 'est_vel': [], 'est_acc': [],
            'cmd': [], 'nan': 0}
     min_range = 1e9
     nan_count = 0
@@ -882,6 +1228,10 @@ def run_scenario(name, target_init_pos, target_vel_fn, uav_init_pos, uav_init_ya
     has_frozen_cmd = False
     last_good_range = 1e9
     last_bbox_time = 0.0
+    # IMU preintegration accumulator: ownship Δv over the current camera window (world frame G).
+    # Filled by step_quadrotor's returned a_world each control step; drained at each camera step.
+    dv_own_accum = np.zeros(3)
+    last_dv_own = np.zeros(3)    # last camera-window Δv_own (for geometric-APN a_own_perp)
     frozen_cmd = np.zeros(4)
     captured = False        # mirror C++ capture lockout: hold after a genuine close intercept
     min_range_seen = 1e9    # min estimated range (reopen detection, mirror C++)
@@ -891,6 +1241,12 @@ def run_scenario(name, target_init_pos, target_vel_fn, uav_init_pos, uav_init_ya
         # target dynamics
         target_vel = np.array(target_vel_fn(t), dtype=float)
         target_pos = target_pos + target_vel * dt_ctrl
+
+        # Semi-strapdown gimbal: every control step, servo the cam-x pitch so boresight → horizontal
+        # (cancels own_pitch's elev effect). Must run BEFORE the camera update (project_target reads
+        # the module-level R_B2C, which we update in-place here). Angle known → estimator consistent.
+        _gimbal_total = update_gimbal(uav, dt_ctrl, GIMBAL_TAU)
+        R_B2C[:,:] = Rx(_gimbal_total) @ R_B2C_BASE
 
         # camera update at camera rate
         if step % cam_step == 0:
@@ -916,10 +1272,53 @@ def run_scenario(name, target_init_pos, target_vel_fn, uav_init_pos, uav_init_ya
                 v += np.random.normal(0, noise_pos)
                 s += np.random.normal(0, noise_size)
                 s = max(1.0, s)
-            ok, x_est = estimator.process_camera(has_bbox, u, v, s, t, uav.pos.copy(), uav.R_b2n.copy())
+            # Drain the IMU-preintegration window for this camera step. dv_own is the ownship
+            # velocity change since the last camera frame (world frame); the estimator consumes it
+            # as the exogenous a_own input to the relativized process model (no ownship pos/vel).
+            dv_own = dv_own_accum.copy()
+            dv_own_accum = np.zeros(3)
+            last_dv_own = dv_own.copy()
+            # Parallax demod feed: project ownship lateral accel + LOS lateral bearing onto e_perp_xy.
+            if has_bbox:
+                los_nav_meas = pixel_to_los_nav(u, v, FOCAL_LENGTH, uav.R_b2n, R_B2C)
+            else:
+                los_nav_meas = None
+            # Dither-free LOS reference: lowpass r_est horizontal so the demod axis does NOT follow
+            # the dither (a rotating e_perp_xy cancels the parallax signal in theta_perp).
+            ref_xy = (estimator.imm_ukf.x[0:2]
+                      if (estimator.initialized and np.linalg.norm(estimator.imm_ukf.x[0:2]) > 1e-3)
+                      else (los_nav_meas[0:2] if los_nav_meas is not None else None))
+            if ref_xy is not None:
+                if r_est_xy_lp is None:
+                    r_est_xy_lp = ref_xy.copy()
+                else:
+                    alpha_lp = clamp(dt_cam / 1.0, 0.0, 1.0)   # tau=1s, cutoff ~0.16Hz < dither 0.5Hz
+                    r_est_xy_lp = r_est_xy_lp + alpha_lp * (ref_xy - r_est_xy_lp)
+            if r_est_xy_lp is not None:
+                e_los_xy = r_est_xy_lp / max(np.linalg.norm(r_est_xy_lp), 1e-6)
+                e_perp_xy = np.array([-e_los_xy[1], e_los_xy[0]])
+                a_lat = float(np.dot(dv_own[0:2] / max(dt_cam, 1e-3), e_perp_xy))
+                if has_bbox and los_nav_meas is not None:
+                    theta_perp = float(np.arctan2(np.dot(los_nav_meas[0:2], e_perp_xy),
+                                                  np.dot(los_nav_meas[0:2], e_los_xy)))
+                else:
+                    theta_perp = None
+            else:
+                a_lat = 0.0
+                theta_perp = None
+            demod.push(t, a_lat, theta_perp, has_bbox)
+            if ENABLE_PARALLAX_DEPTH:
+                z_depth, R_depth, eta_now = demod.compute_depth(t)
+            else:
+                z_depth, R_depth = np.nan, np.inf
+            # Sync estimator's R_b2c to the actual servoed gimbal angle (incl. lag) so its R_n2c and
+            # pixel_to_los_nav match the measurement-generation rotation (project_target uses module R_B2C).
+            estimator.R_b2c = Rx(_gimbal_total) @ R_B2C_BASE
+            ok, x_est = estimator.process_camera(has_bbox, u, v, s, t, uav.R_b2n.copy(), dv_own,
+                                                 z_depth=z_depth, R_depth=R_depth)
             if ok and estimator.initialized:
-                r_est = x_est[0:3] - uav.pos
-                # Fix B: EMA the absolute target velocity so the raw UKF swings don't reach guidance.
+                r_est = x_est[0:3].copy()           # relative pos (target - own) — state IS relative
+                # Fix B: EMA the relative velocity (v_rel) so the raw UKF swings don't reach guidance.
                 tgt_vel = x_est[3:6]
                 if VEL_SMOOTH_TC > 1e-6:
                     if target_vel_smoothed is not None and t > last_tv_t and (t - last_tv_t) < 1.0:
@@ -929,7 +1328,7 @@ def run_scenario(name, target_init_pos, target_vel_fn, uav_init_pos, uav_init_ya
                         target_vel_smoothed = tgt_vel.copy()
                     last_tv_t = t
                     tgt_vel = target_vel_smoothed
-                v_est = tgt_vel - uav.vel
+                v_est = tgt_vel.copy()              # relative velocity (no - uav.vel)
                 if has_bbox:
                     los_nav = pixel_to_los_nav(u, v, FOCAL_LENGTH, uav.R_b2n, R_B2C)
                     los_az_world = np.arctan2(los_nav[1], los_nav[0])
@@ -952,7 +1351,9 @@ def run_scenario(name, target_init_pos, target_vel_fn, uav_init_pos, uav_init_ya
         if cache is not None:
             r_est, v_est, los_az_world, los_el, bbox_size, t_cache, los_rate = cache
             roll, pitch, yaw = R_to_euler(uav.R_b2n)
-            v_fwd_body = np.cos(yaw) * uav.vel[0] + np.sin(yaw) * uav.vel[1]
+            # Closing speed along LOS from relative quantities only (no ownship vel):
+            # v_closing = -d|r|/dt = -v_rel·r̂  (positive = approaching). Replaces odom v_fwd_body.
+            v_closing = -np.dot(v_est, r_est) / max(np.linalg.norm(r_est), 1e-3)
             los_az = los_az_world - yaw
             los_az = np.arctan2(np.sin(los_az), np.cos(los_az))
             # Capture lockout (mirror C++): once intercepted, BRAKE-TO-HOLD to end of mission. The
@@ -971,7 +1372,7 @@ def run_scenario(name, target_init_pos, target_vel_fn, uav_init_pos, uav_init_ya
                 captured = True
             if captured:
                 max_brake_tilt = np.deg2rad(25.0)
-                theta_brake = clamp(-0.12 * v_fwd_body, -max_brake_tilt, max_brake_tilt)
+                theta_brake = clamp(-0.12 * v_closing, -max_brake_tilt, max_brake_tilt)
                 tilt = np.sqrt(roll * roll + pitch * pitch)
                 ctrl = np.array([G / max(np.cos(tilt), 0.3),
                                  clamp(-3.0 * roll, -3.0, 3.0),
@@ -994,11 +1395,14 @@ def run_scenario(name, target_init_pos, target_vel_fn, uav_init_pos, uav_init_ya
                                      clamp(-3.0 * pitch, -3.0, 3.0),
                                      0.0])
                 else:
-                    # Estimated absolute target speed (v_est is relative): drives the speed-aware brake floor.
-                    target_speed = clamp(float(np.linalg.norm(v_est + uav.vel)), 0.0, 15.0)
+                    # Relative-speed proxy drives the speed-aware brake floor (ownship absolute
+                    # speed unobservable without odom). v_z ownship vertical speed ≈ -v_rel[2]
+                    # (target-level approximation; preserves vertical-PD damping sign).
+                    target_speed = clamp(float(np.linalg.norm(v_est)), 0.0, 15.0)
+                    a_own_world = last_dv_own / max(dt_cam, 1e-3)   # ownship world accel (geometric-APN a_own_perp)
                     raw_ctrl = controller.compute_control(roll, pitch, yaw, r_est, v_est, los_az, los_el,
-                                                          t, v_fwd_body, bbox_size, uav.vel[2], los_rate,
-                                                          target_speed)
+                                                          t, v_closing, bbox_size, -v_est[2], los_rate,
+                                                          target_speed, a_own_world=a_own_world)
                     if not np.all(np.isfinite(raw_ctrl)):
                         nan_count += 1
                         raw_ctrl = np.array([G, 0, 0, 0])
@@ -1011,7 +1415,8 @@ def run_scenario(name, target_init_pos, target_vel_fn, uav_init_pos, uav_init_ya
                         last_good_range = np.linalg.norm(r_est)
                         frozen_cmd = ctrl.copy()
                         has_frozen_cmd = True
-            step_quadrotor(uav, ctrl[0], ctrl[1:4], dt_ctrl)
+            a_world_step = step_quadrotor(uav, ctrl[0], ctrl[1:4], dt_ctrl)
+            dv_own_accum += a_world_step * dt_ctrl    # accumulate ownship Δv for next camera window
 
         # range + LOS rate
         rel = target_pos - uav.pos
@@ -1032,19 +1437,25 @@ def run_scenario(name, target_init_pos, target_vel_fn, uav_init_pos, uav_init_ya
         log['uav_pos'].append(uav.pos.copy())
         log['tgt_pos'].append(target_pos.copy())
         if estimator.initialized:
-            est_pos = estimator.imm_ukf.x[0:3]
-            est_vel = estimator.imm_ukf.x[3:6]
+            est_pos = estimator.imm_ukf.x[0:3]   # relative (target-own)
+            est_vel = estimator.imm_ukf.x[3:6]   # relative
             est_w = estimator.imm_ukf.x[9]
-            log['est_pos_err'].append(np.linalg.norm(est_pos - target_pos))
-            log['est_vel_err'].append(np.linalg.norm(est_vel - target_vel))
+            rel_pos_true = target_pos - uav.pos
+            rel_vel_true = target_vel - uav.vel
+            log['est_pos_err'].append(np.linalg.norm(est_pos - rel_pos_true))
+            log['est_vel_err'].append(np.linalg.norm(est_vel - rel_vel_true))
             log['est_w_err'].append(abs(est_w - target_width_true))
             log['est_pos'].append(est_pos.copy())
+            log['est_vel'].append(est_vel.copy())
+            log['est_acc'].append(estimator.imm_ukf.x[6:9].copy())
             log['mu'].append(estimator.imm_ukf.mu.copy())
         else:
             log['est_pos_err'].append(np.nan)
             log['est_vel_err'].append(np.nan)
             log['est_w_err'].append(np.nan)
             log['est_pos'].append(np.array([np.nan]*3))
+            log['est_vel'].append(np.array([np.nan]*3))
+            log['est_acc'].append(np.array([np.nan]*3))
             log['mu'].append(np.array([np.nan]*3))
         log['cmd'].append(prev_rate.copy())
 
@@ -1102,7 +1513,7 @@ def main():
         uav_init_pos=[0.0, 0.0, 10.0],
         uav_init_yaw=0.0,
         sim_time=25.0,
-        v_des_override=10.0)
+        v_des_override=CTRL_V_DES)
     scenarios.append(r1)
 
     # --- Scenario 2: Constant-velocity crossing target ---
@@ -1114,7 +1525,7 @@ def main():
         uav_init_pos=[0.0, 0.0, 10.0],
         uav_init_yaw=0.0,
         sim_time=30.0,
-        v_des_override=10.0)
+        v_des_override=CTRL_V_DES)
     scenarios.append(r2)
 
     # --- Scenario 3: Maneuvering target (coordinated turn) ---
@@ -1130,7 +1541,7 @@ def main():
         uav_init_pos=[0.0, 0.0, 10.0],
         uav_init_yaw=0.0,
         sim_time=30.0,
-        v_des_override=10.0)
+        v_des_override=CTRL_V_DES)
     scenarios.append(r3)
 
     # --- Scenario 4: BBox dropout (target occluded mid-flight) ---
@@ -1143,7 +1554,7 @@ def main():
         uav_init_yaw=0.0,
         sim_time=30.0,
         bbox_dropout_steps=[(300, 400)],  # ~6s-8s at 50Hz
-        v_des_override=10.0)
+        v_des_override=CTRL_V_DES)
     scenarios.append(r4)
 
     # --- Scenario 5: High measurement noise ---
@@ -1156,7 +1567,7 @@ def main():
         uav_init_yaw=0.0,
         sim_time=30.0,
         noise_pos=5.0, noise_size=6.0,
-        v_des_override=10.0)
+        v_des_override=CTRL_V_DES)
     scenarios.append(r5)
 
     # --- Scenario 6: Wrong W_guess (size mismatch) ---
@@ -1169,7 +1580,7 @@ def main():
         uav_init_yaw=0.0,
         sim_time=30.0,
         target_width_true=0.8,
-        v_des_override=10.0)
+        v_des_override=CTRL_V_DES)
     scenarios.append(r6)
 
     # --- Scenario 7: v_des=20 intercept of the same maneuvering target as scenario 3 ----------
@@ -1186,13 +1597,13 @@ def main():
         r = 15.0
         return [-r * omega * np.sin(omega * t), r * omega * np.cos(omega * t), 0.0]
     r7, l7 = run_scenario(
-        "maneuvering_v20",
+        "maneuvering_x2",
         target_init_pos=[45.0, 0.0, 10.0],
         target_vel_fn=ct_vel_v20,
         uav_init_pos=[0.0, 0.0, 10.0],
         uav_init_yaw=0.0,
         sim_time=15.0,
-        v_des_override=20.0)
+        v_des_override=CTRL_V_DES*2)
     scenarios.append(r7)
 
     # === Report ===
