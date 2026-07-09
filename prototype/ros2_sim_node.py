@@ -12,7 +12,9 @@ Subscribes:
   /fpv/mission_state   (std_msgs/Bool) — mission active flag
 
 Internal quadrotor dynamics: first-order body-rate tracking + thrust along body z - gravity.
-Camera: pinhole projection with R_b2c (mount pitch 15°) + Gaussian noise.
+Camera: pinhole projection on a semi-strapdown single-axis pitch gimbal (boresight servo-held
+near-horizontal, 5° down-gaze bias, servo lag 0.1 s) + Gaussian noise. The actual gimbal angle
+is published on /fpv/gimbal_angle (std_msgs/Float64, rad, positive = down-gaze).
 
 Usage:
   ros2 launch drone_interceptor launch_relative_imm_ukf.py   # terminal 1
@@ -37,7 +39,7 @@ from rclpy.node import Node
 from nav_msgs.msg import Odometry
 from vision_msgs.msg import Detection2D
 from quadrotor_msgs.msg import ControlCommand
-from std_msgs.msg import Header, Bool
+from std_msgs.msg import Header, Bool, Float64
 
 
 # ============================================================================
@@ -47,21 +49,28 @@ M_PI = math.pi
 CAM_WIDTH_PX = 960
 CAM_HEIGHT_PX = 960
 CAM_FOV_DEG = 60.0
-MOUNT_PITCH_DEG = 15.0
 FOCAL_LENGTH = (CAM_WIDTH_PX / 2.0) / math.tan(math.radians(CAM_FOV_DEG) / 2.0)
 FOV_HALF_RAD = math.radians(CAM_FOV_DEG / 2.0)
 
-# R_b2c: body(FLU) -> cam(RDF), with mount pitch. Must EXACTLY mirror the C++ node's
-# load_parameters(): p_rad = -mount_pitch_deg, R_b2c = R_pitch(p_rad) @ R_b2c_base. A sign flip
-# here makes the node reconstruct a 30-deg-elev error on a level target and the UAV climbs away.
+# R_b2c base: body(FLU) -> cam(RDF). NO fixed mount — the semi-strapdown single-axis pitch gimbal
+# replaces it: R_B2C = Rx(gimbal_total) @ R_B2C_BASE, updated every control step. Convention
+# (mirror of the C++ node's gimbal_R_b2c and sim_test_relative_imm_ukf.py): Rx =
+# [[1,0,0],[0,c,-s],[0,s,c]], POSITIVE angle = down-gaze. Boresight world elevation =
+# -(own_pitch + gimbal_total); the servo tracks servo_cmd = -own_pitch + GIMBAL_BIAS with a
+# first-order lag GIMBAL_TAU, so the boresight settles at -GIMBAL_BIAS (5 deg down-gaze).
+# The ACTUAL lagged angle is published on /fpv/gimbal_angle so the node sees the true camera
+# orientation including lag.
 R_B2C_BASE = np.array([[0.0, -1.0, 0.0],
                        [0.0, 0.0, -1.0],
                        [1.0, 0.0, 0.0]])
-_p = math.radians(-MOUNT_PITCH_DEG)   # node negates pitch_deg; mirror that so boresight tilts up for +pitch
-R_PITCH = np.array([[1.0, 0.0, 0.0],
-                    [0.0, math.cos(_p), -math.sin(_p)],
-                    [0.0, math.sin(_p), math.cos(_p)]])
-R_B2C = R_PITCH @ R_B2C_BASE
+GIMBAL_TAU = 0.1                       # s, servo lag (boresight trails body pitch changes)
+GIMBAL_BIAS = math.radians(5.0)        # rad, fixed down-gaze bias (positive = down)
+R_B2C = R_B2C_BASE.copy()              # updated in-place each control step from the gimbal state
+
+
+def Rx(a):
+    c, s = math.cos(a), math.sin(a)
+    return np.array([[1.0, 0.0, 0.0], [0.0, c, -s], [0.0, s, c]])
 
 G = 9.81
 DRAG_COEFF = 0.0    # no drag — the active brake-to-hold (capture) stops the UAV; drag blunts the close approach
@@ -167,6 +176,21 @@ class QuadState:
     vel: np.ndarray = field(default_factory=lambda: np.zeros(3))
     R_b2n: np.ndarray = field(default_factory=lambda: np.eye(3))
     omega: np.ndarray = field(default_factory=lambda: np.zeros(3))
+    gimbal_pitch: float = GIMBAL_BIAS   # semi-strapdown cam-x pitch servo state (actual angle)
+
+
+def update_gimbal(state, dt, tau=GIMBAL_TAU):
+    """Semi-strapdown single-axis (cam-x pitch) gimbal servo. The gimbal drives the camera
+    boresight to near-horizontal in the world frame, compensating ownship pitch. Boresight world
+    elev = -(own_pitch + gimbal_total); servo_cmd = -own_pitch + GIMBAL_BIAS => boresight settles
+    at -GIMBAL_BIAS (down-gaze). First-order lag tau: the boresight trails fast pitch changes;
+    the residual is fully captured because the ACTUAL lagged angle is what gets published/applied.
+    Returns gimbal_total (the cam-x rotation actually applied)."""
+    own_pitch = R_to_euler(state.R_b2n)[1]              # nose-down positive
+    servo_cmd = -own_pitch + GIMBAL_BIAS
+    alpha = 1.0 - math.exp(-dt / tau)
+    state.gimbal_pitch += alpha * (servo_cmd - state.gimbal_pitch)
+    return state.gimbal_pitch
 
 
 def step_quadrotor(state, throttle, omega_cmd, dt):
@@ -277,6 +301,7 @@ class SimNode(Node):
         self.odom_pub = self.create_publisher(Odometry, '/fpv/odom', sensor_qos)
         self.bbox_pub = self.create_publisher(Detection2D, '/fpv/target_bbox', reliable_qos)
         self.trigger_pub = self.create_publisher(Header, '/fpv/tracker_trigger', 10)
+        self.gimbal_pub = self.create_publisher(Float64, '/fpv/gimbal_angle', sensor_qos)
 
         # Subscribers
         self.control_sub = self.create_subscription(
@@ -310,7 +335,8 @@ class SimNode(Node):
         self.launch_timer = self.create_timer(1.0, self.launch_once)
 
         self.get_logger().info(
-            f"Sim node ready. focal={FOCAL_LENGTH:.1f} fov={CAM_FOV_DEG} mount={MOUNT_PITCH_DEG}")
+            f"Sim node ready. focal={FOCAL_LENGTH:.1f} fov={CAM_FOV_DEG} "
+            f"gimbal(tau={GIMBAL_TAU}s bias={math.degrees(GIMBAL_BIAS):.1f}deg)")
 
     def launch_once(self):
         if self.mission_launched:
@@ -358,6 +384,15 @@ class SimNode(Node):
         if self.latest_cmd is not None:
             throttle, rates = self.latest_cmd
             step_quadrotor(self.uav, throttle, rates, self.dt_ctrl)
+
+        # Semi-strapdown gimbal: servo the cam-x pitch every control step (before the camera
+        # projection reads module R_B2C) and publish the ACTUAL lagged angle so the node rebuilds
+        # R_b2c from the true camera orientation.
+        gimbal_total = update_gimbal(self.uav, self.dt_ctrl)
+        R_B2C[:, :] = Rx(gimbal_total) @ R_B2C_BASE
+        gmsg = Float64()
+        gmsg.data = float(gimbal_total)
+        self.gimbal_pub.publish(gmsg)
 
         # range + LOS rate
         rel = self.target_pos - self.uav.pos

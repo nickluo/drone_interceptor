@@ -46,10 +46,16 @@ interceptor_node_relative_imm_ukf:
       width_px: 960
       height_px: 960
       fov_deg: 60.0
-      # Fixed camera mounting pitch relative to the body (degrees, up positive). A positive
-      # value tilts the strapdown boresight up so the target stays in FOV while the body
-      # pitches nose-down to accelerate forward.
-      mount_pitch_deg: 15.0
+      # Fixed camera mounting pitch relative to the body (degrees, up positive). IGNORED when
+      # use_gimbal is true (the gimbal replaces the fixed mount).
+      mount_pitch_deg: 0.0
+      # Semi-strapdown single-axis pitch gimbal: servo keeps the boresight near-horizontal in the
+      # world frame regardless of body pitch (with servo lag); the ACTUAL angle is measured and
+      # published on /fpv/gimbal_angle (std_msgs/Float64, rad, positive = down-gaze) in real time.
+      # R_b2c = Rx(angle) * R_b2c_base. gimbal_bias_deg = fixed down-gaze bias: boresight world
+      # elevation = -gimbal_bias_deg (keeps nonzero image-v for co-altitude targets).
+      use_gimbal: true
+      gimbal_bias_deg: 5.0
 
     # Extrinsic parameters: Rotation from body (IMU) to camera frame (3x3 flattened row-major)
     # Camera frame (RDF): X-right, Y-down, Z-front
@@ -71,7 +77,10 @@ interceptor_node_relative_imm_ukf:
       # on a maneuvering/crossing target; the speed-aware brake floor (see compute_control) keeps
       # the final-approach speed above the target speed so v_des sets the mid-course advantage.
       v_des: 20.0
-      max_tilt_deg: 25.0
+      # Pitch/roll authority (user req: 45 deg). Safe with the gimbal: the camera boresight is
+      # decoupled from body pitch, so a steep accel/brake pitch no longer tilts the target out of
+      # the vertical FOV.
+      max_tilt_deg: 45.0
       # FOV keep-in-frame guard
       enable_fov_clamp: true   # hard-clamp pitch to keep target in FOV (original sign, less restrictive)
       fov_keep_margin: 0.65    # fraction of the FOV half-angle to keep the target within

@@ -2,6 +2,7 @@
 #include <sensor_msgs/msg/imu.hpp>
 #include <vision_msgs/msg/detection2_d.hpp>
 #include <std_msgs/msg/bool.hpp>
+#include <std_msgs/msg/float64.hpp>
 #include <std_msgs/msg/header.hpp>
 #include <quadrotor_msgs/msg/control_command.hpp>
 #include <nav_msgs/msg/odometry.hpp>
@@ -635,6 +636,12 @@ public:
                                 // zero-crossing; with K_z=2 -> zeta≈0.7. Was pure-P -> AirSim z porpoising)
     double K_fwd_ = 2.0;        // axial: a_fwd = K_fwd * (v_des - v_fwd_body)
     double terminal_bbox_size_ = 80.0;  // bbox px at terminal_brake_range (computed from focal/W)
+    // Semi-strapdown single-axis pitch gimbal: keeps the camera boresight near-horizontal
+    // (world elev = -gimbal_bias_) regardless of body pitch, so the vertical FOV is DECOUPLED
+    // from theta_cmd. When true, the fixed-mount pitch FOV clamp is skipped and vertical
+    // keep-in-frame is done through ALTITUDE (a_z) instead (see compute_control).
+    bool has_gimbal_ = false;
+    double gimbal_bias_ = 0.0;   // rad, down-gaze bias: boresight elev = -gimbal_bias_
     // Speed-scheduled PN + attitude reference slew governor (v_des=20 oscillation fixes).
     double v_pn_ref_ = 1e9;       // cap on v_fwd in PN lateral accel -> bounds effective N*v at high speed
     double max_att_rate_ = 1e9;   // max |d(phi_cmd)/dt|, |d(theta_cmd)/dt| [rad/s] (slew governor)
@@ -692,6 +699,10 @@ public:
     void set_a_z_slew(double v) { a_z_slew_ = (v > 0.0) ? v : 1e9; }  // <=0 disables the slew limit
     void set_lateral_decay_floor(double v) { lateral_decay_floor_ = clamp(v, 0.0, 1.0); }
     void set_lat_decay_start(double v) { lat_decay_start_ = std::max(v, terminal_brake_range_ + 1.0); }
+    void set_gimbal(bool has_gimbal, double gimbal_bias_rad) {
+        has_gimbal_ = has_gimbal;
+        gimbal_bias_ = gimbal_bias_rad;
+    }
 
     // Decoupled control. Inputs:
     //   r_est, v_est : target rel pos/vel in NAV frame (v_est noisy, used only for LOS rate)
@@ -911,7 +922,25 @@ public:
         // making it impossible to catch moving targets. Accept brief FOV loss during approach;
         // the estimator dead-reckons and reacquires when the UAV levels out for terminal guidance.
         target_behind = std::abs(los_az) > (M_PI / 2.0);
-        if (enable_fov_clamp_ && !target_behind && r_norm < 15.0) {
+        if (enable_fov_clamp_ && has_gimbal_ && !target_behind) {
+            // Semi-strapdown gimbal: the boresight is decoupled from body pitch (gimbal cancels
+            // it; elev ~= -gimbal_bias_), so a theta clamp cannot keep the target in the vertical
+            // FOV — ALTITUDE can. If the target approaches the bottom edge (los_el well below the
+            // boresight), command a descent so the frame re-centers; symmetric for the top edge.
+            // Overrides the PD a_z only near the edge (outer 30% of the half-FOV). Mirrors the
+            // verified Python implementation (sim_test_relative_imm_ukf.py).
+            const double fov_keep = fov_half_v_ * fov_keep_margin_;
+            const double boresight_el = -gimbal_bias_;
+            const double el_err = los_el - boresight_el;   // negative = target below boresight
+            const double edge = 0.7 * fov_keep;
+            if (el_err < -edge) {
+                a_z = std::min(a_z, -8.0 * clamp((-el_err - edge) /
+                                                 std::max(fov_keep - edge, 1e-3), 0.0, 1.0));
+            } else if (el_err > edge) {
+                a_z = std::max(a_z, 8.0 * clamp((el_err - edge) /
+                                                std::max(fov_keep - edge, 1e-3), 0.0, 1.0));
+            }
+        } else if (enable_fov_clamp_ && !target_behind && r_norm < 15.0) {
             const double fov_hard = fov_half_v_;
             // theta_hi (nose-down): kept conservative (fov_hard - los_el - mount_pitch). The
             // geometrically correct form (mount_pitch + fov_hard - los_el) allows large nose-down
@@ -965,15 +994,15 @@ public:
         has_last_att_   = true;
 
         // ---- (B) Thrust: magnitude to realize the vertical component + tilt overhead --------
-        // throttle = (a_z + g) / cos(tilt): the collective thrust along body-z needed so its
-        // vertical projection matches (a_z + g). Horizontal projection comes from the tilt and
-        // produces fx_h/fy_h once the attitude tracks theta_cmd/phi_cmd. Using |thrust_vec| here
-        // would over-thrust while level (throttle ~ sqrt(fx_h^2+g^2) >> g) and cause pure climb
-        // before the body can tilt; the /cos(tilt) form ramps throttle with tilt instead.
-        const double a_h_mag = std::sqrt(fx_h * fx_h + fy_h * fy_h);
-        double tilt = std::atan2(a_h_mag, a_z + g);
-        if (tilt > max_tilt_rad) tilt = max_tilt_rad;
-        const double throttle = clamp((a_z + g) / std::cos(tilt), 2.0, 25.0);
+        // Throttle from the ACTUAL attitude, not the commanded tilt: during a hard brake the
+        // attitude lags theta_cmd, and (a_z+g)/cos(commanded tilt) then over-thrusts vertically ->
+        // brake-climb -> target exits the bottom of the (gimbal-horizontal) frame at 5-7 m.
+        // T*cos(actual tilt) = a_z + g  =>  vertical accel tracks a_z regardless of the attitude
+        // lag. Floor the divisor slightly beyond max_tilt so a transient over-bank cannot blow
+        // the throttle up. Mirrors the verified Python implementation.
+        const double cos_tilt_actual = std::max(std::cos(roll) * std::cos(pitch),
+                                                std::cos(max_tilt_rad + 0.2));
+        const double throttle = clamp((a_z + g) / cos_tilt_actual, 2.0, 25.0);
 
         // ---- Attitude rate commands (P on attitude error) -------------------------------
         // Yaw rate boost when target near horizontal FOV edge: turn nose toward target
@@ -1001,6 +1030,14 @@ public:
         this->declare_parameter<int>("camera.height_px", 480);
         this->declare_parameter<double>("camera.fov_deg", 60.0);
         this->declare_parameter<double>("camera.mount_pitch_deg", 0.0);
+        // Semi-strapdown single-axis pitch gimbal: the camera boresight is servo-stabilized to
+        // near-horizontal (down-gaze = gimbal_bias_deg) regardless of body pitch, with a small
+        // servo lag. The ACTUAL gimbal angle is measured and published in real time; the node
+        // consumes it to rebuild R_b2c per frame: R_b2c = Rx(gimbal_angle) * R_b2c_base, where
+        // Rx uses [[1,0,0],[0,c,-s],[0,s,c]] and POSITIVE angle = down-gaze. When enabled the
+        // fixed mount_pitch is ignored (the gimbal replaces the fixed mount).
+        this->declare_parameter<bool>("camera.use_gimbal", false);
+        this->declare_parameter<double>("camera.gimbal_bias_deg", 5.0);
         this->declare_parameter<std::vector<double>>("extrinsics.body_to_camera_rotation", 
             {0.0, -1.0, 0.0, 0.0, 0.0, -1.0, 1.0, 0.0, 0.0});
         this->declare_parameter<double>("controller.N", 4.5);
@@ -1060,6 +1097,13 @@ public:
         bbox_sub_ = this->create_subscription<vision_msgs::msg::Detection2D>(
             "/fpv/target_bbox", 10, std::bind(&InterceptorNodeRelativeIMMUKF::bbox_callback, this, std::placeholders::_1), sub_options);
 
+        // Actual (measured, lagged) gimbal pitch angle in rad; published by the gimbal driver /
+        // sim harness at the control rate. Convention: R_b2c = Rx(angle) * R_b2c_base, positive
+        // = down-gaze. Only consumed when camera.use_gimbal is true.
+        gimbal_sub_ = this->create_subscription<std_msgs::msg::Float64>(
+            "/fpv/gimbal_angle", rclcpp::SensorDataQoS(),
+            std::bind(&InterceptorNodeRelativeIMMUKF::gimbal_callback, this, std::placeholders::_1), sub_options);
+
         control_pub_ = this->create_publisher<quadrotor_msgs::msg::ControlCommand>("/fpv/control_command", 10);
         mission_state_pub_ = this->create_publisher<std_msgs::msg::Bool>("/fpv/mission_state", 10);
 
@@ -1089,7 +1133,17 @@ private:
         R_pitch << 1.0, 0.0, 0.0,
                    0.0, std::cos(p_rad), -std::sin(p_rad),
                    0.0, std::sin(p_rad), std::cos(p_rad);
-        R_b2c_ = R_pitch * R_b2c_base;
+        R_b2c_base_ = R_b2c_base;
+        use_gimbal_ = this->get_parameter("camera.use_gimbal").as_bool();
+        gimbal_bias_rad_ = this->get_parameter("camera.gimbal_bias_deg").as_double() * M_PI / 180.0;
+        if (use_gimbal_) {
+            // Gimbal replaces the fixed mount. Until the first gimbal message arrives, assume the
+            // body is level so the servo sits at its bias (boresight = bias down-gaze).
+            latest_gimbal_pitch_ = gimbal_bias_rad_;
+            R_b2c_ = gimbal_R_b2c(gimbal_bias_rad_);
+        } else {
+            R_b2c_ = R_pitch * R_b2c_base;
+        }
 
         dt_cam_ = this->get_parameter("estimation.dt_cam").as_double();
         W_guess_ = this->get_parameter("estimation.W_guess").as_double();
@@ -1144,6 +1198,7 @@ private:
         controller_->set_a_z_slew(this->get_parameter("controller.a_z_slew").as_double());
         controller_->set_lateral_decay_floor(this->get_parameter("controller.lateral_decay_floor").as_double());
         controller_->set_lat_decay_start(this->get_parameter("controller.lateral_decay_start").as_double());
+        controller_->set_gimbal(use_gimbal_, gimbal_bias_rad_);
         vel_smooth_tc_ = this->get_parameter("estimation.vel_smooth_tc").as_double();
 
     }
@@ -1186,10 +1241,20 @@ private:
 
         Eigen::Vector3d uav_pos_use;
         Eigen::Matrix3d R_b2n;
+        double gimbal_pitch_now = 0.0;
         {
             std::lock_guard<std::mutex> ol(odom_mtx_);
             uav_pos_use = latest_odom_pos_;
             R_b2n = latest_R_b2n_;
+            gimbal_pitch_now = latest_gimbal_pitch_;
+        }
+
+        // Semi-strapdown gimbal: rebuild R_b2c from the ACTUAL (lagged) servo angle so the
+        // measurement model and the LOS reconstruction match the physical camera orientation at
+        // capture time. The angle is measured in real time, so lag is fully accounted for.
+        if (use_gimbal_) {
+            R_b2c_ = gimbal_R_b2c(gimbal_pitch_now);
+            estimator_->R_b2c = R_b2c_;
         }
 
         const bool was_initialized = estimator_->initialized;
@@ -1411,21 +1476,24 @@ private:
                 cache.r_est.norm(), los_az * 180.0 / M_PI);
         }
         if (captured_) {
-            // Brake-to-hold: cancel forward velocity with nose-up pitch (a real quad brakes by
-            // pitching), level the roll, hold altitude. theta_brake -> 0 as v_fwd -> 0, so this
-            // naturally settles into a level hover once stopped (works in the drag-free sim AND on
-            // real hardware; pure zero-rate "hover" sinks on a banked body and never stops a
-            // drag-free body).
+            // Brake-to-hold: cancel the FULL horizontal velocity with attitude (a real quad brakes
+            // by tilting), then settle into a level hover. theta_brake cancels the forward (body-x)
+            // component; phi_brake cancels the lateral (body-y) component — a crossing/banked
+            // intercept ends with several m/s of LATERAL velocity, and leveling the roll alone
+            // never decelerates it (the drag-free sim drifts forever; a real quad drifts far).
+            // Both angles -> 0 as velocity -> 0, so this settles into a level hover once stopped.
             constexpr double g_hover = 9.81;
-            constexpr double max_brake_tilt = 0.436;   // 25 deg
+            constexpr double max_brake_tilt = 0.785;   // 45 deg (matches max_tilt authority)
+            const double v_lat_body = -std::sin(yaw) * odom_vel(0) + std::cos(yaw) * odom_vel(1);
             const double theta_brake = clamp(-0.12 * v_fwd_body, -max_brake_tilt, max_brake_tilt);
+            const double phi_brake = clamp(0.12 * v_lat_body, -max_brake_tilt, max_brake_tilt);
             const double tilt = std::sqrt(roll * roll + pitch * pitch);
             auto cmd = std::make_unique<quadrotor_msgs::msg::ControlCommand>();
             cmd->header.stamp = now;
             cmd->armed = true;
             cmd->control_mode = quadrotor_msgs::msg::ControlCommand::BODY_RATES;
             cmd->collective_thrust = g_hover / std::max(std::cos(tilt), 0.3);
-            cmd->bodyrates.x = clamp(-3.0 * roll, -3.0, 3.0) * ctrl_coeff_;
+            cmd->bodyrates.x = clamp(5.0 * (phi_brake - roll), -3.0, 3.0) * ctrl_coeff_;
             cmd->bodyrates.y = clamp(5.0 * (theta_brake - pitch), -3.0, 3.0) * ctrl_coeff_;
             cmd->bodyrates.z = 0.0;
             last_cmd_ = Eigen::Vector3d(cmd->bodyrates.x, cmd->bodyrates.y, cmd->bodyrates.z);
@@ -1588,6 +1656,22 @@ private:
         latest_gyro_(2) = msg->angular_velocity.z;
     }
 
+    // Actual gimbal pitch angle (rad, lagged servo measurement). Convention documented at the
+    // parameter declaration: R_b2c = Rx(angle) * R_b2c_base, positive = down-gaze.
+    void gimbal_callback(const std_msgs::msg::Float64::SharedPtr msg) {
+        std::lock_guard<std::mutex> odom_lock(odom_mtx_);
+        latest_gimbal_pitch_ = msg->data;
+    }
+
+    // Build R_b2c from the given gimbal cam-x pitch angle (positive = down-gaze).
+    Eigen::Matrix3d gimbal_R_b2c(double angle) const {
+        Eigen::Matrix3d R_g;
+        R_g << 1.0, 0.0, 0.0,
+               0.0, std::cos(angle), -std::sin(angle),
+               0.0, std::sin(angle), std::cos(angle);
+        return R_g * R_b2c_base_;
+    }
+
     void odom_callback(const nav_msgs::msg::Odometry::SharedPtr msg) {
         std::lock_guard<std::mutex> odom_lock(odom_mtx_);
         latest_odom_pos_(0) = msg->pose.pose.position.x;
@@ -1677,6 +1761,11 @@ private:
     double cam_fov_deg_ = 60.0;
     double focal_length_ = 554.256;
     Eigen::Matrix3d R_b2c_ = Eigen::Matrix3d::Identity();
+    Eigen::Matrix3d R_b2c_base_ = Eigen::Matrix3d::Identity();
+    // Semi-strapdown gimbal state (see parameter declaration for the convention).
+    bool use_gimbal_ = false;
+    double gimbal_bias_rad_ = 0.0;
+    double latest_gimbal_pitch_ = 0.0;   // rad, actual servo angle; guarded by odom_mtx_
 
     double dt_cam_ = 0.033;
     double W_guess_ = 1.5;
@@ -1692,6 +1781,7 @@ private:
     rclcpp::Subscription<nav_msgs::msg::Odometry>::SharedPtr odom_sub_;
     rclcpp::Subscription<sensor_msgs::msg::Imu>::SharedPtr imu_sub_;
     rclcpp::Subscription<vision_msgs::msg::Detection2D>::SharedPtr bbox_sub_;
+    rclcpp::Subscription<std_msgs::msg::Float64>::SharedPtr gimbal_sub_;
     rclcpp::Publisher<quadrotor_msgs::msg::ControlCommand>::SharedPtr control_pub_;
     rclcpp::Publisher<std_msgs::msg::Bool>::SharedPtr mission_state_pub_;
 
