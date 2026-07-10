@@ -37,6 +37,7 @@ import rclpy
 import rclpy.qos
 from rclpy.node import Node
 from nav_msgs.msg import Odometry
+from sensor_msgs.msg import Imu
 from vision_msgs.msg import Detection2D
 from quadrotor_msgs.msg import ControlCommand
 from std_msgs.msg import Header, Bool, Float64
@@ -195,9 +196,8 @@ def update_gimbal(state, dt, tau=GIMBAL_TAU):
 
 def step_quadrotor(state, throttle, omega_cmd, dt):
     """Integrate quadrotor. throttle = collective accel (m/s^2) along body z.
-    omega_cmd tracked with first-order lag tau. Linear body drag (DRAG_COEFF, from yaml
-    physics.drag_coeff) opposes world velocity — a real quad decelerates when leveled; without it the
-    sim is drag-free and any residual forward speed coasts forever (the post-intercept fly-away)."""
+    omega_cmd tracked with first-order lag tau. Returns a_world (gravity-corrected free accel)
+    so the IMU publisher can derive the body-frame specific force."""
     state.omega = state.omega + (omega_cmd - state.omega) * (dt / RATE_TAU)
     w = state.omega * dt
     angle = np.linalg.norm(w)
@@ -211,6 +211,7 @@ def step_quadrotor(state, throttle, omega_cmd, dt):
     a_world = a_world - DRAG_COEFF * state.vel
     state.vel = state.vel + a_world * dt
     state.pos = state.pos + state.vel * dt
+    return a_world
 
 
 # ============================================================================
@@ -299,6 +300,7 @@ class SimNode(Node):
 
         # Publishers
         self.odom_pub = self.create_publisher(Odometry, '/fpv/odom', sensor_qos)
+        self.imu_pub = self.create_publisher(Imu, '/mavros/imu/data', sensor_qos)
         self.bbox_pub = self.create_publisher(Detection2D, '/fpv/target_bbox', reliable_qos)
         self.trigger_pub = self.create_publisher(Header, '/fpv/tracker_trigger', 10)
         self.gimbal_pub = self.create_publisher(Float64, '/fpv/gimbal_angle', sensor_qos)
@@ -381,9 +383,10 @@ class SimNode(Node):
         self.target_pos = self.target_pos + self.target_vel * self.dt_ctrl
 
         # apply control if available
+        a_world = np.zeros(3)
         if self.latest_cmd is not None:
             throttle, rates = self.latest_cmd
-            step_quadrotor(self.uav, throttle, rates, self.dt_ctrl)
+            a_world = step_quadrotor(self.uav, throttle, rates, self.dt_ctrl)
 
         # Semi-strapdown gimbal: servo the cam-x pitch every control step (before the camera
         # projection reads module R_B2C) and publish the ACTUAL lagged angle so the node rebuilds
@@ -420,8 +423,9 @@ class SimNode(Node):
             self.log['cmd_throttle'].append(0.0)
             self.log['cmd_rate'].append(np.zeros(3))
 
-        # publish odom
+        # publish odom (legacy/debug — the ODOMETRY-FREE node does not subscribe) + IMU
         self.publish_odom(t)
+        self.publish_imu(a_world)
 
         if t % 2.0 < self.dt_ctrl:
             self.get_logger().info(
@@ -450,6 +454,27 @@ class SimNode(Node):
         msg.twist.twist.linear.y = float(vel_body[1])
         msg.twist.twist.linear.z = float(vel_body[2])
         self.odom_pub.publish(msg)
+
+    def publish_imu(self, a_world):
+        """Bias-free IMU at the control rate: orientation (b2n quaternion), body angular velocity,
+        and body-frame specific force f_b = R^T (a_world + g·e_z). The node's strapdown
+        preintegration reconstructs dv_own = ∫(R·f_b − g)dt from exactly this."""
+        msg = Imu()
+        msg.header.stamp = self.get_clock().now().to_msg()
+        msg.header.frame_id = "base_link"
+        w, x, y, z = R_to_quat(self.uav.R_b2n)
+        msg.orientation.w = float(w)
+        msg.orientation.x = float(x)
+        msg.orientation.y = float(y)
+        msg.orientation.z = float(z)
+        msg.angular_velocity.x = float(self.uav.omega[0])
+        msg.angular_velocity.y = float(self.uav.omega[1])
+        msg.angular_velocity.z = float(self.uav.omega[2])
+        f_body = self.uav.R_b2n.T @ (a_world + np.array([0.0, 0.0, G]))
+        msg.linear_acceleration.x = float(f_body[0])
+        msg.linear_acceleration.y = float(f_body[1])
+        msg.linear_acceleration.z = float(f_body[2])
+        self.imu_pub.publish(msg)
 
     def cam_loop(self):
         if self.start_time is None:

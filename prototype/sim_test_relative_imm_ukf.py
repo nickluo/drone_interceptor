@@ -1505,7 +1505,7 @@ def main():
     scenarios = []
 
     # --- Scenario 1: Nominal — stationary target ahead, level ---
-    print("[1/7] Nominal: stationary target ahead (v_des=10)...")
+    print("[1/7] Nominal: stationary target ahead...")
     r1, l1 = run_scenario(
         "nominal_stationary",
         target_init_pos=[40.0, 0.0, 10.0],
@@ -1517,7 +1517,7 @@ def main():
     scenarios.append(r1)
 
     # --- Scenario 2: Constant-velocity crossing target ---
-    print("[2/7] Crossing target (constant velocity, v_des=10)...")
+    print("[2/7] Crossing target (constant velocity)...")
     r2, l2 = run_scenario(
         "crossing_cv",
         target_init_pos=[50.0, 20.0, 12.0],
@@ -1529,7 +1529,7 @@ def main():
     scenarios.append(r2)
 
     # --- Scenario 3: Maneuvering target (coordinated turn) ---
-    print("[3/7] Maneuvering target (coordinated turn, v_des=10)...")
+    print("[3/7] Maneuvering target (coordinated turn)...")
     def ct_vel(t):
         omega = 0.3
         r = 15.0
@@ -1545,7 +1545,7 @@ def main():
     scenarios.append(r3)
 
     # --- Scenario 4: BBox dropout (target occluded mid-flight) ---
-    print("[4/7] BBox dropout (2s occlusion, v_des=10)...")
+    print("[4/7] BBox dropout (2s occlusion)...")
     r4, l4 = run_scenario(
         "bbox_dropout",
         target_init_pos=[40.0, 5.0, 10.0],
@@ -1558,7 +1558,7 @@ def main():
     scenarios.append(r4)
 
     # --- Scenario 5: High measurement noise ---
-    print("[5/7] High measurement noise (v_des=10)...")
+    print("[5/7] High measurement noise...")
     r5, l5 = run_scenario(
         "high_noise",
         target_init_pos=[35.0, 0.0, 10.0],
@@ -1571,7 +1571,7 @@ def main():
     scenarios.append(r5)
 
     # --- Scenario 6: Wrong W_guess (size mismatch) ---
-    print("[6/7] Wrong W_guess (true=0.8, guess=1.5, v_des=10)...")
+    print("[6/7] Wrong W_guess (true=0.8, guess=1.5)...")
     r6, l6 = run_scenario(
         "wrong_wguess",
         target_init_pos=[40.0, 0.0, 10.0],
@@ -1591,7 +1591,7 @@ def main():
     # pure-pursuit + PN axial guidance — at 20 m/s the pursuer overshot and range reopened to ~60 m
     # before a fragile second-pass intercept at 0.92 m / 14.7 s. This geometry intercepts cleanly in a
     # single pass (~0.9 m at ~9 s). Verified: range is monotone-decreasing, no reopen.
-    print("[7/7] v_des=20 maneuvering target (same target as #3, high-speed terminal authority)...")
+    print("[7/7] x2 maneuvering target (same target as #3, high-speed terminal authority)...")
     def ct_vel_v20(t):
         omega = 0.3
         r = 15.0

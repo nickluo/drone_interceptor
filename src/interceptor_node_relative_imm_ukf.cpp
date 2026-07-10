@@ -67,65 +67,82 @@ Eigen::MatrixXd make_Q(double q_pos, double q_vel, double q_acc, double q_w) {
     return Q;
 }
 
-Eigen::VectorXd f_singer(const Eigen::VectorXd& x, double dt) {
+// Relative-state motion models. State x = [r(3), v_rel(3), a_t(3), W(1)] in a gravity-aligned
+// world frame G (origin arbitrary). r/v_rel are TARGET-OWNSHIP (relative); a_t is the target's
+// OWN acceleration; `a_own` is the ownship's world-frame acceleration over dt, supplied as an
+// exogenous input from IMU preintegration (dv_own/dt, gravity-corrected). Ownship pos/vel are
+// NOT state — relative quantities are drift-free because each bbox update closes the loop on r.
+// Exact mirror of the verified Python prototype (sim_test_relative_imm_ukf.py).
+Eigen::VectorXd f_singer(const Eigen::VectorXd& x, double dt, const Eigen::Vector3d& a_own) {
     Eigen::VectorXd x_new = x;
     const double decay = std::exp(-dt / 1.5);
-    x_new.segment<3>(6) = x.segment<3>(6) * decay;
-    x_new.segment<3>(3) = x.segment<3>(3) + x.segment<3>(6) * dt;
-    x_new.segment<3>(0) = x.segment<3>(0) + x.segment<3>(3) * dt + 0.5 * x.segment<3>(6) * dt * dt;
+    const Eigen::Vector3d a_rel = x.segment<3>(6) - a_own;      // relative accel = a_target - a_ownship
+    x_new.segment<3>(6) = x.segment<3>(6) * decay;              // target own accel decays (Singer)
+    x_new.segment<3>(3) = x.segment<3>(3) + a_rel * dt;         // v_rel
+    x_new.segment<3>(0) = x.segment<3>(0) + x.segment<3>(3) * dt + 0.5 * a_rel * dt * dt;   // r
     x_new(9) = x(9);
     return x_new;
 }
 
-Eigen::VectorXd f_ct(const Eigen::VectorXd& x, double dt) {
+Eigen::VectorXd f_ct(const Eigen::VectorXd& x, double dt, const Eigen::Vector3d& a_own) {
     Eigen::VectorXd x_new = x;
     const Eigen::Vector3d p = x.segment<3>(0);
-    const Eigen::Vector3d v = x.segment<3>(3);
-    const Eigen::Vector3d a = x.segment<3>(6);
+    const Eigen::Vector3d v = x.segment<3>(3);      // v_rel
+    const Eigen::Vector3d a_t = x.segment<3>(6);    // target own accel
+    const Eigen::Vector3d a_rel = a_t - a_own;
     const double v_xy2 = std::max(v(0) * v(0) + v(1) * v(1), 1e-4);
-    const double omega = clamp((v(0) * a(1) - v(1) * a(0)) / v_xy2, -2.0, 2.0);
+    // approx: v_rel stands in for target vel in the turn-rate estimate
+    const double omega = clamp((v(0) * a_t(1) - v(1) * a_t(0)) / v_xy2, -2.0, 2.0);
 
     if (std::abs(omega) < 1e-3) {
-        x_new.segment<3>(0) = p + v * dt + 0.5 * a * dt * dt;
-        x_new.segment<3>(3) = v + a * dt;
+        x_new.segment<3>(0) = p + v * dt + 0.5 * a_rel * dt * dt;
+        x_new.segment<3>(3) = v + a_rel * dt;
     } else {
         const double sin_wt = std::sin(omega * dt);
         const double cos_wt = std::cos(omega * dt);
         x_new(0) = p(0) + (v(0) * sin_wt - v(1) * (1.0 - cos_wt)) / omega;
         x_new(1) = p(1) + (v(1) * sin_wt + v(0) * (1.0 - cos_wt)) / omega;
-        x_new(2) = p(2) + v(2) * dt + 0.5 * a(2) * dt * dt;
+        x_new(2) = p(2) + v(2) * dt + 0.5 * a_rel(2) * dt * dt;
         x_new(3) = v(0) * cos_wt - v(1) * sin_wt;
         x_new(4) = v(0) * sin_wt + v(1) * cos_wt;
-        x_new(5) = v(2) + a(2) * dt;
-        x_new(6) = a(0) * cos_wt - a(1) * sin_wt;
-        x_new(7) = a(0) * sin_wt + a(1) * cos_wt;
-        x_new(8) = a(2);
+        x_new(5) = v(2) + a_rel(2) * dt;
+        x_new(6) = a_t(0) * cos_wt - a_t(1) * sin_wt;   // target own accel rotates with the turn
+        x_new(7) = a_t(0) * sin_wt + a_t(1) * cos_wt;
+        x_new(8) = a_t(2);
     }
     x_new(9) = x(9);
     return x_new;
 }
 
-Eigen::VectorXd f_rotor(const Eigen::VectorXd& x, double dt) {
+Eigen::VectorXd f_rotor(const Eigen::VectorXd& x, double dt, const Eigen::Vector3d& a_own) {
     Eigen::VectorXd x_new = x;
-    const Eigen::Vector3d v = x.segment<3>(3);
-    const Eigen::Vector3d a_thrust = x.segment<3>(6);
-    const double k_drag = 0.05;
-    const Eigen::Vector3d a_real = a_thrust - k_drag * v.norm() * v;
-    x_new.segment<3>(0) = x.segment<3>(0) + v * dt + 0.5 * a_real * dt * dt;
-    x_new.segment<3>(3) = v + a_real * dt;
-    x_new.segment<3>(6) = a_thrust * std::exp(-dt / 2.0);
+    const Eigen::Vector3d v = x.segment<3>(3);      // v_rel
+    const Eigen::Vector3d a_t = x.segment<3>(6);    // target own accel
+    const Eigen::Vector3d a_rel = a_t - a_own;
+    // NOTE: the original absolute-state f_rotor modeled target aerodynamic drag as
+    // a_real = a_thrust - k_drag*|v_target|*v_target. In relative coordinates v_target is
+    // UNOBSERVABLE (it would need ownship vel). Substituting v_rel is wrong: when the target is
+    // static but the ownship is moving, |v_rel| is large and the drag term spuriously brakes the
+    // RELATIVE velocity -> v_rel under-estimation that grows with ownship accel. Drop the drag
+    // term; rotor degrades to a target-accel-relaxation model (tau=2s), distinct from Singer (1.5s).
+    x_new.segment<3>(0) = x.segment<3>(0) + v * dt + 0.5 * a_rel * dt * dt;
+    x_new.segment<3>(3) = v + a_rel * dt;
+    x_new.segment<3>(6) = a_t * std::exp(-dt / 2.0);
     x_new(9) = x(9);
     return x_new;
 }
 
-Eigen::VectorXd apply_model(const Eigen::VectorXd& x, double dt, int mode) {
-    if (mode == 0) return f_singer(x, dt);
-    if (mode == 1) return f_ct(x, dt);
-    return f_rotor(x, dt);
+Eigen::VectorXd apply_model(const Eigen::VectorXd& x, double dt, int mode, const Eigen::Vector3d& a_own) {
+    if (mode == 0) return f_singer(x, dt, a_own);
+    if (mode == 1) return f_ct(x, dt, a_own);
+    return f_rotor(x, dt, a_own);
 }
 
-Eigen::Vector3d h_meas_pixel(const Eigen::VectorXd& x, const Eigen::Vector3d& uav_pos, const Eigen::Matrix3d& R_n2c, double focal_length) {
-    const Eigen::Vector3d rel_p = x.segment<3>(0) - uav_pos;
+Eigen::Vector3d h_meas_pixel(const Eigen::VectorXd& x, const Eigen::Matrix3d& R_n2c, double focal_length) {
+    // Relative-state form: x[0:3] IS the relative position (target - ownship) in world frame G.
+    // No uav_pos needed — the measurement is purely relative; R_n2c = R_b2c @ R_b2n^T carries the
+    // ownship ATTITUDE (from IMU orientation), which is all the projection requires.
+    const Eigen::Vector3d rel_p = x.segment<3>(0);
     Eigen::Vector3d p_cam = R_n2c * rel_p;
     p_cam(2) = std::max(p_cam(2), 0.5);
     const double u = focal_length * p_cam(0) / p_cam(2);
@@ -163,7 +180,7 @@ public:
         R.diagonal() << 0.005 * 0.005, 0.005 * 0.005, 0.015 * 0.015;
     }
 
-    void predict(double dt) {
+    void predict(double dt, const Eigen::Vector3d& a_own) {
         const int n = kStateDim;
         const double Wi = 0.5 / n;
 
@@ -176,8 +193,9 @@ public:
         }
 
         sigmas_f.resize(2 * n + 1, Eigen::VectorXd::Zero(n));
+        // a_own is a deterministic exogenous input — same value applied to every sigma point.
         for (int i = 0; i <= 2 * n; ++i) {
-            sigmas_f[i] = apply_model(sigmas[i], dt, mode);
+            sigmas_f[i] = apply_model(sigmas[i], dt, mode, a_own);
         }
 
         Eigen::VectorXd x_pred = Eigen::VectorXd::Zero(n);
@@ -197,7 +215,7 @@ public:
         predicted = true;
     }
 
-    double update(const Eigen::Vector3d& z_pixel, const Eigen::Vector3d& uav_pos, const Eigen::Matrix3d& R_n2c, double focal_length) {
+    double update(const Eigen::Vector3d& z_pixel, const Eigen::Matrix3d& R_n2c, double focal_length) {
         const int n = kStateDim;
         const double Wi = 0.5 / n;
 
@@ -214,7 +232,7 @@ public:
 
         std::vector<Eigen::Vector3d> sigmas_h(2 * n + 1, Eigen::Vector3d::Zero());
         for (int i = 0; i <= 2 * n; ++i) {
-            sigmas_h[i] = h_meas_pixel(sigmas_f[i], uav_pos, R_n2c, focal_length);
+            sigmas_h[i] = h_meas_pixel(sigmas_f[i], R_n2c, focal_length);
         }
 
         Eigen::Vector3d z_pred = Eigen::Vector3d::Zero();
@@ -297,7 +315,7 @@ public:
         }
     }
 
-    void predict(double dt) {
+    void predict(double dt, const Eigen::Vector3d& a_own) {
         std::vector<Eigen::VectorXd> xs(kModeCount, Eigen::VectorXd::Zero(kStateDim));
         std::vector<Eigen::MatrixXd> Ps(kModeCount, Eigen::MatrixXd::Zero(kStateDim, kStateDim));
 
@@ -314,16 +332,16 @@ public:
         for (int j = 0; j < kModeCount; ++j) {
             filters[j].x = xs[j];
             filters[j].P = (Ps[j] + Ps[j].transpose()) * 0.5;
-            filters[j].predict(dt);
+            filters[j].predict(dt, a_own);
         }
         compute_mixing_probabilities();
         compute_state_estimate();
     }
 
-    void update(const Eigen::Vector3d& z_pixel, const Eigen::Vector3d& uav_pos, const Eigen::Matrix3d& R_n2c, double focal_length) {
+    void update(const Eigen::Vector3d& z_pixel, const Eigen::Matrix3d& R_n2c, double focal_length) {
         Eigen::Vector3d likelihoods;
         for (int j = 0; j < kModeCount; ++j) {
-            likelihoods(j) = filters[j].update(z_pixel, uav_pos, R_n2c, focal_length);
+            likelihoods(j) = filters[j].update(z_pixel, R_n2c, focal_length);
         }
         mu = cbar.cwiseProduct(likelihoods);
         const double mu_sum = mu.sum();
@@ -361,6 +379,13 @@ public:
     // detection (motion blur / partial bbox) from corrupting scale (observed W 1.5 -> 2.8 after a
     // dropout+reacquire -> phantom target 11 m below -> dive). Old value ~5 m was too late.
     double width_freeze_range_ = 15.0;
+    // Size-plausibility gate is CLOSE-RANGE ONLY: it exists to reject close-range mis-detections
+    // (a garbage bbox that corrupts the monocular scale). Applied at long range it starves the
+    // relative estimator: r_est lags the true range during a closing -> s_pred too small -> good
+    // measurements rejected -> r never corrects (deadlock).
+    double size_gate_range_ = 12.0;
+    double size_gate_lo_ = 0.6;
+    double size_gate_hi_ = 1.8;
 
     RobustIMMEstimator10D imm_ukf;
     bool initialized = false;
@@ -370,36 +395,40 @@ public:
     double last_cap_time = 0.0;
     bool has_last_cap_time = false;
 
-    // EMA-smoothed target velocity (world frame). PN guidance is sensitive to vel noise; the raw
-    // UKF vel estimate jumps frame-to-frame and excites control jitter. Smooth before feeding the
-    // controller. Initialized lazily on first valid estimate.
-    Eigen::Vector3d v_est_smoothed = Eigen::Vector3d::Zero();
-    bool has_v_smoothed = false;
     // Soft-recovery: first measurement after a bbox dropout uses inflated measurement noise so the
     // large innovation does not slam the state (especially vel) to an extreme value.
     bool first_meas_after_dropout = false;
+    // Cached LOS unit vector (world) from the last detection, for the divergence reset direction.
+    Eigen::Vector3d last_los_nav = Eigen::Vector3d(1.0, 0.0, 0.0);
+    bool has_last_los_nav = false;
 
     RelativeIMMUKFEstimator(double dt_cam_val, double focal_length_val, double W_guess_val,
                             const Eigen::Matrix3d& R_b2c_val)
         : dt_cam(dt_cam_val), focal_length(focal_length_val), W_guess(W_guess_val), R_b2c(R_b2c_val) {}
 
     void update_process_noise(double r_norm, double W_est, double bbox_s = 0.0) {
+        (void)W_est;
         const double q_scale = 1.0;
         const double r_freeze = width_freeze_range_;
         const double snr_factor = bbox_s > 0.0 ? clamp(bbox_s / 40.0, 0.1, 1.0) : 1.0;
         const double q_w_scale = std::pow(clamp((r_norm - r_freeze) / 20.0, 0.0, 1.0), 2.0);
         const double q_w_dynamic = 0.005 * q_w_scale * snr_factor;
-        imm_ukf.filters[0].Q = make_Q(0.05 * q_scale, 0.05 * q_scale, 1.0 * q_scale, q_w_dynamic * q_scale);
-        imm_ukf.filters[1].Q = make_Q(0.05 * q_scale, 0.05 * q_scale, 0.5 * q_scale, q_w_dynamic * q_scale);
-        imm_ukf.filters[2].Q = make_Q(0.05 * q_scale, 0.05 * q_scale, 1.0 * q_scale, q_w_dynamic * q_scale);
+        // Relative-state: v_rel is driven by the a_own predict (high-quality, IMU preintegration).
+        // The monocular measurement constrains v_rel only weakly (depth is noisy), so a large Q_vel
+        // makes the update TRUST the lagged measurement and pull v_rel back toward it (under-playing
+        // the closing speed). Keep Q_vel SMALL so K(vel) stays small and the a_own predict dominates.
+        const double q_vel = 0.02 * q_scale;
+        imm_ukf.filters[0].Q = make_Q(0.05 * q_scale, q_vel, 1.0 * q_scale, q_w_dynamic * q_scale);
+        imm_ukf.filters[1].Q = make_Q(0.05 * q_scale, q_vel, 0.5 * q_scale, q_w_dynamic * q_scale);
+        imm_ukf.filters[2].Q = make_Q(0.05 * q_scale, q_vel, 1.0 * q_scale, q_w_dynamic * q_scale);
     }
 
-    void sanitize_filters(const Eigen::Vector3d& uav_pos) {
+    void sanitize_filters() {
+        // Relative-state form: r_norm is just |x[0:3]| (no uav_pos subtraction). On divergence,
+        // reset along the last observed LOS direction at a nominal range.
         bool should_freeze = false;
         for (auto& filter : imm_ukf.filters) {
-            const double r_norm = (filter.x.segment<3>(0) - uav_pos).norm();
-            const double r_freeze = width_freeze_range_;
-            if (r_norm < r_freeze) {
+            if (filter.x.segment<3>(0).norm() < width_freeze_range_) {
                 should_freeze = true;
                 break;
             }
@@ -413,6 +442,7 @@ public:
             has_frozen_width = true;
         }
 
+        const Eigen::Vector3d los_dir = has_last_los_nav ? last_los_nav : Eigen::Vector3d(1.0, 0.0, 0.0);
         for (auto& filter : imm_ukf.filters) {
             bool diverged = !filter.x.allFinite() || !filter.P.allFinite();
             if (!diverged) {
@@ -425,21 +455,21 @@ public:
             }
             if (diverged) {
                 filter.x.setZero();
-                filter.x.segment<3>(0) = uav_pos + Eigen::Vector3d(10.0, 0.0, 0.0);
+                filter.x.segment<3>(0) = 10.0 * los_dir;   // relative pos along last LOS
                 filter.x(9) = W_guess;
                 filter.P = Eigen::MatrixXd::Zero(kStateDim, kStateDim);
                 filter.P.diagonal() << 100.0, 100.0, 100.0, 25.0, 25.0, 25.0, 10.0, 10.0, 10.0, 1.0;
                 continue;
             }
 
-            Eigen::Vector3d rel_p = filter.x.segment<3>(0) - uav_pos;
+            const Eigen::Vector3d rel_p = filter.x.segment<3>(0);
             const double r_norm = rel_p.norm();
             if (r_norm > 200.0) {
-                filter.x.segment<3>(0) = uav_pos + rel_p / std::max(r_norm, 1e-6) * 120.0;
+                filter.x.segment<3>(0) = rel_p / std::max(r_norm, 1e-6) * 120.0;
             }
             for (int i = 3; i < 6; ++i) filter.x(i) = clamp(filter.x(i), -30.0, 30.0);
             for (int i = 6; i < 9; ++i) filter.x(i) = clamp(filter.x(i), -15.0, 15.0);
-            filter.x(9) = clamp(filter.x(9), 0.9, 2.5);
+            filter.x(9) = clamp(filter.x(9), 0.8, 1.8);
 
             if (has_frozen_width) {
                 filter.x(9) = frozen_width;
@@ -458,9 +488,8 @@ public:
             for (int i = 3; i < 6; ++i) {
                 filter.P(i, i) = clamp(filter.P(i, i), 0.5, 500.0);
             }
-            // acc (6-8): cap P(acc) at 10.0. A large P(acc) (observed 80-114) makes the acc
-            // channel absorb all measurement residual, injecting noise into acc -> vel -> pos and
-            // destabilizing the estimate. width (9) keeps the existing wide range.
+            // acc (6-8): cap P(acc) at 10.0. A large P(acc) makes the acc channel absorb all
+            // measurement residual, injecting noise into acc -> vel -> pos.
             for (int i = 6; i < 9; ++i) {
                 filter.P(i, i) = clamp(filter.P(i, i), 1e-4, 10.0);
             }
@@ -473,53 +502,54 @@ public:
             imm_ukf.P.col(9).setZero();
             imm_ukf.P(9, 9) = 1e-8;
         } else {
-            imm_ukf.x(9) = clamp(imm_ukf.x(9), 0.9, 2.5);
+            imm_ukf.x(9) = clamp(imm_ukf.x(9), 1.2, 1.8);
         }
     }
 
+    // Relative-state estimator. Inputs that replaced ownship pos/vel:
+    //   R_b2n_cur — ownship ATTITUDE (from IMU orientation), used for cam projection + LOS ray.
+    //   dv_own    — ownship velocity change over [last_cam, now] in world frame G, from IMU
+    //               preintegration (dv_own = ∫(R_b2n·(f_imu − bias) − g)dτ). Pure relative
+    //               quantity, recomputed each window — NOT a drifting integrated velocity.
+    // No uav_pos/uav_vel anywhere; r in the state IS the relative position.
     std::pair<bool, Eigen::VectorXd> process_camera(bool has_bbox, double bbox_u, double bbox_v, double bbox_s,
-                                                    double t_now, const Eigen::Vector3d& uav_pos_current,
-                                                    const Eigen::Matrix3d& R_b2n_current) {
+                                                    double t_now, const Eigen::Matrix3d& R_b2n_cur,
+                                                    const Eigen::Vector3d& dv_own) {
         if (!has_bbox) {
             if (!initialized) {
                 return {false, Eigen::VectorXd::Constant(kStateDim, std::numeric_limits<double>::quiet_NaN())};
             }
             const double w_prev = imm_ukf.x(9);
-            const double r_norm = (imm_ukf.x.segment<3>(0) - uav_pos_current).norm();
-            if (r_norm < 25.0) {
-                for (auto& filter : imm_ukf.filters) {
-                    filter.x.segment<3>(3).setZero();
-                    filter.x.segment<3>(6).setZero();
-                    filter.x(9) = w_prev;
-                }
-                imm_ukf.compute_state_estimate();
-                imm_ukf.x(9) = w_prev;
-                return {true, imm_ukf.x};
-            }
+            const double r_norm = imm_ukf.x.segment<3>(0).norm();
+            const Eigen::Vector3d a_own = dv_own / std::max(dt_cam, 1e-3);
             update_process_noise(r_norm, w_prev);
-            imm_ukf.predict(dt_cam);
+            // ALWAYS predict r forward using ownship motion (a_own). The absolute-state estimator
+            // could skip the predict for a stationary target; the RELATIVE position r = target - own
+            // moves by the ownship's motion EVERY frame. Skipping the predict freezes r while the
+            // ownship keeps flying -> unbounded drift the moment the target leaves the FOV.
+            imm_ukf.predict(dt_cam, a_own);
+            // Coast: assume the target stops ACCELERATING (a_t->0, constant-velocity target) but
+            // DO NOT touch v_rel. In relative coordinates v_rel = v_target - v_own; zeroing or
+            // decaying it would erase the ownship's ongoing motion from r's predict. Keep v_rel;
+            // the a_own-driven predict carries the ownship motion, the retained v_rel the target's.
             for (auto& filter : imm_ukf.filters) {
-                filter.x.segment<3>(3) *= std::exp(-dt_cam / 3.0);
                 filter.x.segment<3>(6).setZero();
                 filter.x(9) = w_prev;
                 filter.P(9, 9) = std::max(0.001, filter.P(9, 9));
             }
             imm_ukf.compute_state_estimate();
             imm_ukf.x(9) = w_prev;
-            sanitize_filters(uav_pos_current);
+            sanitize_filters();
             // Mark dropout so the next bbox update uses inflated measurement noise (soft recovery).
             first_meas_after_dropout = true;
             return {true, imm_ukf.x};
         }
 
-        // bbox is real-time: capture pose == current pose, no history lookup needed.
-        const Eigen::Vector3d& uav_pos_cap = uav_pos_current;
-        const Eigen::Matrix3d& R_b2n_cap = R_b2n_current;
-
-        const Eigen::Vector3d los_nav = pixel_to_los_nav(bbox_u, bbox_v, focal_length, R_b2n_cap, R_b2c);
-        const double r_meas = focal_length * W_guess / std::max(1.0, bbox_s);
+        const Eigen::Vector3d los_nav = pixel_to_los_nav(bbox_u, bbox_v, focal_length, R_b2n_cur, R_b2c);
+        last_los_nav = los_nav;
+        has_last_los_nav = true;
         const Eigen::Vector3d z_pixel(bbox_u, bbox_v, bbox_s);
-        const Eigen::Matrix3d R_n2c = R_b2c * R_b2n_cap.transpose();
+        const Eigen::Matrix3d R_n2c = R_b2c * R_b2n_cur.transpose();
         Eigen::Matrix3d R_k = Eigen::Matrix3d::Zero();
         R_k(0,0) = 25.0;
         R_k(1,1) = 25.0;
@@ -532,22 +562,19 @@ public:
         }
 
         if (initialized) {
-            const double dt_meas = has_last_cap_time ? clamp(t_now - last_cap_time, 0.001, dt_cam) : dt_cam;
-            update_process_noise((imm_ukf.x.segment<3>(0) - uav_pos_cap).norm(), imm_ukf.x(9), bbox_s);
-            imm_ukf.predict(dt_meas);
+            const double dt_meas = has_last_cap_time ? clamp(t_now - last_cap_time, 0.001, 0.1) : dt_cam;
+            const Eigen::Vector3d a_own = dv_own / std::max(dt_meas, 1e-3);
+            update_process_noise(imm_ukf.x.segment<3>(0).norm(), imm_ukf.x(9), bbox_s);
+            imm_ukf.predict(dt_meas, a_own);
 
-            // Size-plausibility gate: reject detections whose bbox size is wildly inconsistent
-            // with the predicted range/width. A garbage size (e.g. a 32 px detection of a target
-            // that should be ~138 px at this range) maps to a wildly wrong monocular range and
-            // corrupts scale (W) and position -> the phantom-target dive seen in AirSim (W 1.5 ->
-            // 2.8 after a dropout+reacquire). Reject -> predict-only (no update), treat the frame
-            // as a dropout so the next GOOD measurement recovers with inflated noise.
-            const double r_pred = (imm_ukf.x.segment<3>(0) - uav_pos_cap).norm();
+            // Size-plausibility gate (close range only, see size_gate_range_): reject detections
+            // whose bbox size is wildly inconsistent with predicted range/width -> predict-only,
+            // mark soft-recovery. Stops a garbage close-range size from corrupting scale/position.
+            const double r_pred = imm_ukf.x.segment<3>(0).norm();
             const double s_pred = focal_length * std::max(0.1, imm_ukf.x(9)) / std::max(0.5, r_pred);
             const double size_ratio = bbox_s / std::max(1.0, s_pred);
-            const double size_gate_lo = 0.6;
-            const double size_gate_hi = 1.8;
-            if (size_ratio < size_gate_lo || size_ratio > size_gate_hi) {
+            if (r_pred < size_gate_range_ &&
+                (size_ratio < size_gate_lo_ || size_ratio > size_gate_hi_)) {
                 imm_ukf.compute_state_estimate();
                 first_meas_after_dropout = true;
                 last_cap_time = t_now;
@@ -556,24 +583,22 @@ public:
             }
 
             for (auto& filter : imm_ukf.filters) filter.R = R_k;
-            imm_ukf.update(z_pixel, uav_pos_cap, R_n2c, focal_length);
+            imm_ukf.update(z_pixel, R_n2c, focal_length);
 
             last_cap_time = t_now;
             has_last_cap_time = true;
             first_meas_after_dropout = false;
-            sanitize_filters(uav_pos_cap);
-            // Clamp vel axes to reject single-frame UKF outliers without adding EMA lag (lag
-            // destabilizes PN). ±15 m/s is well above any real target speed here.
-            for (int i = 0; i < 3; ++i) {
-                imm_ukf.x(3 + i) = clamp(imm_ukf.x(3 + i), -15.0, 15.0);
-            }
+            sanitize_filters();
+            // (No fused v clamp to +-15: that was an absolute-state target-speed limit. In relative
+            // coordinates v_rel = v_target - v_ownship easily exceeds 15 m/s during a high-speed
+            // closing; clamping caps the closing-speed estimate and starves the controller.
+            // sanitize_filters already bounds v_rel to +-30.)
             return {true, imm_ukf.x};
         } else {
             const double W_init = clamp(W_guess, 0.5, 4.0);
             const double r0 = clamp(focal_length * W_init / std::max(1.0, bbox_s), 10.0, 300.0);
             Eigen::VectorXd x0 = Eigen::VectorXd::Zero(kStateDim);
-            x0.segment<3>(0) = uav_pos_cap + r0 * los_nav;
-            x0.segment<3>(3).setZero();
+            x0.segment<3>(0) = r0 * los_nav;            // relative pos = range * LOS (no uav_pos)
             x0(9) = W_init;
 
             Eigen::MatrixXd P0 = Eigen::MatrixXd::Zero(kStateDim, kStateDim);
@@ -590,7 +615,7 @@ public:
             last_cap_time = t_now;
             has_last_cap_time = true;
 
-            sanitize_filters(uav_pos_cap);
+            sanitize_filters();
             return {true, imm_ukf.x};
         }
     }
@@ -658,6 +683,28 @@ public:
     double terminal_tilt_range_ = 15.0;  // m, below this range phi_cmd may use max_tilt_terminal_rad_
     double terminal_decel_range_ = 30.0; // m, start ramping v_des -> v_terminal_ here
     double v_terminal_ = 12.0;           // m/s, desired speed at the terminal phase (more bank agility)
+    // Active monocular-observability dither: a small lateral sinusoidal acceleration that gives
+    // the ownship a horizontal parallax baseline. With x != 0 the pinhole u=fx*x/z becomes
+    // sensitive to z (depth), so the depth/width degeneracy (size=fx*W/z) is broken and the
+    // along-LOS v_rel — otherwise only weakly observable via the noisy size channel — becomes
+    // observable through the bearing channel. The IMU preintegration captures the dither motion
+    // as a_own, so the estimator predict carries it; the update resolves depth from the parallax.
+    double dither_amp_ = 0.8;          // m/s^2, lateral dither amplitude
+    double dither_freq_ = 0.5;         // Hz, lateral dither frequency
+    double dither_min_range_ = 10.0;   // m, suppress dither inside this range (don't disturb terminal)
+    // Geometric APN: recover the target lateral accel from TRUE-PN geometry + IMU (NOT the
+    // estimator a_t state — unobservable with a single bbox): a_t_perp = range*ydot +
+    // 2*lambda_dot*v_range + a_own_perp, where ydot = d(lambda_dot)/dt. Leads a turning target.
+    double K_apn_ = 0.8;
+    double K_apn_min_at_ = 0.5;        // m/s^2, gate on |a_t_perp_geom|
+    double ydot_tc_ = 0.8;             // s, EMA time constant on d(lambda_dot)/dt
+    double atp_tc_ = 0.6;              // s, EMA time constant on a_t_perp_geom
+    double prev_los_rate_ = 0.0;
+    double prev_lr_t_ = -1.0;
+    bool   has_prev_lr_ = false;
+    double ydot_ema_ = 0.0;
+    double atp_ema_ = 0.0;
+    double aown_perp_ema_ = 0.0;
 
     AdvancedHybridController(double N_val, double K_v_val, double K_ibvs_val,
                              double K_att_val, double K_yaw_val, double v_des_val, double max_tilt_deg,
@@ -695,6 +742,12 @@ public:
         last_a_z_ = 0.0;
         last_az_t_ = -1.0;
         has_last_az_ = false;
+        prev_los_rate_ = 0.0;
+        prev_lr_t_ = -1.0;
+        has_prev_lr_ = false;
+        ydot_ema_ = 0.0;
+        atp_ema_ = 0.0;
+        aown_perp_ema_ = 0.0;
     }
     void set_a_z_slew(double v) { a_z_slew_ = (v > 0.0) ? v : 1e9; }  // <=0 disables the slew limit
     void set_lateral_decay_floor(double v) { lateral_decay_floor_ = clamp(v, 0.0, 1.0); }
@@ -704,40 +757,32 @@ public:
         gimbal_bias_ = gimbal_bias_rad;
     }
 
-    // Decoupled control. Inputs:
-    //   r_est, v_est : target rel pos/vel in NAV frame (v_est noisy, used only for LOS rate)
+    // Decoupled control (odometry-free, exact mirror of the Python prototype). Inputs:
+    //   r_est, v_est : RELATIVE target pos/vel in world frame G (estimator state directly)
     //   los_az       : target azimuth in body heading frame (rad, 0 = dead ahead)
     //   los_el       : target elevation in world frame (rad, 0 = level, negative = below)
-    //   v_fwd_body   : interceptor forward speed in body frame (m/s, from odom, observable)
-    //   bbox_size    : target bbox size in px (observable proximity cue, monocular-range-independent)
+    //   v_fwd_body   : closing speed proxy = -v_rel·r̂ (positive = approaching); NOT odom
+    //   bbox_size    : target bbox size in px (observable proximity cue)
+    //   v_z          : ownship vertical speed proxy = -v_rel(2) (target-level approximation)
+    //   target_speed : |v_rel| clamped — relative-speed proxy for the brake floor
+    //   los_rate     : EMA-smoothed measured bearing rate (lambda_dot)
+    //   a_own_world  : ownship world accel over the last camera window (IMU preintegration)
     //   t            : mission-relative time (s)
     std::vector<double> compute_control(double roll, double pitch, double yaw,
                                         const Eigen::Vector3d& r_est, const Eigen::Vector3d& v_est,
                                         double los_az, double los_el, double t,
                                         double v_fwd_body = 0.0, double bbox_size = 0.0,
                                         double v_z = 0.0, double target_speed = 0.0,
-                                        double los_rate = 0.0) {
+                                        double los_rate = 0.0,
+                                        const Eigen::Vector3d& a_own_world = Eigen::Vector3d::Zero()) {
+        (void)v_est;
         const double r_norm = r_est.norm();
 
         // ---- (A) Bearing-only lateral guidance -------------------------------------------
-        // LOS angular rate (observable from bbox motion). v_est used only to form the cross
-        // product; magnitude bounded so monocular vel noise cannot blow up PN.
-        Eigen::Vector3d omega_los = Eigen::Vector3d::Zero();
-        if (r_norm > 0.1) {
-            omega_los = r_est.cross(v_est) / (r_norm * r_norm);
-        }
-        // LOS angular rate (lambda_dot) source. omega_los(2) = (r x v_est)_z / |r_xy|^2 is the
-        // textbook PN LOS rate, but v_est is noisy (observed +/-12..18 m/s jumps in AirSim) and the
-        // 1/|r_xy| scaling blows it up -> violent banked turns. los_rate is the EMA-smoothed
-        // derivative of the *measured* bearing (los_az_world) — bounded and noise-robust — and is
-        // the ONLY source. The old `if (|lambda_dot| < 1e-4) lambda_dot = omega_los(2)` fallback was
-        // meant for warmup but fired whenever the bearing rate was small, injecting the noisy v_est
-        // term and sign-flipping lambda_dot -> a_lat sign-flip -> phi_cmd bang-bang -> the roll
-        // limit-cycle (omega_x saturating +-max_body_rate) seen in AirSim.
+        // LOS rate from the measured bearing ONLY (clean, no 1/r blowup, no v_est noise).
         double lambda_dot = los_rate;
         // Deadband: a steady bearing (<0.02 rad/s) yields ZERO lateral lead. Stops residual bearing
-        // noise around zero from sign-flipping a_lat. Real bearing rates for a turning/moving target
-        // are well above this, so PN lead against maneuvering targets is preserved.
+        // noise around zero from sign-flipping a_lat.
         if (std::abs(lambda_dot) < 0.02) {
             lambda_dot = 0.0;
         }
@@ -746,36 +791,15 @@ public:
         if (r_norm > 15.0) {
             N_eff = N - (N - 2.0) * clamp((r_norm - 15.0) / 35.0, 0.0, 1.0);
         }
-        const double v_fwd_safe = clamp(v_fwd_body, 0.5, 20.0);
-        // Speed-scheduled PN: cap the forward speed entering a_lat = N*v*lambda_dot. At v_des=20 the
-        // raw N*v (~90) makes even 0.05 rad/s of LOS rate command ~4.5 m/s^2 lateral accel, slamming
-        // phi_cmd to +-max_tilt and bang-banging omega_x into +-max_body_rate -> roll limit-cycle.
-        // Capping v at v_pn_ref_ keeps the effective lateral gain near its tuned (lower-speed) value.
-        const double v_pn = std::min(v_fwd_safe, v_pn_ref_);
+        // Speed-scheduled PN: use v_des (OPEN-LOOP) for the v in a_lat = N*v*lambda_dot, NOT the
+        // measured v_closing. v_closing is under-observable along-LOS until the estimator anchors
+        // scale; using it starves PN lead in the first seconds and lets a crossing target escape
+        // the FOV. v_des is the intended ownship speed — the correct PN proxy — available from t=0.
+        const double v_pn = std::min(v_des, v_pn_ref_);
         double a_lat_mag = N_eff * v_pn * omega_los_mag;
-        // No near-range lateral decay. The old code zeroed lateral below 15 m to suppress the
-        // v_est-noise (+/-12 m/s) banking, leaving pure-pursuit (yaw + axial) for the terminal
-        // dash -> it trailed maneuvering targets (maneuvering-ct miss). Now that lambda_dot comes
-        // from the clean, EMA-smoothed *bearing* derivative (not the 1/r v_est cross product),
-        // there is no noise reason to attenuate, and full PN lead must survive to close range to
-        // intercept a turning target. Dropping the decay takes maneuvering-ct from a 2.85 m miss
-        // to a clean intercept, with no regression on nominal/crossing (lambda_dot ~= 0 for a
-        // near-stationary target, so lateral is naturally idle there).
-        // FOV keep-in-frame (horizontal): when target approaches the horizontal FOV edge,
-        // reduce lateral accel so the UAV does not bank the target out of frame. The yaw
-        // loop (boosted below) turns the nose toward the target instead.
-        const double az_edge = fov_half_h_ * fov_keep_margin_;
-        const double az_excess = clamp((std::abs(los_az) - az_edge) /
-                                       std::max(fov_half_h_ - az_edge, 1e-6), 0.0, 1.0);
-        a_lat_mag *= (1.0 - az_excess);
-        // Close-range lateral attenuation (Fix D/F): at v_des=20 the full PN gain is a closed-loop
-        // instability — the bearing-rate loop over-corrects, lambda_dot sign-flips, phi_cmd rails
-        // ±max_tilt_terminal and omega_x saturates ±max_body_rate (the close-approach weave seen in
-        // AirSim, occurring as far out as ~26 m). GENTLY scale a_lat_mag down toward
-        // lateral_decay_floor_ over [terminal_brake_range, lat_decay_start_]. NOT a hard zero (the
-        // old zero trailed maneuvering targets); a 0.4 floor keeps enough PN lead to track a turn
-        // while damping the weave. Window widened 12 -> 25 m (Fix F) so the 22-27 m weave zone is
-        // covered. No-op at mid-course (r >= lat_decay_start_).
+        // Close-range lateral attenuation (Fix D/F): gently scale a_lat_mag toward
+        // lateral_decay_floor_ over [terminal_brake_range, lat_decay_start_] to damp the
+        // close-approach PN weave. NOT a hard zero — the floor keeps PN lead for turning targets.
         const double lat_f = clamp((r_norm - terminal_brake_range_) /
                                    std::max(lat_decay_start_ - terminal_brake_range_, 1.0), 0.0, 1.0);
         a_lat_mag *= lateral_decay_floor_ + (1.0 - lateral_decay_floor_) * lat_f;
@@ -786,49 +810,67 @@ public:
         Eigen::Vector2d e_perp_xy(-e_los_xy(1), e_los_xy(0));  // 90 deg CCW
         const double turn_sign = (lambda_dot >= 0.0) ? 1.0 : -1.0;
         Eigen::Vector2d a_lat_world = turn_sign * a_lat_mag * e_perp_xy;
+        // Active observability dither (mid-course only): lateral sinusoid for monocular scale/depth.
+        if (dither_amp_ > 0.0 && r_norm > dither_min_range_) {
+            const double a_dither = dither_amp_ * std::sin(2.0 * M_PI * dither_freq_ * t);
+            a_lat_world += a_dither * e_perp_xy;
+        }
+        // Geometric APN: classic PN lags a turning target. Recover the target lateral accel from
+        // TRUE-PN geometry + IMU: a_t_perp = range*ydot + 2*lambda_dot*v_range + a_own_perp.
+        // EMA a_own_perp with the SAME tc as ydot so the ownship-dither component cancels for a
+        // static/CV target; EMA a_t_perp_geom so pixel-noise spikes average toward 0.
+        if (has_prev_lr_ && t > prev_lr_t_) {
+            const double dt_lr = t - prev_lr_t_;
+            if (dt_lr > 1e-3 && dt_lr < 1.0) {
+                const double ydot_raw = (los_rate - prev_los_rate_) / dt_lr;
+                const double a_ydot = clamp(dt_lr / ydot_tc_, 0.0, 1.0);
+                ydot_ema_ += a_ydot * (ydot_raw - ydot_ema_);
+                const double a_ao = clamp(dt_lr / ydot_tc_, 0.0, 1.0);
+                const double a_own_perp = a_own_world.head<2>().dot(e_perp_xy);
+                aown_perp_ema_ += a_ao * (a_own_perp - aown_perp_ema_);
+            }
+        }
+        prev_los_rate_ = los_rate;
+        prev_lr_t_ = t;
+        has_prev_lr_ = true;
+        const double a_t_perp_geom = r_norm * ydot_ema_ + 2.0 * los_rate * v_fwd_body + aown_perp_ema_;
+        {
+            const double a_atp = clamp(0.02 / atp_tc_, 0.0, 1.0);
+            atp_ema_ += a_atp * (a_t_perp_geom - atp_ema_);
+        }
+        if (std::abs(a_t_perp_geom) > K_apn_min_at_) {
+            a_lat_world += K_apn_ * a_t_perp_geom * e_perp_xy;
+        }
 
         // ---- (A) Axial guidance: fixed forward thrust, range-independent ------------------
-        // Monocular range is unobservable, so do NOT close the loop on r_norm. Drive a constant
-        // desired forward speed; proximity sensed via bbox_size growth.
         double v_des_eff = v_des;
         // Range-based terminal decel schedule: arrive at the terminal phase ~v_terminal (slower),
-        // where the same bank gives ~2x the turn rate -> tracks maneuvering targets. This is a
-        // feedforward schedule on the (now-stable, post W_est hardening) monocular range estimate,
-        // NOT a closed range loop; a +/-15% range error only shifts the schedule slightly. The
-        // speed-aware floor never lets it stall below target speed + margin against a fast target.
+        // where the same bank gives ~2x the turn rate. Feedforward on the monocular range estimate.
         if (r_norm < terminal_decel_range_) {
             const double v_term_eff = std::min(std::max(v_terminal_, target_speed + 1.5), v_des);
             const double frac = clamp((terminal_decel_range_ - r_norm) /
                                       std::max(terminal_decel_range_ - terminal_brake_range_, 1.0), 0.0, 1.0);
             v_des_eff = v_des + (v_term_eff - v_des) * frac;   // ramp v_des -> v_term_eff (<= v_des)
         }
-        if (bbox_size > terminal_bbox_size_ * 0.2) {
-            // Engage the proximity brake at ~5x terminal_brake_range (e.g. 25 m, not 10 m). At
-            // v_des=20 with full rate authority (use_simulation:=true) the old 0.5 threshold (10 m)
-            // engaged far too late to shed the closing speed — the UAV arrived at ~15 m/s, blew past
-            // the target, lost the bbox and flew off chasing the dead-reckoned estimate. Ramp
-            // v_des_eff -> floor over [bbox_engage, terminal_bbox_size_] = [~5R, R].
-            const double bbox_engage = terminal_bbox_size_ * 0.2;
+        const double bbox_engage = terminal_bbox_size_ * 0.2;   // engage at ~5x brake_range
+        if (bbox_size > bbox_engage) {
             const double prox = clamp((bbox_size - bbox_engage) /
                                       std::max(1.0, terminal_bbox_size_ - bbox_engage), 0.0, 1.0);
-            // Speed-aware brake floor: against a moving target, braking to the configured floor
-            // (1 m/s) stalls the interceptor below the target's speed so it levels off and falls
-            // behind in the final approach (observed: crossing target at 3.6 m/s, UAV braked to
-            // ~2 m/s and stuck at ~5 m). Never brake below target speed + margin when the target
-            // is actually moving; a near-stationary target keeps the configured floor unchanged.
+            // Speed-aware brake floor: never brake below target speed + margin when the target
+            // is actually moving; a near-stationary target keeps the configured floor.
             const double moving_floor = (target_speed > 1.0) ? (target_speed + 1.5) : terminal_brake_floor_;
             const double floor_eff = std::min(std::max(terminal_brake_floor_, moving_floor), v_des);
-            v_des_eff = v_des_eff + (floor_eff - v_des_eff) * prox;   // lower the scheduled v_des toward floor
+            v_des_eff = v_des_eff + (floor_eff - v_des_eff) * prox;
         }
-        double a_fwd = K_fwd_ * (v_des_eff - v_fwd_body);
-        // Overshoot recovery: target behind (|los_az|>90°) = flew past. Constant v_des would
-        // keep flying away (observed 14m->56m no turn-back). Brake + reverse closing direction
-        // so body yaws back. Uses only los_az (observable), range-independent.
-        bool target_behind = std::abs(los_az) > (M_PI / 2.0);
-        if (target_behind) {
-            v_des_eff = -v_des * 0.5;
-            a_fwd = K_fwd_ * (v_des_eff - v_fwd_body);
-        }
+        // v_fwd_body (= v_closing from v_rel) is under-observable along-LOS until scale converges;
+        // a low v_closing inflates a_fwd -> ownship over-accelerates ON-AXIS, starving lateral PN
+        // lead. Scene-adaptive 3-level floor: turning target (|atp_ema| large) -> 0.88 (don't blast
+        // through a circle); laterally-moving target (v_perp > 1) -> 0.82; static/slow -> 0.8.
+        // Braking (v_closing above the floor) passes through unchanged.
+        const double v_perp = std::abs(r_norm * los_rate);
+        const double v_floor_frac = (std::abs(atp_ema_) > 0.5) ? 0.88 : ((v_perp > 1.0) ? 0.82 : 0.8);
+        const double v_fwd_for_afwd = std::max(v_fwd_body, v_floor_frac * v_des_eff);
+        double a_fwd = K_fwd_ * (v_des_eff - v_fwd_for_afwd);
         if (has_last_ && t > last_t_) {
             const double dt = t - last_t_;
             if (dt > 0.0 && dt < 1.0) {
@@ -842,23 +884,12 @@ public:
         Eigen::Vector2d a_fwd_world = a_fwd * e_los_xy;
 
         // ---- (B) Decoupled vertical: independent altitude track -------------------------
-        // a_z = K_z * dz_target, with a soft vertical velocity limiter that begins reducing
-        // vertical accel at |v_z|=4 m/s and zeroes it at |v_z|=8 m/s. This prevents:
-        //  (1) Runaway climb (noise scenario: estimate divergence → dz_target=126m → sustained
-        //      a_z=4.0 → 23 m/s climb → z=-220m).
-        //  (2) Descent overshoot (target below: FOV clamp forces nose-down pitch → aggressive
-        //      dive → v_z grows unchecked → UAV plunges past target before braking can engage).
-        // The soft ramp (vs the old hard binary cutoff at 8 m/s) avoids the discontinuity that
-        // caused limit-cycle oscillation near the threshold.
         const double dz_target = r_est(2);
-        // PD on vertical: K_z on position error, K_zd damps pursuer odom v_z so the climb rate
-        // built up while dz_target was large is braked BEFORE the zero-crossing. Without the
-        // -K_zd*v_z term this is a pure spring (zeta=0) -> the +/-4 m z porpoising that caused
-        // the AirSim miss (pursuer blasts through co-altitude at ~6 m/s). v_z is clean odom.
+        // PD on vertical: K_z on position error, K_zd damps the vertical-speed proxy so the climb
+        // rate built up while dz_target was large is braked BEFORE the zero-crossing.
         double a_z = clamp(K_z_ * dz_target - K_zd_ * v_z, -4.0, 4.0);
-        // Slew limit |da_z/dt|: the z-estimate can jump O(10 m) in one cycle (monocular scale +
-        // estimator update), which would step a_z straight to +-4 and pitch the body over. Bound it
-        // like the axial jerk limit so vertical accel ramps instead of stepping.
+        // Slew limit |da_z/dt|: the z-estimate can jump O(10 m) in one cycle; ramp a_z instead of
+        // stepping it (which would pitch the body over).
         if (has_last_az_ && t > last_az_t_) {
             const double dt_az = t - last_az_t_;
             if (dt_az > 0.0 && dt_az < 1.0) {
@@ -869,20 +900,6 @@ public:
         last_a_z_ = a_z;
         last_az_t_ = t;
         has_last_az_ = true;
-        // Soft vertical velocity limiter: linearly decay a_z toward zero as |v_z| grows from
-        // v_z_soft_start (4) to v_z_hard_zero (8). Only attenuates the component that would
-        // increase |v_z| (same sign as v_z), allowing braking accel to pass through.
-        const double v_z_soft_start = 5.0;
-        const double v_z_hard_zero = 9.0;
-        const double v_z_abs = std::abs(v_z);
-        if (v_z_abs > v_z_soft_start) {
-            const double decay = clamp(1.0 - (v_z_abs - v_z_soft_start) /
-                                      (v_z_hard_zero - v_z_soft_start), 0.0, 1.0);
-            // Only attenuate if a_z would increase |v_z| (same sign as v_z).
-            if ((v_z > 0.0 && a_z > 0.0) || (v_z < 0.0 && a_z < 0.0)) {
-                a_z *= decay;
-            }
-        }
 
         // ---- (B) Total horizontal acceleration (lateral + forward) ----------------------
         Eigen::Vector2d a_h_world = a_lat_world + a_fwd_world;
@@ -910,18 +927,7 @@ public:
         const double max_tilt_roll = (r_norm < terminal_tilt_range_) ? max_tilt_terminal_rad_ : max_tilt_rad;
         double phi_cmd   = clamp(-std::atan2(fy_h, a_z + g), -max_tilt_roll, max_tilt_roll);
 
-        // FOV keep-in-frame (vertical): clamp pitch so target stays within vertical FOV.
-        // Uses the original (less restrictive) sign convention: theta_hi = fov_hard - los_el - mount_pitch.
-        // The "geometrically correct" sign (mount_pitch + fov_hard - los_el) was tested and caused
-        // aggressive diving when target is below → image smear → bbox loss → overshoot. The original
-        // sign is less restrictive but empirically keeps the target in frame during terminal phase
-        // without forcing excessive nose-down pitch.
-        //
-        // Only active in terminal phase (r < 15 m): during mid-course the clamp limits pitch
-        // to ~6° (mount_pitch=15° + narrow vertical FOV), capping forward accel at 1 m/s² and
-        // making it impossible to catch moving targets. Accept brief FOV loss during approach;
-        // the estimator dead-reckons and reacquires when the UAV levels out for terminal guidance.
-        target_behind = std::abs(los_az) > (M_PI / 2.0);
+        const bool target_behind = std::abs(los_az) > (M_PI / 2.0);
         if (enable_fov_clamp_ && has_gimbal_ && !target_behind) {
             // Semi-strapdown gimbal: the boresight is decoupled from body pitch (gimbal cancels
             // it; elev ~= -gimbal_bias_), so a theta clamp cannot keep the target in the vertical
@@ -1005,13 +1011,9 @@ public:
         const double throttle = clamp((a_z + g) / cos_tilt_actual, 2.0, 25.0);
 
         // ---- Attitude rate commands (P on attitude error) -------------------------------
-        // Yaw rate boost when target near horizontal FOV edge: turn nose toward target
-        // faster to keep it in frame. az_excess (computed above) goes 0→1 as target
-        // moves from keep-margin to FOV edge.
-        const double yaw_boost = 1.0 + 2.0 * az_excess;
         double omega_x = clamp(K_att * (phi_cmd - roll), -max_body_rate_, max_body_rate_);
         double omega_y = clamp(K_att * (theta_cmd - pitch), -max_body_rate_, max_body_rate_);
-        double omega_z = clamp(K_yaw * yaw_boost * los_az, -max_body_rate_, max_body_rate_);
+        double omega_z = clamp(K_yaw * los_az, -max_body_rate_, max_body_rate_);
         return {throttle, omega_x, omega_y, omega_z};
     }
 };
@@ -1070,6 +1072,9 @@ public:
         this->declare_parameter<double>("estimation.dt_cam", 0.033);
         this->declare_parameter<double>("estimation.W_guess", 1.5);
         this->declare_parameter<double>("estimation.vel_smooth_tc", 0.25);  // Fix B: target-vel EMA (s, 0=off)
+        // Accelerometer bias in body frame, subtracted before the strapdown preintegration.
+        // The Python-harness sim publishes a bias-free IMU (zeros); set calibrated values on real HW.
+        this->declare_parameter<std::vector<double>>("imu_bias", {0.0, 0.0, 0.0});
         this->declare_parameter<double>("system.control_rate", 100.0);
         this->declare_parameter<double>("control.rate_tc", 0.02);
         this->declare_parameter<bool>("control.rate_control_attenuation", true);
@@ -1086,11 +1091,10 @@ public:
         tracker_trigger_sub_ = this->create_subscription<std_msgs::msg::Header>(
             "/fpv/tracker_trigger", 10, std::bind(&InterceptorNodeRelativeIMMUKF::mission_launch_callback, this, std::placeholders::_1));
 
-        odom_sub_ = this->create_subscription<nav_msgs::msg::Odometry>(
-            "/fpv/odom", rclcpp::SensorDataQoS(), std::bind(&InterceptorNodeRelativeIMMUKF::odom_callback, this, std::placeholders::_1), sub_options);
-
-        // IMU gyro for collision detection (AirSim/real HW). Subscribed always; only consumed for
-        // !use_simulation_. Prefer this over odom twist.angular (raw, higher rate).
+        odom_sub_ = nullptr;   // ODOMETRY-FREE: the relative-state estimator + IMU strapdown
+        // IMU: SOLE ego-motion source. Orientation -> R_b2n (attitude for cam projection +
+        // control); linear_acceleration -> preintegrated dv_own between camera frames (exogenous
+        // a_own for the relativized process model); angular_velocity -> collision detection.
         imu_sub_ = this->create_subscription<sensor_msgs::msg::Imu>(
             "/mavros/imu/data", rclcpp::SensorDataQoS(), std::bind(&InterceptorNodeRelativeIMMUKF::imu_callback, this, std::placeholders::_1), sub_options);
 
@@ -1108,7 +1112,7 @@ public:
         mission_state_pub_ = this->create_publisher<std_msgs::msg::Bool>("/fpv/mission_state", 10);
 
         mission_state_.set(MissionState::IDLE);
-        RCLCPP_INFO(this->get_logger(), "Relative IMM-UKF node ready (Pure Odometry mode). Odom=/fpv/odom BBox=/fpv/target_bbox Launch=/fpv/tracker_trigger Control=/fpv/control_command");
+        RCLCPP_INFO(this->get_logger(), "Relative IMM-UKF node ready (ODOMETRY-FREE, IMU strapdown). IMU=/mavros/imu/data BBox=/fpv/target_bbox Launch=/fpv/tracker_trigger Control=/fpv/control_command");
     }
 
 private:
@@ -1200,6 +1204,10 @@ private:
         controller_->set_lat_decay_start(this->get_parameter("controller.lateral_decay_start").as_double());
         controller_->set_gimbal(use_gimbal_, gimbal_bias_rad_);
         vel_smooth_tc_ = this->get_parameter("estimation.vel_smooth_tc").as_double();
+        const std::vector<double> bias = this->get_parameter("imu_bias").as_double_array();
+        if (bias.size() == 3) {
+            imu_bias_ = Eigen::Vector3d(bias[0], bias[1], bias[2]);
+        }
 
     }
 
@@ -1228,7 +1236,7 @@ private:
 
         if (last_imu_time_ < 0.0 || !yaw_align_init_) {
             RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 1000,
-                "Waiting for Odometry to initialize...");
+                "Waiting for IMU to initialize...");
             return;
         }
 
@@ -1239,14 +1247,18 @@ private:
         const double v = msg->bbox.center.position.y - cam_height_ / 2.0;
         const double s = std::max(msg->bbox.size_x, msg->bbox.size_y);
 
-        Eigen::Vector3d uav_pos_use;
         Eigen::Matrix3d R_b2n;
+        Eigen::Vector3d dv_own;
         double gimbal_pitch_now = 0.0;
         {
             std::lock_guard<std::mutex> ol(odom_mtx_);
-            uav_pos_use = latest_odom_pos_;
             R_b2n = latest_R_b2n_;
             gimbal_pitch_now = latest_gimbal_pitch_;
+            // Drain the IMU-preintegration window for this camera frame: dv_own is the ownship
+            // velocity change since the last camera frame (world frame G, gravity-corrected).
+            dv_own = dv_own_accum_;
+            dv_own_accum_.setZero();
+            last_dv_own_ = dv_own;
         }
 
         // Semi-strapdown gimbal: rebuild R_b2c from the ACTUAL (lagged) servo angle so the
@@ -1258,7 +1270,7 @@ private:
         }
 
         const bool was_initialized = estimator_->initialized;
-        const auto result = estimator_->process_camera(has_bbox, u, v, s, t_now, uav_pos_use, R_b2n);
+        const auto result = estimator_->process_camera(has_bbox, u, v, s, t_now, R_b2n, dv_own);
 
         if (!was_initialized && estimator_->initialized) {
             transition_to_state(MissionState::TRACKING, "Target initialized");
@@ -1268,31 +1280,24 @@ private:
 
         if (!estimator_->initialized) return;
 
-        Eigen::Vector3d target_pos_now = result.second.segment<3>(0);
-        Eigen::Vector3d target_vel_now = result.second.segment<3>(3);
-        // Output smoothing of the absolute target velocity (Fix B): the raw UKF velocity estimate
-        // swings +/-12..18 m/s cycle-to-cycle in AirSim. EMA it so the cached v_est / target_speed
-        // (which drive the speed-aware brake floor) are stable. vel_smooth_tc_<=0 disables it.
+        // Relative-state estimator: x[0:3] IS the relative position, x[3:6] the relative velocity.
+        Eigen::Vector3d r_est = result.second.segment<3>(0);
+        Eigen::Vector3d rel_vel_now = result.second.segment<3>(3);
+        // Output smoothing of the relative velocity (Fix B): EMA the raw UKF v_rel so single-frame
+        // swings do not reach guidance. vel_smooth_tc_<=0 disables it.
         if (vel_smooth_tc_ > 1e-6) {
             if (has_target_vel_smoothed_ && t_now > last_vel_smooth_t_ &&
                 (t_now - last_vel_smooth_t_) < 1.0) {
                 const double a = clamp((t_now - last_vel_smooth_t_) / vel_smooth_tc_, 0.0, 1.0);
-                target_vel_smoothed_ += a * (target_vel_now - target_vel_smoothed_);
+                target_vel_smoothed_ += a * (rel_vel_now - target_vel_smoothed_);
             } else {
-                target_vel_smoothed_ = target_vel_now;
+                target_vel_smoothed_ = rel_vel_now;
             }
             last_vel_smooth_t_ = t_now;
             has_target_vel_smoothed_ = true;
-            target_vel_now = target_vel_smoothed_;
+            rel_vel_now = target_vel_smoothed_;
         }
-
-        Eigen::Vector3d r_est;
-        Eigen::Vector3d v_est;
-        {
-            std::lock_guard<std::mutex> ol(odom_mtx_);
-            r_est = target_pos_now - latest_odom_pos_;
-            v_est = target_vel_now - latest_odom_vel_;
-        }
+        const Eigen::Vector3d v_est = rel_vel_now;   // relative velocity (no ownship vel available)
 
         double los_az_world = std::atan2(r_est(1), r_est(0));
         double los_el = std::asin(clamp(r_est(2) / std::max(r_est.norm(), 0.1), -1.0, 1.0));
@@ -1339,9 +1344,11 @@ private:
         cache.source_time = t_now;
         cache.update_time = this->get_clock()->now().seconds();
         cache.bbox_size = s;
-        // Absolute target speed (clamped) feeds the speed-aware terminal-brake floor so the
-        // interceptor never decelerates below a maneuvering target's speed in the final approach.
-        cache.target_speed = std::min(target_vel_now.norm(), 15.0);
+        // Relative-speed proxy (ownship absolute speed unobservable without odom): drives the
+        // speed-aware terminal-brake floor. Mirror of the Python prototype's target_speed.
+        cache.target_speed = std::min(rel_vel_now.norm(), 15.0);
+        // Ownship world accel over the last camera window (for the controller's geometric APN).
+        cache.a_own = last_dv_own_ / std::max(dt_cam_, 1e-3);
 
         {
             std::lock_guard<std::mutex> cache_lock(control_cache_mtx_);
@@ -1385,24 +1392,30 @@ private:
         }
 
         Eigen::Matrix3d R_b2n;
-        Eigen::Vector3d odom_vel = Eigen::Vector3d::Zero();
         Eigen::Vector3d gyro = Eigen::Vector3d::Zero();
         double t_now = 0.0;
         double sim_start_time = -1.0;
         {
             std::lock_guard<std::mutex> odom_lock(odom_mtx_);
             R_b2n = latest_R_b2n_;
-            odom_vel = latest_odom_vel_;
             gyro = latest_gyro_;
             t_now = (last_imu_time_ > 0.0) ? last_imu_time_ : now.seconds();
+            // Anchor mission-relative time on the first control tick: the controller's jerk/slew/
+            // EMA states and the observability DITHER (sin(2*pi*f*t)) all need a running t.
+            if (sim_start_time_ < 0.0) {
+                sim_start_time_ = t_now;
+            }
             sim_start_time = sim_start_time_;
         }
 
         const double roll = std::atan2(R_b2n(2, 1), R_b2n(2, 2));
         const double pitch = std::atan2(-R_b2n(2, 0), std::sqrt(R_b2n(2, 1) * R_b2n(2, 1) + R_b2n(2, 2) * R_b2n(2, 2)));
         const double yaw = std::atan2(R_b2n(1, 0), R_b2n(0, 0));
-        // Body-frame forward speed from odom velocity rotated into heading frame.
-        const double v_fwd_body = std::cos(yaw) * odom_vel(0) + std::sin(yaw) * odom_vel(1);
+        // Closing speed along LOS from relative quantities only (no ownship vel):
+        // v_closing = -d|r|/dt = -v_rel·r̂ (positive = approaching). Replaces odom v_fwd_body.
+        const double v_closing = cache.valid
+            ? -cache.v_est.dot(cache.r_est) / std::max(cache.r_est.norm(), 1e-3)
+            : 0.0;
         double los_az = cache.los_az_world - yaw;
         los_az = std::atan2(std::sin(los_az), std::cos(los_az));
         const double t_rel = (sim_start_time >= 0.0) ? t_now - sim_start_time : 0.0;
@@ -1437,11 +1450,10 @@ private:
                 collision_detected_ = true;
                 RCLCPP_WARN(this->get_logger(),
                     "[COLLISION] Gyro spike! |err|=%.1f rad/s gyro=[%.2f,%.2f,%.2f] "
-                    "cmd=[%.2f,%.2f,%.2f] vel=[%.1f,%.1f,%.1f]",
+                    "cmd=[%.2f,%.2f,%.2f]",
                     rate_error_norm,
                     gyro.x(), gyro.y(), gyro.z(),
-                    last_cmd_.x(), last_cmd_.y(), last_cmd_.z(),
-                    odom_vel.x(), odom_vel.y(), odom_vel.z());
+                    last_cmd_.x(), last_cmd_.y(), last_cmd_.z());
                 transition_to_state(MissionState::COMPLETED, "Collision detected via gyro");
                 stop();
                 return;
@@ -1471,22 +1483,37 @@ private:
              (overshot && has_frozen_cmd_ && last_good_range_ < 12.0) ||
              range_reopened)) {
             captured_ = true;
+            // Seed the brake-scoped ownship velocity: the estimator's v_closing flips sign once
+            // the dead-reckoned r_est passes behind (fly-through), so braking on it runs AWAY
+            // (positive feedback). Instead, take the ownship velocity at capture ≈ last good
+            // closing speed along the current heading, then track it by IMU strapdown integration
+            // (imu_callback) — the brake then always opposes the REAL ownship velocity.
+            {
+                std::lock_guard<std::mutex> ol(odom_mtx_);
+                const double v_seed = std::max(v_closing, 0.0);
+                v_own_brake_ = Eigen::Vector3d(v_seed * std::cos(yaw), v_seed * std::sin(yaw), 0.0);
+                brake_vel_seeded_ = true;
+            }
             RCLCPP_INFO(this->get_logger(),
-                "CAPTURE: holding (brake-to-hold) to end of mission (r_est=%.1fm los_az=%.0fdeg)",
-                cache.r_est.norm(), los_az * 180.0 / M_PI);
+                "CAPTURE: holding (brake-to-hold) to end of mission (r_est=%.1fm los_az=%.0fdeg v_seed=%.1f)",
+                cache.r_est.norm(), los_az * 180.0 / M_PI, std::max(v_closing, 0.0));
         }
         if (captured_) {
-            // Brake-to-hold: cancel the FULL horizontal velocity with attitude (a real quad brakes
-            // by tilting), then settle into a level hover. theta_brake cancels the forward (body-x)
-            // component; phi_brake cancels the lateral (body-y) component — a crossing/banked
-            // intercept ends with several m/s of LATERAL velocity, and leveling the roll alone
-            // never decelerates it (the drag-free sim drifts forever; a real quad drifts far).
-            // Both angles -> 0 as velocity -> 0, so this settles into a level hover once stopped.
+            // Brake-to-hold on the strapdown brake velocity (NOT the estimator v_closing — its
+            // sign is unreliable once the target is behind): nose-up pitch cancels the forward
+            // component, roll cancels the lateral component, tilt-compensated hover thrust holds
+            // altitude. Both angles -> 0 as the velocity -> 0, settling into a level hover.
             constexpr double g_hover = 9.81;
-            constexpr double max_brake_tilt = 0.785;   // 45 deg (matches max_tilt authority)
-            const double v_lat_body = -std::sin(yaw) * odom_vel(0) + std::cos(yaw) * odom_vel(1);
-            const double theta_brake = clamp(-0.12 * v_fwd_body, -max_brake_tilt, max_brake_tilt);
-            const double phi_brake = clamp(0.12 * v_lat_body, -max_brake_tilt, max_brake_tilt);
+            constexpr double max_brake_tilt = 0.436;   // 25 deg
+            Eigen::Vector3d v_brake;
+            {
+                std::lock_guard<std::mutex> ol(odom_mtx_);
+                v_brake = v_own_brake_;
+            }
+            const double v_fwd_brake = std::cos(yaw) * v_brake(0) + std::sin(yaw) * v_brake(1);
+            const double v_lat_brake = -std::sin(yaw) * v_brake(0) + std::cos(yaw) * v_brake(1);
+            const double theta_brake = clamp(-0.12 * v_fwd_brake, -max_brake_tilt, max_brake_tilt);
+            const double phi_brake = clamp(0.12 * v_lat_brake, -max_brake_tilt, max_brake_tilt);
             const double tilt = std::sqrt(roll * roll + pitch * pitch);
             auto cmd = std::make_unique<quadrotor_msgs::msg::ControlCommand>();
             cmd->header.stamp = now;
@@ -1546,8 +1573,13 @@ private:
             return;
         }
 
-        const double v_z = odom_vel(2);
-        const auto ctrl = controller_->compute_control(roll, pitch, yaw, cache.r_est, cache.v_est, los_az, cache.los_el, t_rel, v_fwd_body, cache.bbox_size, v_z, cache.target_speed, cache.los_rate);
+        // Ownship vertical-speed proxy: -v_rel(2) (target-level approximation; preserves the
+        // vertical-PD damping sign). No odometry v_z available.
+        const double v_z = -cache.v_est(2);
+        const auto ctrl = controller_->compute_control(roll, pitch, yaw, cache.r_est, cache.v_est,
+                                                       los_az, cache.los_el, t_rel, v_closing,
+                                                       cache.bbox_size, v_z, cache.target_speed,
+                                                       cache.los_rate, cache.a_own);
         if (!std::isfinite(ctrl[0]) || !std::isfinite(ctrl[1]) || !std::isfinite(ctrl[2]) || !std::isfinite(ctrl[3])) {
             RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), THROTTLE_INTERVAL_MS*4,
                 "Skipping non-finite control command");
@@ -1618,11 +1650,13 @@ private:
             if (controller_) controller_->reset_dynamic_state();
             {
                 std::lock_guard<std::mutex> ol(odom_mtx_);
-                has_odom_ = false;
+                dv_own_accum_.setZero();
+                last_dv_own_.setZero();
+                last_imu_time_ = -1.0;
+                sim_start_time_ = -1.0;
             }
-            last_imu_time_ = -1.0;
-            sim_start_time_ = -1.0;
             last_cmd_ = Eigen::Vector3d::Zero();
+            has_target_vel_smoothed_ = false;
             has_prev_attitude_ = false;
             has_prev_los_ = false;
             los_rate_ema_ = 0.0;
@@ -1633,6 +1667,11 @@ private:
             captured_ = false;
             min_range_seen_ = 1e9;
             collision_detected_ = false;
+            {
+                std::lock_guard<std::mutex> ol(odom_mtx_);
+                v_own_brake_.setZero();
+                brake_vel_seeded_ = false;
+            }
             transition_to_state(MissionState::INITIALIZING, "Mission launch command");
             publish_mission_state(true);
             start_control_timer();
@@ -1647,13 +1686,38 @@ private:
         mission_launch_callback(header);
     }
 
-    // IMU gyro for collision detection (AirSim/real HW). Body angular velocity, same frame as the
-    // ControlCommand bodyrates. Stored under odom_mtx_ so the control loop reads a consistent sample.
+    // IMU: sole ego-motion input (ODOMETRY-FREE). Orientation -> attitude R_b2n; angular velocity
+    // -> collision detection; linear acceleration -> strapdown preintegration of the ownship
+    // velocity change dv_own = ∫(R_b2n·(f_imu − bias) − g)dτ over the current camera window.
+    // The accumulator is drained by bbox_callback each camera frame; it is a pure RELATIVE
+    // quantity per window, so there is no long-term velocity drift.
     void imu_callback(const sensor_msgs::msg::Imu::SharedPtr msg) {
+        const double t = rclcpp::Time(msg->header.stamp).seconds();
         std::lock_guard<std::mutex> odom_lock(odom_mtx_);
         latest_gyro_(0) = msg->angular_velocity.x;
         latest_gyro_(1) = msg->angular_velocity.y;
         latest_gyro_(2) = msg->angular_velocity.z;
+        const Eigen::Quaterniond q(msg->orientation.w, msg->orientation.x,
+                                   msg->orientation.y, msg->orientation.z);
+        if (q.norm() > 1e-6) {
+            latest_R_b2n_ = q.normalized().toRotationMatrix();
+        }
+        if (last_imu_time_ > 0.0 && t > last_imu_time_) {
+            const double dt = std::min(t - last_imu_time_, 0.05);   // guard against stamp gaps
+            const Eigen::Vector3d f_body(msg->linear_acceleration.x - imu_bias_(0),
+                                         msg->linear_acceleration.y - imu_bias_(1),
+                                         msg->linear_acceleration.z - imu_bias_(2));
+            const Eigen::Vector3d a_world = latest_R_b2n_ * f_body - Eigen::Vector3d(0.0, 0.0, 9.81);
+            dv_own_accum_ += a_world * dt;
+            // Brake-scoped ownship velocity (capture hold only): seeded from the last good
+            // v_closing at capture, then propagated by pure strapdown integration. Short-horizon
+            // (seconds), so accel-noise drift is negligible.
+            if (brake_vel_seeded_) {
+                v_own_brake_ += a_world * dt;
+            }
+        }
+        last_imu_time_ = t;
+        yaw_align_init_ = true;
     }
 
     // Actual gimbal pitch angle (rad, lagged servo measurement). Convention documented at the
@@ -1670,59 +1734,6 @@ private:
                0.0, std::cos(angle), -std::sin(angle),
                0.0, std::sin(angle), std::cos(angle);
         return R_g * R_b2c_base_;
-    }
-
-    void odom_callback(const nav_msgs::msg::Odometry::SharedPtr msg) {
-        std::lock_guard<std::mutex> odom_lock(odom_mtx_);
-        latest_odom_pos_(0) = msg->pose.pose.position.x;
-        latest_odom_pos_(1) = msg->pose.pose.position.y;
-        latest_odom_pos_(2) = msg->pose.pose.position.z;
-
-        const Eigen::Quaterniond q(msg->pose.pose.orientation.w, msg->pose.pose.orientation.x,
-                                   msg->pose.pose.orientation.y, msg->pose.pose.orientation.z);
-        latest_R_b2n_raw_ = q.normalized().toRotationMatrix();
-        latest_R_b2n_ = latest_R_b2n_raw_;
-
-        // mavros local_position/odom: pose in frame_id (map=ENU/world), twist in child_frame_id
-        // (base_link=body FLU). Rotate body-frame velocity into world so v_est = target_vel_world
-        // - odom_vel is consistent (both world). Without this, omega_los = r×v/r² mixes world r
-        // with body v, corrupting PN lateral direction, and v_fwd_body double-rotates.
-        const Eigen::Vector3d vel_body(msg->twist.twist.linear.x,
-                                       msg->twist.twist.linear.y,
-                                       msg->twist.twist.linear.z);
-        const Eigen::Vector3d vel_world = latest_R_b2n_ * vel_body;
-        latest_odom_vel_(0) = vel_world(0);
-        latest_odom_vel_(1) = vel_world(1);
-        latest_odom_vel_(2) = vel_world(2);
-        // Body angular velocity (gyro) for collision detection. mavros local_position/odom twist is
-        // in child_frame_id (base_link = body FLU), so twist.angular IS the body rate — same frame
-        // as the ControlCommand bodyrates we compare it against.
-        latest_gyro_(0) = msg->twist.twist.angular.x;
-        latest_gyro_(1) = msg->twist.twist.angular.y;
-        latest_gyro_(2) = msg->twist.twist.angular.z;
-
-        yaw_align_init_ = true;
-        has_odom_ = true;
-        last_imu_time_ = rclcpp::Time(msg->header.stamp).seconds();
-
-        if (!mission_state_.is_active()) {
-            return;
-        }
-
-        ControlCacheData cache;
-        {
-            std::lock_guard<std::mutex> cache_lock(control_cache_mtx_);
-            cache = control_cache_;
-        }
-
-        if (cache.valid && (last_imu_time_ - cache.source_time < 1.0)) {
-            const Eigen::Vector3d target_abs = cache.r_est + latest_odom_pos_;
-            RCLCPP_INFO_THROTTLE(this->get_logger(), *this->get_clock(), THROTTLE_INTERVAL_MS,
-                "odom pos=[%.2f %.2f %.2f] vel=[%.2f %.2f %.2f] | target_abs=[%.2f %.2f %.2f] range=%.2f",
-                latest_odom_pos_(0), latest_odom_pos_(1), latest_odom_pos_(2),
-                latest_odom_vel_(0), latest_odom_vel_(1), latest_odom_vel_(2),
-                target_abs(0), target_abs(1), target_abs(2), cache.r_est.norm());
-        }
     }
 
     void transition_to_state(MissionState new_state, const char* reason) {
@@ -1808,23 +1819,24 @@ private:
         Eigen::Matrix3d R_b2n = Eigen::Matrix3d::Identity();
         double bbox_size = 0.0;
         double target_speed = 0.0;
+        // Ownship world accel over the last camera window (IMU preintegration; geometric APN input).
+        Eigen::Vector3d a_own = Eigen::Vector3d::Zero();
     };
     ControlCacheData control_cache_;
 
     MissionStateMachine mission_state_;
 
     std::mutex odom_mtx_;
-    bool has_odom_ = false;
-    Eigen::Vector3d latest_odom_pos_ = Eigen::Vector3d::Zero();
-    Eigen::Vector3d latest_odom_vel_ = Eigen::Vector3d::Zero();
-    // Output smoothing of the estimator's absolute target velocity (Fix B): the raw UKF velocity
-    // swings +/-12..18 m/s in AirSim; EMA it (vel_smooth_tc_) before it drives v_est / target_speed.
+    // ODOMETRY-FREE ego state: attitude + preintegrated velocity change from the IMU only.
+    Eigen::Matrix3d latest_R_b2n_ = Eigen::Matrix3d::Identity();   // from IMU orientation
+    Eigen::Vector3d imu_bias_ = Eigen::Vector3d::Zero();           // accel bias (body frame)
+    Eigen::Vector3d dv_own_accum_ = Eigen::Vector3d::Zero();       // ∫(R(f-b)-g)dt since last cam frame
+    Eigen::Vector3d last_dv_own_ = Eigen::Vector3d::Zero();        // last drained camera window
+    // Output smoothing of the estimator's RELATIVE velocity (Fix B): EMA before it drives guidance.
     Eigen::Vector3d target_vel_smoothed_ = Eigen::Vector3d::Zero();
     bool has_target_vel_smoothed_ = false;
     double last_vel_smooth_t_ = -1.0;
-    double vel_smooth_tc_ = 0.25;   // s, EMA time constant on the target-velocity estimate (0 = off)
-    Eigen::Matrix3d latest_R_b2n_raw_ = Eigen::Matrix3d::Identity();
-    Eigen::Matrix3d latest_R_b2n_ = Eigen::Matrix3d::Identity();
+    double vel_smooth_tc_ = 0.25;   // s, EMA time constant on the relative-velocity estimate (0 = off)
 
     double last_imu_time_ = -1.0;
     double sim_start_time_ = -1.0;
@@ -1849,6 +1861,10 @@ private:
     // the interceptor HOLDS (level-and-hold) for the rest of the mission — resuming normal guidance
     // on a reacquired-and-now-distant target is what flies the UAV off after a clean close approach.
     bool captured_ = false;
+    // Brake-scoped ownship velocity (capture hold): seeded at capture from the last good closing
+    // speed, then strapdown-integrated in imu_callback. Guarded by odom_mtx_.
+    Eigen::Vector3d v_own_brake_ = Eigen::Vector3d::Zero();
+    bool brake_vel_seeded_ = false;
     // Collision detection (AirSim/real HW only, mirror InterceptorNodeBase): a gyro spike vs the
     // last commanded body rate signals physical contact -> intercept success -> COMPLETED. Gated on
     // !use_simulation_: the ROS2 Python sim has ground-truth range and judges intercept externally.

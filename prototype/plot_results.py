@@ -19,7 +19,7 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-INTERCEPT_RANGE = 2.0  # m, success radius used by ros2_sim_node.py
+INTERCEPT_RANGE = 1.0  # m, success radius used by ros2_sim_node.py
 ORDER = ["nominal", "crossing", "maneuvering", "dropout", "noise", "wrong_w"]
 
 # scenario -> (label, target-motion hint) for titles

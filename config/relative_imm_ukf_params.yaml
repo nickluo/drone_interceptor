@@ -1,22 +1,15 @@
 interceptor_node_relative_imm_ukf:
   ros__parameters:
-    # Fallback accelerometer bias in body frame, used when startup calibration is disabled or
-    # not enough stationary samples were gathered before the mission launch.
-    imu_bias: [0.15, -0.08, 0.05]
-
-    # Online accelerometer bias calibration from stationary IMU samples during the idle period
-    # before mission launch. On a stationary body the residual meas_acc - R_b2n^T*(0,0,g) is the bias.
-    imu_bias_calib:
-      enable: true
-      min_samples: 200    # minimum stationary samples required to accept the calibrated bias
-      accel_tol: 0.5      # m/s^2, |‖acc‖ - g| gate for the stationarity test
-      gyro_tol: 0.05      # rad/s, ‖gyro‖ gate for the stationarity test
+    # Accelerometer bias in body frame, subtracted before the strapdown preintegration
+    # (dv_own = ∫(R·(f_imu − bias) − g)dt). The ROS2 Python sim harness publishes a bias-free
+    # IMU, so zeros here; set calibrated values on real hardware.
+    imu_bias: [0.0, 0.0, 0.0]
 
     topics:
       imu: "/mavros/imu/data"
       bbox: "/fpv/target_bbox"
-      # UAV odometry (ENU). Bounds strapdown drift when estimation.use_odometry is true; also logged.
-      odom: "/fpv/odom"
+      # ODOMETRY-FREE: the node no longer subscribes to any odometry. Ego-motion comes solely
+      # from the IMU (orientation + preintegrated accel); the estimator state is fully relative.
       # Same launch trigger as InterceptorNodeBase: Header.frame_id is MISSION or OFF.
       mission_launch: "/fpv/tracker_trigger"
       mission_state: "/fpv/mission_state"
@@ -113,7 +106,7 @@ interceptor_node_relative_imm_ukf:
       # (1) Relax the roll clamp inside terminal_tilt_range so the interceptor can bank steeper at
       #     close range (target bbox is large; coast handles brief dropout). Pitch/FOV keep max_tilt_deg.
       max_tilt_terminal_deg: 45.0  # deg, roll clamp inside terminal_tilt_range (was 25)
-      terminal_tilt_range: 15.0    # m, below this range the roll clamp relaxes to max_tilt_terminal_deg
+      terminal_tilt_range: 30.0    # m, below this range the roll clamp relaxes (sync Python prototype)
       # (2) Arrive slower: ramp v_des -> v_terminal over [terminal_decel_range, terminal_brake_range]
       #     using the (stable) range estimate. Same bank gives ~2x turn rate at the lower speed.
       #     Floor is speed-aware (never stalls below target speed + margin).
@@ -134,11 +127,9 @@ interceptor_node_relative_imm_ukf:
 
     # State estimation aiding
     estimation:
-      # Use external odometry to bound strapdown drift via complementary fusion at the camera rate.
-      # First valid fix hard-seeds the ego frame onto the odometry ENU frame. Disables lateral
-      # dither when true (accurate parallax baseline makes the scale-observability dither redundant).
-      use_odometry: true
-      # Output smoothing of the estimator's absolute target velocity (Fix B, AirSim jitter): the raw
-      # UKF velocity swings +/-12..18 m/s cycle-to-cycle; EMA it before it drives v_est / the
-      # speed-aware brake floor. 0 disables.
-      vel_smooth_tc: 0.25          # s, EMA time constant on the target-velocity estimate
+      # ODOMETRY-FREE (mirror of the Python prototype): ego-motion from IMU strapdown
+      # preintegration only; the controller's lateral observability dither provides the parallax
+      # baseline that makes monocular depth/scale observable.
+      # Output smoothing of the estimator's RELATIVE velocity (Fix B): EMA before it drives
+      # guidance / the speed-aware brake floor. 0 disables.
+      vel_smooth_tc: 0.25          # s, EMA time constant on the relative-velocity estimate
