@@ -43,10 +43,12 @@ interceptor_node_relative_imm_ukf:
       # use_gimbal is true (the gimbal replaces the fixed mount).
       mount_pitch_deg: 0.0
       # Semi-strapdown single-axis pitch gimbal: servo keeps the boresight near-horizontal in the
-      # world frame regardless of body pitch (with servo lag); the ACTUAL angle is measured and
-      # published on /fpv/gimbal_angle (std_msgs/Float64, rad, positive = down-gaze) in real time.
-      # R_b2c = Rx(angle) * R_b2c_base. gimbal_bias_deg = fixed down-gaze bias: boresight world
-      # elevation = -gimbal_bias_deg (keeps nonzero image-v for co-altitude targets).
+      # world frame regardless of body pitch (with servo lag). The ACTUAL camera-to-world orientation
+      # q_C_W is published on /fpv/gimbal (sensor_msgs/Imu, orientation = camera->world quaternion) —
+      # the SAME convention as interceptor_node_base, the hardware gimbal driver, and AirSim. The node
+      # rebuilds R_b2c from q_C_W each frame. gimbal_bias_deg = fixed down-gaze bias: boresight world
+      # elevation = -gimbal_bias_deg (keeps nonzero image-v for co-altitude targets); still consumed
+      # by the controller FOV clamp and the pre-first-message R_b2c placeholder.
       use_gimbal: true
       gimbal_bias_deg: 5.0
 

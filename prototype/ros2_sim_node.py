@@ -4,6 +4,8 @@ ROS2 simulation node for testing InterceptorNodeRelativeIMMUKF (real C++ node).
 
 Publishes:
   /fpv/odom          (nav_msgs/Odometry, BEST_EFFORT)  @ 100 Hz — UAV ego state
+  /mavros/imu/data   (sensor_msgs/Imu, BEST_EFFORT) @ 100 Hz — body IMU (attitude + spec force)
+  /fpv/gimbal        (sensor_msgs/Imu, BEST_EFFORT) @ 100 Hz — camera-to-world orientation q_C_W
   /fpv/target_bbox   (vision_msgs/Detection2D, BEST_EFFORT) @ 30 Hz — camera projection
   /fpv/tracker_trigger (std_msgs/Header "MISSION") — one-shot mission launch
 
@@ -13,8 +15,8 @@ Subscribes:
 
 Internal quadrotor dynamics: first-order body-rate tracking + thrust along body z - gravity.
 Camera: pinhole projection on a semi-strapdown single-axis pitch gimbal (boresight servo-held
-near-horizontal, 5° down-gaze bias, servo lag 0.1 s) + Gaussian noise. The actual gimbal angle
-is published on /fpv/gimbal_angle (std_msgs/Float64, rad, positive = down-gaze).
+near-horizontal, 5° down-gaze bias, servo lag 0.1 s) + Gaussian noise. The actual camera-to-world
+orientation q_C_W is published on /fpv/gimbal (sensor_msgs/Imu), matching InterceptorNodeBase.
 
 Usage:
   ros2 launch drone_interceptor launch_relative_imm_ukf.py   # terminal 1
@@ -40,7 +42,7 @@ from nav_msgs.msg import Odometry
 from sensor_msgs.msg import Imu
 from vision_msgs.msg import Detection2D
 from quadrotor_msgs.msg import ControlCommand
-from std_msgs.msg import Header, Bool, Float64
+from std_msgs.msg import Header, Bool
 
 
 # ============================================================================
@@ -59,8 +61,9 @@ FOV_HALF_RAD = math.radians(CAM_FOV_DEG / 2.0)
 # [[1,0,0],[0,c,-s],[0,s,c]], POSITIVE angle = down-gaze. Boresight world elevation =
 # -(own_pitch + gimbal_total); the servo tracks servo_cmd = -own_pitch + GIMBAL_BIAS with a
 # first-order lag GIMBAL_TAU, so the boresight settles at -GIMBAL_BIAS (5 deg down-gaze).
-# The ACTUAL lagged angle is published on /fpv/gimbal_angle so the node sees the true camera
-# orientation including lag.
+# The ACTUAL camera-to-world orientation q_C_W = R_b2n @ R_B2C.T is published on /fpv/gimbal
+# (sensor_msgs/Imu, same convention as InterceptorNodeBase / hardware / AirSim) so the node sees
+# the true camera orientation including servo lag.
 R_B2C_BASE = np.array([[0.0, -1.0, 0.0],
                        [0.0, 0.0, -1.0],
                        [1.0, 0.0, 0.0]])
@@ -303,7 +306,7 @@ class SimNode(Node):
         self.imu_pub = self.create_publisher(Imu, '/mavros/imu/data', sensor_qos)
         self.bbox_pub = self.create_publisher(Detection2D, '/fpv/target_bbox', reliable_qos)
         self.trigger_pub = self.create_publisher(Header, '/fpv/tracker_trigger', 10)
-        self.gimbal_pub = self.create_publisher(Float64, '/fpv/gimbal_angle', sensor_qos)
+        self.gimbal_pub = self.create_publisher(Imu, '/fpv/gimbal', sensor_qos)
 
         # Subscribers
         self.control_sub = self.create_subscription(
@@ -389,12 +392,30 @@ class SimNode(Node):
             a_world = step_quadrotor(self.uav, throttle, rates, self.dt_ctrl)
 
         # Semi-strapdown gimbal: servo the cam-x pitch every control step (before the camera
-        # projection reads module R_B2C) and publish the ACTUAL lagged angle so the node rebuilds
-        # R_b2c from the true camera orientation.
+        # projection reads module R_B2C), then publish the ACTUAL camera-to-world orientation on
+        # /fpv/gimbal (sensor_msgs/Imu) — the SAME convention as InterceptorNodeBase, the hardware
+        # gimbal driver, and AirSim. orientation = q_C_W (camera->world); the node derives R_b2c from
+        # it. R_c2n = R_b2n @ R_B2C.T is the inverse of the sim projection's R_n2c = R_B2C @ R_b2n.T.
         gimbal_total = update_gimbal(self.uav, self.dt_ctrl)
         R_B2C[:, :] = Rx(gimbal_total) @ R_B2C_BASE
-        gmsg = Float64()
-        gmsg.data = float(gimbal_total)
+        R_c2n = self.uav.R_b2n @ R_B2C.T
+        w, x, y, z = R_to_quat(R_c2n)
+        gmsg = Imu()
+        gmsg.header.stamp = self.get_clock().now().to_msg()
+        gmsg.header.frame_id = "gimbal"
+        gmsg.orientation.w = float(w)
+        gmsg.orientation.x = float(x)
+        gmsg.orientation.y = float(y)
+        gmsg.orientation.z = float(z)
+        # angular_velocity / orientation_covariance are NOT consumed by the IMM-UKF node (it runs its
+        # own IMM-UKF + body-IMU strapdown). Populated best-effort for contract consistency with the
+        # base node / AirSim, which read them: body rate as the camera-rate approximation, and the
+        # camera world euler (r,p,y) packed into the covariance[0:3] slots (the base-node convention).
+        gmsg.angular_velocity.x = float(self.uav.omega[0])
+        gmsg.angular_velocity.y = float(self.uav.omega[1])
+        gmsg.angular_velocity.z = float(self.uav.omega[2])
+        g_roll, g_pitch, g_yaw = R_to_euler(R_c2n)
+        gmsg.orientation_covariance = [g_roll, g_pitch, g_yaw, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
         self.gimbal_pub.publish(gmsg)
 
         # range + LOS rate

@@ -2,7 +2,6 @@
 #include <sensor_msgs/msg/imu.hpp>
 #include <vision_msgs/msg/detection2_d.hpp>
 #include <std_msgs/msg/bool.hpp>
-#include <std_msgs/msg/float64.hpp>
 #include <std_msgs/msg/header.hpp>
 #include <quadrotor_msgs/msg/control_command.hpp>
 #include <nav_msgs/msg/odometry.hpp>
@@ -774,7 +773,8 @@ public:
                                         double v_fwd_body = 0.0, double bbox_size = 0.0,
                                         double v_z = 0.0, double target_speed = 0.0,
                                         double los_rate = 0.0,
-                                        const Eigen::Vector3d& a_own_world = Eigen::Vector3d::Zero()) {
+                                        const Eigen::Vector3d& a_own_world = Eigen::Vector3d::Zero(),
+                                        double boresight_el_meas = std::numeric_limits<double>::quiet_NaN()) {
         (void)v_est;
         const double r_norm = r_est.norm();
 
@@ -936,7 +936,12 @@ public:
             // Overrides the PD a_z only near the edge (outer 30% of the half-FOV). Mirrors the
             // verified Python implementation (sim_test_relative_imm_ukf.py).
             const double fov_keep = fov_half_v_ * fov_keep_margin_;
-            const double boresight_el = -gimbal_bias_;
+            // Boresight world elevation: prefer the ACTUAL camera orientation measured by the gimbal
+            // (q_C_W) — this tracks the true boresight INCLUDING servo lag, so the vertical-FOV clamp
+            // reacts to where the camera really points during pitch transients (closer to real HW).
+            // Fall back to the constant -gimbal_bias_ assumption when no measurement is available.
+            const double boresight_el = std::isfinite(boresight_el_meas)
+                ? boresight_el_meas : -gimbal_bias_;
             const double el_err = los_el - boresight_el;   // negative = target below boresight
             const double edge = 0.7 * fov_keep;
             if (el_err < -edge) {
@@ -1091,7 +1096,7 @@ public:
         tracker_trigger_sub_ = this->create_subscription<std_msgs::msg::Header>(
             "/fpv/tracker_trigger", 10, std::bind(&InterceptorNodeRelativeIMMUKF::mission_launch_callback, this, std::placeholders::_1));
 
-        odom_sub_ = nullptr;   // ODOMETRY-FREE: the relative-state estimator + IMU strapdown
+        // odom_sub_ = nullptr;   // ODOMETRY-FREE: the relative-state estimator + IMU strapdown
         // IMU: SOLE ego-motion source. Orientation -> R_b2n (attitude for cam projection +
         // control); linear_acceleration -> preintegrated dv_own between camera frames (exogenous
         // a_own for the relativized process model); angular_velocity -> collision detection.
@@ -1101,11 +1106,13 @@ public:
         bbox_sub_ = this->create_subscription<vision_msgs::msg::Detection2D>(
             "/fpv/target_bbox", 10, std::bind(&InterceptorNodeRelativeIMMUKF::bbox_callback, this, std::placeholders::_1), sub_options);
 
-        // Actual (measured, lagged) gimbal pitch angle in rad; published by the gimbal driver /
-        // sim harness at the control rate. Convention: R_b2c = Rx(angle) * R_b2c_base, positive
-        // = down-gaze. Only consumed when camera.use_gimbal is true.
-        gimbal_sub_ = this->create_subscription<std_msgs::msg::Float64>(
-            "/fpv/gimbal_angle", rclcpp::SensorDataQoS(),
+        // Gimbal orientation, IDENTICAL convention to InterceptorNodeBase / the hardware gimbal
+        // driver / AirSim: a sensor_msgs/Imu whose orientation field is the camera-to-world
+        // quaternion q_C_W (camera attitude in world/ENU). angular_velocity and orientation_covariance
+        // are ignored by this node (it has its own IMM-UKF + body-IMU strapdown); they are populated
+        // by the publisher for contract consistency. Only consumed when camera.use_gimbal is true.
+        gimbal_sub_ = this->create_subscription<sensor_msgs::msg::Imu>(
+            "/fpv/gimbal", rclcpp::SensorDataQoS(),
             std::bind(&InterceptorNodeRelativeIMMUKF::gimbal_callback, this, std::placeholders::_1), sub_options);
 
         control_pub_ = this->create_publisher<quadrotor_msgs::msg::ControlCommand>("/fpv/control_command", 10);
@@ -1141,9 +1148,9 @@ private:
         use_gimbal_ = this->get_parameter("camera.use_gimbal").as_bool();
         gimbal_bias_rad_ = this->get_parameter("camera.gimbal_bias_deg").as_double() * M_PI / 180.0;
         if (use_gimbal_) {
-            // Gimbal replaces the fixed mount. Until the first gimbal message arrives, assume the
-            // body is level so the servo sits at its bias (boresight = bias down-gaze).
-            latest_gimbal_pitch_ = gimbal_bias_rad_;
+            // Gimbal replaces the fixed mount. R_b2c_ is rebuilt from q_C_W every camera frame in
+            // bbox_callback; this is only the pre-first-/fpv/gimbal-msg placeholder (a level-body
+            // bias down-gaze body->camera mount). gimbal_received_ stays false until the first msg.
             R_b2c_ = gimbal_R_b2c(gimbal_bias_rad_);
         } else {
             R_b2c_ = R_pitch * R_b2c_base;
@@ -1249,11 +1256,13 @@ private:
 
         Eigen::Matrix3d R_b2n;
         Eigen::Vector3d dv_own;
-        double gimbal_pitch_now = 0.0;
+        Eigen::Quaterniond gimbal_q_now = Eigen::Quaterniond::Identity();
+        bool gimbal_rcvd = false;
         {
             std::lock_guard<std::mutex> ol(odom_mtx_);
             R_b2n = latest_R_b2n_;
-            gimbal_pitch_now = latest_gimbal_pitch_;
+            gimbal_q_now = latest_gimbal_q_;
+            gimbal_rcvd = gimbal_received_;
             // Drain the IMU-preintegration window for this camera frame: dv_own is the ownship
             // velocity change since the last camera frame (world frame G, gravity-corrected).
             dv_own = dv_own_accum_;
@@ -1261,11 +1270,23 @@ private:
             last_dv_own_ = dv_own;
         }
 
-        // Semi-strapdown gimbal: rebuild R_b2c from the ACTUAL (lagged) servo angle so the
-        // measurement model and the LOS reconstruction match the physical camera orientation at
-        // capture time. The angle is measured in real time, so lag is fully accounted for.
+        // Semi-strapdown gimbal: rebuild R_b2c from the ACTUAL (lagged) camera-to-world
+        // orientation q_C_W so the measurement model and the LOS reconstruction match the physical
+        // camera orientation at capture time. The orientation is measured in real time, so lag is
+        // fully accounted for.
+        //
+        // NOTE: in gimbal mode R_b2c_ is a SYNTHETIC matrix, not a true body->camera rotation. Its
+        // only purpose is to make the estimator's R_n2c = R_b2c*R_b2n^T and pixel_to_los_nav's
+        // R_b2n*R_b2c^T*ray reproduce the camera projection from q_C_W: with R_b2c_ = q_C_W^T * R_b2n,
+        // R_n2c = q_C_W^T and LOS = q_C_W*ray_cam. The same local R_b2n read here is passed to
+        // process_camera below (so the two cancel exactly). Until the first /fpv/gimbal msg arrives,
+        // fall back to the bias-derived body->camera mount (R_n2c then includes attitude via R_b2n^T).
         if (use_gimbal_) {
-            R_b2c_ = gimbal_R_b2c(gimbal_pitch_now);
+            if (gimbal_rcvd) {
+                R_b2c_ = gimbal_q_now.normalized().toRotationMatrix().transpose() * R_b2n;
+            } else {
+                R_b2c_ = gimbal_R_b2c(gimbal_bias_rad_);
+            }
             estimator_->R_b2c = R_b2c_;
         }
 
@@ -1393,12 +1414,16 @@ private:
 
         Eigen::Matrix3d R_b2n;
         Eigen::Vector3d gyro = Eigen::Vector3d::Zero();
+        Eigen::Quaterniond gimbal_q_now = Eigen::Quaterniond::Identity();
+        bool gimbal_rcvd = false;
         double t_now = 0.0;
         double sim_start_time = -1.0;
         {
             std::lock_guard<std::mutex> odom_lock(odom_mtx_);
             R_b2n = latest_R_b2n_;
             gyro = latest_gyro_;
+            gimbal_q_now = latest_gimbal_q_;
+            gimbal_rcvd = gimbal_received_;
             t_now = (last_imu_time_ > 0.0) ? last_imu_time_ : now.seconds();
             // Anchor mission-relative time on the first control tick: the controller's jerk/slew/
             // EMA states and the observability DITHER (sin(2*pi*f*t)) all need a running t.
@@ -1406,6 +1431,16 @@ private:
                 sim_start_time_ = t_now;
             }
             sim_start_time = sim_start_time_;
+        }
+        // Actual camera boresight world elevation from the measured q_C_W (camera->world): the
+        // camera forward axis is +Z (RDF), so its world z-component is sin(boresight_elev). Fed to
+        // the controller's vertical-FOV clamp so it tracks the TRUE boresight (incl. servo lag).
+        // NaN when the gimbal is disabled or no /fpv/gimbal msg has arrived yet (clamp then falls
+        // back to the -gimbal_bias_ assumption).
+        double boresight_el_meas = std::numeric_limits<double>::quiet_NaN();
+        if (use_gimbal_ && gimbal_rcvd) {
+            const Eigen::Matrix3d R_c2n = gimbal_q_now.normalized().toRotationMatrix();
+            boresight_el_meas = std::asin(clamp(R_c2n(2, 2), -1.0, 1.0));
         }
 
         const double roll = std::atan2(R_b2n(2, 1), R_b2n(2, 2));
@@ -1579,7 +1614,7 @@ private:
         const auto ctrl = controller_->compute_control(roll, pitch, yaw, cache.r_est, cache.v_est,
                                                        los_az, cache.los_el, t_rel, v_closing,
                                                        cache.bbox_size, v_z, cache.target_speed,
-                                                       cache.los_rate, cache.a_own);
+                                                       cache.los_rate, cache.a_own, boresight_el_meas);
         if (!std::isfinite(ctrl[0]) || !std::isfinite(ctrl[1]) || !std::isfinite(ctrl[2]) || !std::isfinite(ctrl[3])) {
             RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), THROTTLE_INTERVAL_MS*4,
                 "Skipping non-finite control command");
@@ -1720,11 +1755,17 @@ private:
         yaw_align_init_ = true;
     }
 
-    // Actual gimbal pitch angle (rad, lagged servo measurement). Convention documented at the
-    // parameter declaration: R_b2c = Rx(angle) * R_b2c_base, positive = down-gaze.
-    void gimbal_callback(const std_msgs::msg::Float64::SharedPtr msg) {
+    // /fpv/gimbal (Imu): store the camera-to-world orientation q_C_W. Same convention as
+    // InterceptorNodeBase (orientation used verbatim). angular_velocity / orientation_covariance
+    // are NOT consumed here — this node runs its own IMM-UKF + body-IMU strapdown.
+    void gimbal_callback(const sensor_msgs::msg::Imu::SharedPtr msg) {
+        const Eigen::Quaterniond q(msg->orientation.w, msg->orientation.x,
+                                   msg->orientation.y, msg->orientation.z);
         std::lock_guard<std::mutex> odom_lock(odom_mtx_);
-        latest_gimbal_pitch_ = msg->data;
+        if (q.norm() > 1e-6) {
+            latest_gimbal_q_ = q.normalized();
+            gimbal_received_ = true;
+        }
     }
 
     // Build R_b2c from the given gimbal cam-x pitch angle (positive = down-gaze).
@@ -1776,7 +1817,9 @@ private:
     // Semi-strapdown gimbal state (see parameter declaration for the convention).
     bool use_gimbal_ = false;
     double gimbal_bias_rad_ = 0.0;
-    double latest_gimbal_pitch_ = 0.0;   // rad, actual servo angle; guarded by odom_mtx_
+    // Camera-to-world quaternion q_C_W from /fpv/gimbal (Imu). Guarded by odom_mtx_.
+    Eigen::Quaterniond latest_gimbal_q_ = Eigen::Quaterniond::Identity();
+    bool gimbal_received_ = false;       // true once the first valid /fpv/gimbal msg arrives
 
     double dt_cam_ = 0.033;
     double W_guess_ = 1.5;
@@ -1789,10 +1832,10 @@ private:
 
     rclcpp::Subscription<std_msgs::msg::Bool>::SharedPtr mission_sub_;
     rclcpp::Subscription<std_msgs::msg::Header>::SharedPtr tracker_trigger_sub_;
-    rclcpp::Subscription<nav_msgs::msg::Odometry>::SharedPtr odom_sub_;
+    // rclcpp::Subscription<nav_msgs::msg::Odometry>::SharedPtr odom_sub_;
     rclcpp::Subscription<sensor_msgs::msg::Imu>::SharedPtr imu_sub_;
     rclcpp::Subscription<vision_msgs::msg::Detection2D>::SharedPtr bbox_sub_;
-    rclcpp::Subscription<std_msgs::msg::Float64>::SharedPtr gimbal_sub_;
+    rclcpp::Subscription<sensor_msgs::msg::Imu>::SharedPtr gimbal_sub_;
     rclcpp::Publisher<quadrotor_msgs::msg::ControlCommand>::SharedPtr control_pub_;
     rclcpp::Publisher<std_msgs::msg::Bool>::SharedPtr mission_state_pub_;
 
