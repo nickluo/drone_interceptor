@@ -393,12 +393,13 @@ class SimNode(Node):
 
         # Semi-strapdown gimbal: servo the cam-x pitch every control step (before the camera
         # projection reads module R_B2C), then publish the ACTUAL camera-to-world orientation on
-        # /fpv/gimbal (sensor_msgs/Imu) — the SAME convention as InterceptorNodeBase, the hardware
-        # gimbal driver, and AirSim. orientation = q_C_W (camera->world); the node derives R_b2c from
-        # it. R_c2n = R_b2n @ R_B2C.T is the inverse of the sim projection's R_n2c = R_B2C @ R_b2n.T.
+        # /fpv/gimbal (sensor_msgs/Imu) — q_C_W in the FLU camera frame (x=fwd, y=left, z=up), the
+        # SAME convention as InterceptorNodeBase/DroneEKF, the hardware gimbal driver, and AirSim.
+        # FLU = RDF right-multiplied by R_B2C_BASE (FLU->RDF): (FLU->ENU) = (RDF->ENU)·(FLU->RDF),
+        # where RDF->ENU = R_b2n @ R_B2C.T (inverse of the sim projection's R_n2c = R_B2C @ R_b2n.T).
         gimbal_total = update_gimbal(self.uav, self.dt_ctrl)
         R_B2C[:, :] = Rx(gimbal_total) @ R_B2C_BASE
-        R_c2n = self.uav.R_b2n @ R_B2C.T
+        R_c2n = (self.uav.R_b2n @ R_B2C.T) @ R_B2C_BASE
         w, x, y, z = R_to_quat(R_c2n)
         gmsg = Imu()
         gmsg.header.stamp = self.get_clock().now().to_msg()

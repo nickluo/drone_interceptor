@@ -1755,15 +1755,21 @@ private:
         yaw_align_init_ = true;
     }
 
-    // /fpv/gimbal (Imu): store the camera-to-world orientation q_C_W. Same convention as
-    // InterceptorNodeBase (orientation used verbatim). angular_velocity / orientation_covariance
+    // /fpv/gimbal (Imu): the orientation field is q_C_W in the FLU camera frame (x=fwd, y=left,
+    // z=up) — the SAME convention as InterceptorNodeBase/DroneEKF and airsim_tracker, so the
+    // base/quaternion/DQ nodes consume /fpv/gimbal unchanged. This node's estimator uses the RDF
+    // optical frame internally (x=right, y=down, z=fwd), so convert FLU->RDF at intake:
+    //   q_C_W_rdf = q_C_W_flu * R(R_b2c_base_^T),  since (FLU->ENU)*(RDF->FLU) = RDF->ENU.
+    // R_b2c_base_ is the FLU(body)->RDF(cam) extrinsic. angular_velocity / orientation_covariance
     // are NOT consumed here — this node runs its own IMM-UKF + body-IMU strapdown.
     void gimbal_callback(const sensor_msgs::msg::Imu::SharedPtr msg) {
-        const Eigen::Quaterniond q(msg->orientation.w, msg->orientation.x,
-                                   msg->orientation.y, msg->orientation.z);
-        std::lock_guard<std::mutex> odom_lock(odom_mtx_);
-        if (q.norm() > 1e-6) {
-            latest_gimbal_q_ = q.normalized();
+        const Eigen::Quaterniond q_flu(msg->orientation.w, msg->orientation.x,
+                                       msg->orientation.y, msg->orientation.z);
+        if (q_flu.norm() > 1e-6) {
+            const Eigen::Quaterniond q_rdf = q_flu.normalized() *
+                                             Eigen::Quaterniond(R_b2c_base_.transpose());
+            std::lock_guard<std::mutex> odom_lock(odom_mtx_);
+            latest_gimbal_q_ = q_rdf.normalized();
             gimbal_received_ = true;
         }
     }
