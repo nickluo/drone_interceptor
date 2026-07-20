@@ -883,11 +883,18 @@ public:
         has_last_ = true;
         Eigen::Vector2d a_fwd_world = a_fwd * e_los_xy;
 
-        // ---- (B) Decoupled vertical: independent altitude track -------------------------
+        // ---- (B) Decoupled vertical: cascaded velocity-limited altitude track ------------
         const double dz_target = r_est(2);
-        // PD on vertical: K_z on position error, K_zd damps the vertical-speed proxy so the climb
-        // rate built up while dz_target was large is braked BEFORE the zero-crossing.
-        double a_z = clamp(K_z_ * dz_target - K_zd_ * v_z, -4.0, 4.0);
+        // Command a vertical SPEED toward the target altitude (capped at v_z_max), then accelerate
+        // to track it. Two wins over a direct high-authority PD: (1) the velocity cap prevents the
+        // runaway dive/overshoot (the direct PD built large sink rates that K_zd could not brake in
+        // time -> over-dive on below-FOV targets); (2) the cap saturates the commanded speed, so a
+        // biased monocular dz (wrong target width) does NOT inflate the descent — robust to wrong_w.
+        // Damping rides on the IMU own vertical velocity (well-observed).
+        constexpr double v_z_max = 8.0;   // m/s, max climb/sink commanded toward target altitude
+        constexpr double K_az = 2.0;      // vertical-speed tracking gain
+        const double v_z_desired = clamp(dz_target, -v_z_max, v_z_max);
+        double a_z = clamp(K_az * (v_z_desired - v_z), -8.0, 8.0);
         // Slew limit |da_z/dt|: the z-estimate can jump O(10 m) in one cycle; ramp a_z instead of
         // stepping it (which would pitch the body over).
         if (has_last_az_ && t > last_az_t_) {

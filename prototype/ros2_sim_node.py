@@ -281,16 +281,41 @@ SCENARIOS = {
         uav_init=[0.0, 0.0, 10.0], uav_yaw=0.0,
         sim_time=30.0, noise_pos=1.5, noise_size=2.0,
         target_width=0.8, dropout=None),
-    # Target well BELOW the UAV (4 m down): stresses the vertical guidance. At v_des=20 the
-    # horizontal closing is fast, so the altitude gap must be closed in time or the pursuer passes
-    # overhead (near-miss). Mirrors the AirSim below-FOV near-miss case.
-    'below': dict(
-        target_init=[40.0, 0.0, 6.0],
-        vel_fn=lambda t: [0.0, 0.0, 0.0],
-        uav_init=[0.0, 0.0, 10.0], uav_yaw=0.0,
-        sim_time=30.0, noise_pos=1.5, noise_size=2.0,
-        target_width=1.5, dropout=None),
 }
+
+
+# ============================================================================
+# FOV-position sweep: place the target initially at a named image position
+# (normalized image coords: nx = right, ny = down, in [-1, 1]; 0.67 ~ near the
+# edge, 0.33 ~ between center and edge). Used to test robustness across the FOV.
+# ============================================================================
+FOV_POSITIONS = {
+    'topleft':     (-0.67, -0.67),
+    'top':         ( 0.00, -0.67),
+    'topright':    ( 0.67, -0.67),
+    'left':        (-0.67,  0.00),
+    'midleft':     (-0.33,  0.00),
+    'midright':    ( 0.33,  0.00),
+    'right':       ( 0.67,  0.00),
+    'bottomleft':  (-0.67,  0.67),
+    'bottom':      ( 0.00,  0.67),
+    'bottomright': ( 0.67,  0.67),
+}
+
+
+def target_init_for_fov(scenario, fov_name):
+    """Initial target position that places the target at the named FOV image position, at the
+    scenario's nominal range. Camera at start = body yaw + gimbal bias down-gaze (gimbal_pitch
+    initializes to GIMBAL_BIAS). The world-frame velocity profile is unchanged."""
+    nx, ny = FOV_POSITIONS[fov_name]
+    uav_pos = np.array(scenario['uav_init'], dtype=float)
+    R_b2n = euler_to_R(0.0, 0.0, scenario['uav_yaw'])
+    R_b2c = Rx(GIMBAL_BIAS) @ R_B2C_BASE                       # gimbal starts at the bias
+    ray_cam = np.array([nx * math.tan(FOV_HALF_RAD), ny * math.tan(FOV_HALF_RAD), 1.0])
+    ray_world = R_b2n @ R_b2c.T @ ray_cam
+    ray_world /= np.linalg.norm(ray_world)
+    nominal_range = float(np.linalg.norm(np.array(scenario['target_init'], dtype=float) - uav_pos))
+    return (uav_pos + nominal_range * ray_world).tolist()
 
 
 # ============================================================================
@@ -587,10 +612,23 @@ class SimNode(Node):
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--scenario', default='nominal', choices=list(SCENARIOS.keys()))
+    parser.add_argument('--fov_pos', default=None, choices=list(FOV_POSITIONS.keys()),
+                        help='override target_init: place the target at this FOV image position, at '
+                             'the scenario nominal range (world-frame velocity unchanged)')
+    parser.add_argument('--sim_time', type=float, default=None,
+                        help='override the scenario sim_time (s)')
     args = parser.parse_args()
 
+    scen = dict(SCENARIOS[args.scenario])          # copy so overrides don't mutate SCENARIOS
+    name = args.scenario
+    if args.fov_pos is not None:
+        scen['target_init'] = target_init_for_fov(scen, args.fov_pos)
+        name = f"{args.scenario}-{args.fov_pos}"
+    if args.sim_time is not None:
+        scen['sim_time'] = args.sim_time
+
     rclpy.init()
-    node = SimNode(args.scenario, SCENARIOS[args.scenario])
+    node = SimNode(name, scen)
     np.random.seed(42)
     try:
         rclpy.spin(node)
