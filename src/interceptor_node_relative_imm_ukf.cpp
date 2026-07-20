@@ -1416,6 +1416,7 @@ private:
         Eigen::Vector3d gyro = Eigen::Vector3d::Zero();
         Eigen::Quaterniond gimbal_q_now = Eigen::Quaterniond::Identity();
         bool gimbal_rcvd = false;
+        Eigen::Vector3d own_vel_now = Eigen::Vector3d::Zero();
         double t_now = 0.0;
         double sim_start_time = -1.0;
         {
@@ -1424,6 +1425,7 @@ private:
             gyro = latest_gyro_;
             gimbal_q_now = latest_gimbal_q_;
             gimbal_rcvd = gimbal_received_;
+            own_vel_now = own_vel_;
             t_now = (last_imu_time_ > 0.0) ? last_imu_time_ : now.seconds();
             // Anchor mission-relative time on the first control tick: the controller's jerk/slew/
             // EMA states and the observability DITHER (sin(2*pi*f*t)) all need a running t.
@@ -1608,9 +1610,10 @@ private:
             return;
         }
 
-        // Ownship vertical-speed proxy: -v_rel(2) (target-level approximation; preserves the
-        // vertical-PD damping sign). No odometry v_z available.
-        const double v_z = -cache.v_est(2);
+        // Vertical damping from the IMU-integrated ownship vertical velocity (robust; the
+        // monocular v_est(2) used before is poorly observable and left the vertical PD to over-dive
+        // on below-FOV targets — own_vel_(2) is the actual own climb/sink rate).
+        const double v_z = own_vel_now(2);
         const auto ctrl = controller_->compute_control(roll, pitch, yaw, cache.r_est, cache.v_est,
                                                        los_az, cache.los_el, t_rel, v_closing,
                                                        cache.bbox_size, v_z, cache.target_speed,
@@ -1705,6 +1708,7 @@ private:
             {
                 std::lock_guard<std::mutex> ol(odom_mtx_);
                 v_own_brake_.setZero();
+                own_vel_.setZero();
                 brake_vel_seeded_ = false;
             }
             transition_to_state(MissionState::INITIALIZING, "Mission launch command");
@@ -1744,6 +1748,7 @@ private:
                                          msg->linear_acceleration.z - imu_bias_(2));
             const Eigen::Vector3d a_world = latest_R_b2n_ * f_body - Eigen::Vector3d(0.0, 0.0, 9.81);
             dv_own_accum_ += a_world * dt;
+            own_vel_ += a_world * dt;   // always-on ownship vel (world) for vertical damping
             // Brake-scoped ownship velocity (capture hold only): seeded from the last good
             // v_closing at capture, then propagated by pure strapdown integration. Short-horizon
             // (seconds), so accel-noise drift is negligible.
@@ -1914,6 +1919,11 @@ private:
     // speed, then strapdown-integrated in imu_callback. Guarded by odom_mtx_.
     Eigen::Vector3d v_own_brake_ = Eigen::Vector3d::Zero();
     bool brake_vel_seeded_ = false;
+    // Always-on ownship velocity (world frame) from IMU strapdown. Robust damping signal for the
+    // vertical guidance: the monocular relative v_est(2) it used before is poorly observable, so the
+    // vertical PD over-dived on below-FOV targets. Drifts long-term from accel bias, but the
+    // high-frequency component (what damping needs) is accurate; reset on mission launch.
+    Eigen::Vector3d own_vel_ = Eigen::Vector3d::Zero();
     // Collision detection (AirSim/real HW only, mirror InterceptorNodeBase): a gyro spike vs the
     // last commanded body rate signals physical contact -> intercept success -> COMPLETED. Gated on
     // !use_simulation_: the ROS2 Python sim has ground-truth range and judges intercept externally.

@@ -281,6 +281,15 @@ SCENARIOS = {
         uav_init=[0.0, 0.0, 10.0], uav_yaw=0.0,
         sim_time=30.0, noise_pos=1.5, noise_size=2.0,
         target_width=0.8, dropout=None),
+    # Target well BELOW the UAV (4 m down): stresses the vertical guidance. At v_des=20 the
+    # horizontal closing is fast, so the altitude gap must be closed in time or the pursuer passes
+    # overhead (near-miss). Mirrors the AirSim below-FOV near-miss case.
+    'below': dict(
+        target_init=[40.0, 0.0, 6.0],
+        vel_fn=lambda t: [0.0, 0.0, 0.0],
+        uav_init=[0.0, 0.0, 10.0], uav_yaw=0.0,
+        sim_time=30.0, noise_pos=1.5, noise_size=2.0,
+        target_width=1.5, dropout=None),
 }
 
 
