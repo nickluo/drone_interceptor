@@ -66,8 +66,19 @@ interceptor_node_relative_imm_ukf:
       K_ibvs: 2.0
       K_att: 6.0     # attitude P-gain (was 9.0; lowered to damp the close-range roll limit-cycle)
       K_yaw: 5.0
-      K_z: 2.0     # 垂直比例增益 (a_z = K_z*dz - K_zd*vz)
-      K_zd: 2.0    # 垂直阻尼增益 (pursuer odom v_z), 抑制终端段 z 过冲; K_z=2 -> zeta≈0.7
+      K_z: 2.0     # 垂直比例增益 (a_z = K_z*dz - K_zd*vz) [legacy direct-PD, unused by the cascade below]
+      K_zd: 2.0    # 垂直阻尼增益 (pursuer odom v_z), 抑制终端段 z 过冲; K_z=2 -> zeta≈0.7 [legacy, unused]
+      # --- Active vertical guidance: cascaded velocity-limited altitude track ---
+      # v_z_desired = clamp(dz * K_dz, ±v_climb/v_descent); a_z = K_az*(v_z_desired - own_vz).
+      # v_climb/v_descent (m/s): max commanded climb/sink RATE (the cap). Set to the airframe's REAL
+      #   climb/sink capability so the commanded rate is achievable (too high -> lag -> stall).
+      # K_dz_up/dn (1/s): responsiveness; closure time constant tau = 1/K. CLIMB uses a higher gain
+      #   than DESCENT so an upper-FOV target does not asymptotically stall ~1 m short, while a
+      #   below-FOV target still brakes without over-dive.
+      v_climb: 20.0     # m/s, max commanded climb rate
+      v_descent: 20.0   # m/s, max commanded sink rate
+      K_dz_up: 3.0     # 1/s, climb responsiveness (1=stall-risk @v_des=20, 2.5=over-climb-risk)
+      K_dz_dn: 2.0     # 1/s, descent responsiveness (keep < K_dz_up)
       # Cruise closing speed (m/s). Must exceed any target's speed or the interceptor cannot gain
       # on a maneuvering/crossing target; the speed-aware brake floor (see compute_control) keeps
       # the final-approach speed above the target speed so v_des sets the mid-course advantage.

@@ -666,6 +666,13 @@ public:
     // keep-in-frame is done through ALTITUDE (a_z) instead (see compute_control).
     bool has_gimbal_ = false;
     double gimbal_bias_ = 0.0;   // rad, down-gaze bias: boresight elev = -gimbal_bias_
+    // Vertical cascade (cascaded velocity-limited altitude track): v_climb_/v_descent_ = max
+    // commanded climb/sink rate [m/s] (the cap); K_dz_up_/dn_ = dz->rate gain [1/s] (closure
+    // tau = 1/K). Asymmetric: climb more responsive than descent (avoid below-FOV over-dive).
+    double v_climb_   = 8.0;
+    double v_descent_ = 8.0;
+    double K_dz_up_   = 2.0;
+    double K_dz_dn_   = 1.0;
     // Speed-scheduled PN + attitude reference slew governor (v_des=20 oscillation fixes).
     double v_pn_ref_ = 1e9;       // cap on v_fwd in PN lateral accel -> bounds effective N*v at high speed
     double max_att_rate_ = 1e9;   // max |d(phi_cmd)/dt|, |d(theta_cmd)/dt| [rad/s] (slew governor)
@@ -754,6 +761,16 @@ public:
     void set_gimbal(bool has_gimbal, double gimbal_bias_rad) {
         has_gimbal_ = has_gimbal;
         gimbal_bias_ = gimbal_bias_rad;
+    }
+    // Vertical-cascade tuning (cascaded velocity-limited altitude track). Independent so the
+    // operator can set the climb/sink RATE (m/s, the cap — calibrate to the airframe's real
+    // capability so the commanded rate is achievable) and the RESPONSIVENESS (K_dz 1/s, closure
+    // tau = 1/K) separately for climb vs descent.
+    void set_vertical_climb(double v_climb, double v_descent, double K_dz_up, double K_dz_dn) {
+        v_climb_   = std::max(0.5, v_climb);
+        v_descent_ = std::max(0.5, v_descent);
+        K_dz_up_   = std::max(0.1, K_dz_up);
+        K_dz_dn_   = std::max(0.1, K_dz_dn);
     }
 
     // Decoupled control (odometry-free, exact mirror of the Python prototype). Inputs:
@@ -852,6 +869,13 @@ public:
                                       std::max(terminal_decel_range_ - terminal_brake_range_, 1.0), 0.0, 1.0);
             v_des_eff = v_des + (v_term_eff - v_des) * frac;   // ramp v_des -> v_term_eff (<= v_des)
         }
+        // Turn-radius-aware speed cap: limit the closing speed so the minimum turn radius
+        // (v^2 / (g*tan(max_tilt))) stays inside the current range. Without this, v_des=20 yields a
+        // ~40 m min turn radius at 45 deg bank and the interceptor PHYSICALLY cannot bend onto a
+        // target inside that -> overshoot/fly-by (AirSim v_des=20 ~60% vs v_des=15 ~80%; the Python
+        // sim's ideal rate loop hides it). Bites only at close range (at r=40 m the cap is ~20 m/s).
+        // The brake floor below still keeps enough closing to gain on a moving target.
+        v_des_eff = std::min(v_des_eff, std::sqrt(9.81 * std::tan(max_tilt_rad) * r_norm));
         const double bbox_engage = terminal_bbox_size_ * 0.2;   // engage at ~5x brake_range
         if (bbox_size > bbox_engage) {
             const double prox = clamp((bbox_size - bbox_engage) /
@@ -885,15 +909,22 @@ public:
 
         // ---- (B) Decoupled vertical: cascaded velocity-limited altitude track ------------
         const double dz_target = r_est(2);
-        // Command a vertical SPEED toward the target altitude (capped at v_z_max), then accelerate
-        // to track it. Two wins over a direct high-authority PD: (1) the velocity cap prevents the
-        // runaway dive/overshoot (the direct PD built large sink rates that K_zd could not brake in
-        // time -> over-dive on below-FOV targets); (2) the cap saturates the commanded speed, so a
-        // biased monocular dz (wrong target width) does NOT inflate the descent — robust to wrong_w.
-        // Damping rides on the IMU own vertical velocity (well-observed).
-        constexpr double v_z_max = 8.0;   // m/s, max climb/sink commanded toward target altitude
+        // Command a vertical SPEED toward the target altitude (capped), then accelerate to track it.
+        // (1) the cap prevents runaway dive/overshoot; (2) cap saturation makes a biased monocular
+        // dz (wrong target width) NOT inflate the descent — robust to wrong_w. Damping rides on the
+        // IMU own vertical velocity. v_climb/v_descent (m/s, max commanded climb/sink rate) and
+        // K_dz_up/dn (1/s, responsiveness; closure tau = 1/K) are INDEPENDENT config params
+        // (set_vertical_climb). CLIMB uses a higher gain than DESCENT so an upper-FOV target does
+        // not asymptotically stall ~1 m short, while a below-FOV target still brakes without
+        // over-dive. Set v_climb/v_descent to the airframe's real climb/sink capability so the
+        // commanded rate is achievable (else lag -> stall).
         constexpr double K_az = 2.0;      // vertical-speed tracking gain
-        const double v_z_desired = clamp(dz_target, -v_z_max, v_z_max);
+        double v_z_desired;
+        if (dz_target > 0.0) {
+            v_z_desired = clamp(dz_target * K_dz_up_, 0.0, v_climb_);
+        } else {
+            v_z_desired = clamp(dz_target * K_dz_dn_, -v_descent_, 0.0);
+        }
         double a_z = clamp(K_az * (v_z_desired - v_z), -8.0, 8.0);
         // Slew limit |da_z/dt|: the z-estimate can jump O(10 m) in one cycle; ramp a_z instead of
         // stepping it (which would pitch the body over).
@@ -1081,6 +1112,13 @@ public:
         this->declare_parameter<double>("controller.a_z_slew", 20.0);   // Fix C/E: |da_z/dt| limit (m/s^3)
         this->declare_parameter<double>("controller.lateral_decay_floor", 0.4);  // Fix D: close-range a_lat floor
         this->declare_parameter<double>("controller.lateral_decay_start", 25.0); // Fix F: range lateral attenuation begins (m)
+        // Vertical cascade (cascaded velocity-limited altitude track). Set v_climb/v_descent to the
+        // airframe's real climb/sink capability (m/s) so the commanded rate is achievable; K_dz_up/dn
+        // (1/s, closure tau=1/K) tune responsiveness independently for climb vs descent.
+        this->declare_parameter<double>("controller.v_climb", 8.0);     // m/s, max commanded climb rate (cap)
+        this->declare_parameter<double>("controller.v_descent", 8.0);   // m/s, max commanded sink rate (cap)
+        this->declare_parameter<double>("controller.K_dz_up", 2.0);     // 1/s, climb responsiveness (upper target)
+        this->declare_parameter<double>("controller.K_dz_dn", 1.0);     // 1/s, descent responsiveness (lower target; < K_up to avoid over-dive)
         this->declare_parameter<double>("estimation.dt_cam", 0.033);
         this->declare_parameter<double>("estimation.W_guess", 1.5);
         this->declare_parameter<double>("estimation.vel_smooth_tc", 0.25);  // Fix B: target-vel EMA (s, 0=off)
@@ -1217,6 +1255,11 @@ private:
         controller_->set_lateral_decay_floor(this->get_parameter("controller.lateral_decay_floor").as_double());
         controller_->set_lat_decay_start(this->get_parameter("controller.lateral_decay_start").as_double());
         controller_->set_gimbal(use_gimbal_, gimbal_bias_rad_);
+        controller_->set_vertical_climb(
+            this->get_parameter("controller.v_climb").as_double(),
+            this->get_parameter("controller.v_descent").as_double(),
+            this->get_parameter("controller.K_dz_up").as_double(),
+            this->get_parameter("controller.K_dz_dn").as_double());
         vel_smooth_tc_ = this->get_parameter("estimation.vel_smooth_tc").as_double();
         const std::vector<double> bias = this->get_parameter("imu_bias").as_double_array();
         if (bias.size() == 3) {

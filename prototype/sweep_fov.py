@@ -11,7 +11,8 @@ import os, re, signal, subprocess, sys, time
 PKG = "/media/nick/data/workspace/fpv_ws/src/drone_interceptor"
 EXE = "/media/nick/data/workspace/fpv_ws/install/drone_interceptor/lib/drone_interceptor/interceptor_node_relative_imm_ukf"
 PARAMS = "/media/nick/data/workspace/fpv_ws/install/drone_interceptor/share/drone_interceptor/config/relative_imm_ukf_params.yaml"
-SETUP = "source /opt/ros/jazzy/setup.bash && source /media/nick/data/workspace/fpv_ws/install/setup.bash"
+SETUP = ("export ROS_DOMAIN_ID=1 && source /opt/ros/jazzy/setup.bash && "
+         "source /media/nick/data/workspace/fpv_ws/install/setup.bash")  # isolate from AirSim (domain 0)
 SIM_TIME = "12"
 
 SCENARIOS = ["nominal", "crossing", "maneuvering", "dropout", "noise", "wrong_w"]
@@ -23,8 +24,26 @@ SIM_LOG = "/tmp/sweep_sim.log"
 
 
 def kill_stray():
-    subprocess.run("pkill -9 -f '/interceptor_node_relative_imm_ukf --ros-args' || true",
-                   shell=True)
+    # Kill ONLY processes whose environment has ROS_DOMAIN_ID=1 (our isolated sweep nodes).
+    # A blanket pkill -f interceptor_node... would also kill the user's AirSim node (domain 0).
+    import glob
+    for environ_path in glob.glob('/proc/[0-9]*/environ'):
+        try:
+            env = open(environ_path, 'rb').read().decode(errors='ignore')
+        except OSError:
+            continue
+        if 'ROS_DOMAIN_ID=1' not in env:
+            continue
+        try:
+            pid = int(environ_path.split('/')[2])
+        except (IndexError, ValueError):
+            continue
+        if pid == os.getpid():
+            continue
+        try:
+            os.kill(pid, signal.SIGKILL)
+        except (ProcessLookupError, PermissionError):
+            pass
     time.sleep(2.0)
 
 
@@ -60,10 +79,12 @@ def parse_summary(name):
 def run_one(scen, fov):
     name = f"{scen}-{fov}"
     kill_stray()
+    vdes_override = os.environ.get("V_DES")
+    vdes_arg = f" -p controller.v_des:={float(vdes_override)}" if vdes_override else ""
     # launch node (own process group, line-buffered). log-level INFO so "node ready" is emitted.
     node = subprocess.Popen(
         f"bash -c \"{SETUP} && stdbuf -oL -eL {EXE} --ros-args --params-file {PARAMS} "
-        f"-p use_simulation:=true --log-level INFO > {NODE_LOG} 2>&1\"",
+        f"-p use_simulation:=true{vdes_arg} --log-level INFO > {NODE_LOG} 2>&1\"",
         shell=True, start_new_session=True)
     try:
         if not wait_ready():
