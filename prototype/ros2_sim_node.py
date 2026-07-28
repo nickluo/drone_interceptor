@@ -34,6 +34,7 @@ import time
 from dataclasses import dataclass, field
 
 import numpy as np
+import yaml
 
 import rclpy
 import rclpy.qos
@@ -46,41 +47,67 @@ from std_msgs.msg import Header, Bool
 
 
 # ============================================================================
-# Constants — mirror config/relative_imm_ukf_params.yaml
+# Constants — loaded from config/relative_imm_ukf_params.yaml (sim2real consistency)
 # ============================================================================
 M_PI = math.pi
-CAM_WIDTH_PX = 960
-CAM_HEIGHT_PX = 960
-CAM_FOV_DEG = 60.0
+
+
+def _load_yaml_config():
+    """Load the C++ node's config yaml so the sim stays in sync without manual alignment.
+    Tries: (1) next to this script (../config/), (2) the install share dir. Falls back to
+    the hardcoded defaults below if neither is found."""
+    candidates = [
+        os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'config',
+                     'relative_imm_ukf_params.yaml'),
+        '/media/nick/data/workspace/fpv_ws/install/drone_interceptor/share/drone_interceptor/'
+        'config/relative_imm_ukf_params.yaml',
+    ]
+    for path in candidates:
+        try:
+            with open(path) as f:
+                doc = yaml.safe_load(f)
+            return doc.get('interceptor_node_relative_imm_ukf', {}).get('ros__parameters', {})
+        except (FileNotFoundError, OSError, yaml.YAMLError):
+            continue
+    print("[sim] WARNING: config yaml not found — using hardcoded fallback defaults")
+    return {}
+
+
+_CFG = _load_yaml_config()
+
+# Physics / dynamics
+G = _CFG.get('physics', {}).get('g', 9.81)
+DRAG_COEFF = _CFG.get('physics', {}).get('drag_coeff', 0.1625)
+
+# Control loop
+CONTROL_RATE = _CFG.get('control', {}).get('rate', 100.0)
+RATE_TAU = _CFG.get('control', {}).get('rate_tc', 0.02)
+
+# Camera intrinsics
+CAM_WIDTH_PX = int(_CFG.get('camera', {}).get('width_px', 960))
+CAM_HEIGHT_PX = int(_CFG.get('camera', {}).get('height_px', 960))
+CAM_FOV_DEG = _CFG.get('camera', {}).get('fov_deg', 60.0)
 FOCAL_LENGTH = (CAM_WIDTH_PX / 2.0) / math.tan(math.radians(CAM_FOV_DEG) / 2.0)
 FOV_HALF_RAD = math.radians(CAM_FOV_DEG / 2.0)
 
-# R_b2c base: body(FLU) -> cam(RDF). NO fixed mount — the semi-strapdown single-axis pitch gimbal
-# replaces it: R_B2C = Rx(gimbal_total) @ R_B2C_BASE, updated every control step. Convention
-# (mirror of the C++ node's gimbal_R_b2c and sim_test_relative_imm_ukf.py): Rx =
-# [[1,0,0],[0,c,-s],[0,s,c]], POSITIVE angle = down-gaze. Boresight world elevation =
-# -(own_pitch + gimbal_total); the servo tracks servo_cmd = -own_pitch + GIMBAL_BIAS with a
-# first-order lag GIMBAL_TAU, so the boresight settles at -GIMBAL_BIAS (5 deg down-gaze).
-# The ACTUAL camera-to-world orientation q_C_W = R_b2n @ R_B2C.T is published on /fpv/gimbal
-# (sensor_msgs/Imu, same convention as InterceptorNodeBase / hardware / AirSim) so the node sees
-# the true camera orientation including servo lag.
+# Camera frame rate (fixed for the sim — the C++ node measures dt_cam adaptively from timestamps)
+CAM_RATE = 30.0
+
+# Gimbal (bias from config; tau is sim-only — models the servo lag, no C++ counterpart)
+GIMBAL_BIAS = math.radians(_CFG.get('camera', {}).get('gimbal_bias_deg', 5.0))
+
+# R_b2c base: body(FLU) -> cam(RDF). Standard frame convention (hardcoded in C++ too).
+# Semi-strapdown single-axis pitch gimbal: R_B2C = Rx(gimbal_total) @ R_B2C_BASE.
 R_B2C_BASE = np.array([[0.0, -1.0, 0.0],
                        [0.0, 0.0, -1.0],
                        [1.0, 0.0, 0.0]])
-GIMBAL_TAU = 0.1                       # s, servo lag (boresight trails body pitch changes)
-GIMBAL_BIAS = math.radians(5.0)        # rad, fixed down-gaze bias (positive = down)
+GIMBAL_TAU = 0.1                       # s, servo lag (sim-only; no C++ config counterpart)
 R_B2C = R_B2C_BASE.copy()              # updated in-place each control step from the gimbal state
 
 
 def Rx(a):
     c, s = math.cos(a), math.sin(a)
     return np.array([[1.0, 0.0, 0.0], [0.0, c, -s], [0.0, s, c]])
-
-G = 9.81
-DRAG_COEFF = 0.0    # no drag — the active brake-to-hold (capture) stops the UAV; drag blunts the close approach
-CONTROL_RATE = 100.0
-CAM_RATE = 30.0
-RATE_TAU = 0.05  # body-rate tracking time constant (s)
 INTERCEPT_RANGE = 1.0   # sync with sim_test_relative_imm_ukf.py (was 2.0)
 
 

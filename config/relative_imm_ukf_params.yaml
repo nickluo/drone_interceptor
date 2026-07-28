@@ -26,7 +26,6 @@ interceptor_node_relative_imm_ukf:
     perception:
       bbox_pos_std_dev: 1.5
       bbox_size_std_dev: 2.0
-      target_physical_size_est: 1.5 # W_guess (physical target size, m)
 
     # Delay / History
     control:
@@ -52,22 +51,11 @@ interceptor_node_relative_imm_ukf:
       use_gimbal: true
       gimbal_bias_deg: 5.0
 
-    # Extrinsic parameters: Rotation from body (IMU) to camera frame (3x3 flattened row-major)
-    # Camera frame (RDF): X-right, Y-down, Z-front
-    # Body frame (FLU): X-front, Y-left, Z-up
-    # Standard: X_cam = -Y_body, Y_cam = -Z_body, Z_cam = X_body
-    extrinsics:
-      body_to_camera_rotation: [0.0, -1.0, 0.0, 0.0, 0.0, -1.0, 1.0, 0.0, 0.0]
-
     # Controller parameters
     controller:
       N: 4.5
-      K_v: 2.2
-      K_ibvs: 2.0
       K_att: 6.0     # attitude P-gain (was 9.0; lowered to damp the close-range roll limit-cycle)
       K_yaw: 5.0
-      K_z: 2.0     # 垂直比例增益 (a_z = K_z*dz - K_zd*vz) [legacy direct-PD, unused by the cascade below]
-      K_zd: 2.0    # 垂直阻尼增益 (pursuer odom v_z), 抑制终端段 z 过冲; K_z=2 -> zeta≈0.7 [legacy, unused]
       # --- Active vertical guidance: cascaded velocity-limited altitude track ---
       # v_z_desired = clamp(dz * K_dz, ±v_climb/v_descent); a_z = K_az*(v_z_desired - own_vz).
       # v_climb/v_descent (m/s): max commanded climb/sink RATE (the cap). Set to the airframe's REAL
@@ -76,7 +64,7 @@ interceptor_node_relative_imm_ukf:
       #   than DESCENT so an upper-FOV target does not asymptotically stall ~1 m short, while a
       #   below-FOV target still brakes without over-dive.
       v_climb: 20.0     # m/s, max commanded climb rate
-      v_descent: 20.0   # m/s, max commanded sink rate
+      v_descent: 15.0   # m/s, max commanded sink rate
       K_dz_up: 3.0     # 1/s, climb responsiveness (1=stall-risk @v_des=20, 2.5=over-climb-risk)
       K_dz_dn: 2.0     # 1/s, descent responsiveness (keep < K_dz_up)
       # Cruise closing speed (m/s). Must exceed any target's speed or the interceptor cannot gain
@@ -90,8 +78,6 @@ interceptor_node_relative_imm_ukf:
       # FOV keep-in-frame guard
       enable_fov_clamp: true   # hard-clamp pitch to keep target in FOV (original sign, less restrictive)
       fov_keep_margin: 0.65    # fraction of the FOV half-angle to keep the target within
-      # Soft start from rest to avoid pitching the target out of FOV on launch
-      v_ramp_time: 3.0         # s, ramp effective desired closing speed 0 -> v_des
       axial_jerk_max: 30.0     # m/s^3, rate limit on the along-LOS accel command (raised so terminal decel can shed ~9 m/s)
       # Body-rate saturation. Detector needs low angular rates to keep the target sharp; large
       # banked turns smear the image and the tracker drops the bbox. Cap all three body rates.
@@ -137,6 +123,14 @@ interceptor_node_relative_imm_ukf:
       # Fix F: range at which the close-range lateral attenuation begins. Widened 12 -> 25 m so the
       # 22-27 m weave zone (observed in AirSim at v_des=20) is covered. Must be > terminal_brake_range.
       lateral_decay_start: 25.0    # m, lateral attenuation begins here (ramps to floor by terminal_brake_range)
+      # Guidance tuning (operator-facing, promoted from hardcoded constants):
+      enable_fov_clamp: true      # hard-clamp pitch to keep target in FOV
+      K_fwd: 2.0                  # axial accel gain a_fwd = K_fwd*(v_des - v_fwd)
+      K_az: 2.0                   # vertical-speed tracking gain a_z = K_az*(v_z_desired - v_z)
+      a_z_limit: 8.0              # m/s^2, vertical accel clamp (airframe thrust/accel limit)
+      dither_amp: 0.8             # m/s^2, lateral observability dither amplitude
+      dither_freq: 0.5            # Hz, lateral dither frequency
+      dither_min_range: 10.0      # m, suppress dither inside this range (don't disturb terminal)
 
     # State estimation aiding
     estimation:
