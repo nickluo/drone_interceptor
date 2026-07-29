@@ -17,10 +17,17 @@ interceptor_node_relative_imm_ukf:
       mission: "/fpv/mission_start"
       control: "/fpv/control_command"
 
-    # Physics parameters
+    # Physics & airframe parameters
     physics:
       g: 9.81
       drag_coeff: 0.1625
+      # Airframe limits (calibrate to the real platform / AirSim)
+      max_tilt_deg: 45.0          # deg, structural bank limit
+      max_tilt_terminal_deg: 45.0 # deg, terminal-phase bank limit
+      max_body_rate: 3.0          # rad/s, hard cap on |omega_x/y/z| (attitude-loop / detector limit)
+      a_z_limit: 8.0             # m/s^2, vertical accel clamp (thrust limit)
+      v_climb: 20.0               # m/s, max commanded climb rate
+      v_descent: 15.0             # m/s, max commanded sink rate
 
     # Perception parameters
     perception:
@@ -38,9 +45,6 @@ interceptor_node_relative_imm_ukf:
       width_px: 960
       height_px: 960
       fov_deg: 60.0
-      # Fixed camera mounting pitch relative to the body (degrees, up positive). IGNORED when
-      # use_gimbal is true (the gimbal replaces the fixed mount).
-      mount_pitch_deg: 0.0
       # Semi-strapdown single-axis pitch gimbal: servo keeps the boresight near-horizontal in the
       # world frame regardless of body pitch (with servo lag). The ACTUAL camera-to-world orientation
       # q_C_W is published on /fpv/gimbal (sensor_msgs/Imu, orientation = camera->world quaternion) —
@@ -58,30 +62,19 @@ interceptor_node_relative_imm_ukf:
       K_yaw: 5.0
       # --- Active vertical guidance: cascaded velocity-limited altitude track ---
       # v_z_desired = clamp(dz * K_dz, ±v_climb/v_descent); a_z = K_az*(v_z_desired - own_vz).
-      # v_climb/v_descent (m/s): max commanded climb/sink RATE (the cap). Set to the airframe's REAL
-      #   climb/sink capability so the commanded rate is achievable (too high -> lag -> stall).
-      # K_dz_up/dn (1/s): responsiveness; closure time constant tau = 1/K. CLIMB uses a higher gain
-      #   than DESCENT so an upper-FOV target does not asymptotically stall ~1 m short, while a
-      #   below-FOV target still brakes without over-dive.
-      v_climb: 20.0     # m/s, max commanded climb rate
-      v_descent: 15.0   # m/s, max commanded sink rate
+      # v_climb/v_descent are in physics.* (airframe limits). K_dz_up/dn (1/s): responsiveness;
+      # closure tau = 1/K. CLIMB uses a higher gain than DESCENT so an upper-FOV target does not
+      # asymptotically stall ~1 m short, while a below-FOV target still brakes without over-dive.
       K_dz_up: 3.0     # 1/s, climb responsiveness (1=stall-risk @v_des=20, 2.5=over-climb-risk)
       K_dz_dn: 2.0     # 1/s, descent responsiveness (keep < K_dz_up)
       # Cruise closing speed (m/s). Must exceed any target's speed or the interceptor cannot gain
       # on a maneuvering/crossing target; the speed-aware brake floor (see compute_control) keeps
       # the final-approach speed above the target speed so v_des sets the mid-course advantage.
       v_des: 15.0
-      # Pitch/roll authority (user req: 45 deg). Safe with the gimbal: the camera boresight is
-      # decoupled from body pitch, so a steep accel/brake pitch no longer tilts the target out of
-      # the vertical FOV.
-      max_tilt_deg: 45.0
       # FOV keep-in-frame guard
-      enable_fov_clamp: true   # hard-clamp pitch to keep target in FOV (original sign, less restrictive)
+      enable_fov_clamp: true   # hard-clamp pitch to keep target in FOV
       fov_keep_margin: 0.65    # fraction of the FOV half-angle to keep the target within
-      axial_jerk_max: 30.0     # m/s^3, rate limit on the along-LOS accel command (raised so terminal decel can shed ~9 m/s)
-      # Body-rate saturation. Detector needs low angular rates to keep the target sharp; large
-      # banked turns smear the image and the tracker drops the bbox. Cap all three body rates.
-      max_body_rate: 3.0       # rad/s, hard cap on |omega_x|, |omega_y|, |omega_z|
+      axial_jerk_max: 30.0     # m/s^3, rate limit on the along-LOS accel command
       # Speed-scheduled PN: cap the forward speed used in a_lat = N*v*lambda_dot so v_des=20 does not
       # overheat lateral authority (phi_cmd slamming to +-max_tilt -> roll limit-cycle). Steady-state
       # lateral lead above v_pn_ref is reduced (maneuvering-authority trade for attitude stability).
@@ -101,11 +94,8 @@ interceptor_node_relative_imm_ukf:
       # interceptor does not overshoot through the target at close range.
       terminal_brake_range: 5.0  # m, below this range engage terminal braking
       terminal_brake_floor: 1.0  # m/s, minimum desired closing speed during terminal brake
-      # Terminal authority (maneuvering-target tracking). Two levers:
-      # (1) Relax the roll clamp inside terminal_tilt_range so the interceptor can bank steeper at
-      #     close range (target bbox is large; coast handles brief dropout). Pitch/FOV keep max_tilt_deg.
-      max_tilt_terminal_deg: 45.0  # deg, roll clamp inside terminal_tilt_range (was 25)
-      terminal_tilt_range: 30.0    # m, below this range the roll clamp relaxes (sync Python prototype)
+      # Terminal authority (maneuvering-target tracking).
+      terminal_tilt_range: 30.0    # m, below this range the roll clamp relaxes
       # (2) Arrive slower: ramp v_des -> v_terminal over [terminal_decel_range, terminal_brake_range]
       #     using the (stable) range estimate. Same bank gives ~2x turn rate at the lower speed.
       #     Floor is speed-aware (never stalls below target speed + margin).
@@ -124,10 +114,8 @@ interceptor_node_relative_imm_ukf:
       # 22-27 m weave zone (observed in AirSim at v_des=20) is covered. Must be > terminal_brake_range.
       lateral_decay_start: 25.0    # m, lateral attenuation begins here (ramps to floor by terminal_brake_range)
       # Guidance tuning (operator-facing, promoted from hardcoded constants):
-      enable_fov_clamp: true      # hard-clamp pitch to keep target in FOV
       K_fwd: 2.0                  # axial accel gain a_fwd = K_fwd*(v_des - v_fwd)
       K_az: 2.0                   # vertical-speed tracking gain a_z = K_az*(v_z_desired - v_z)
-      a_z_limit: 8.0              # m/s^2, vertical accel clamp (airframe thrust/accel limit)
       dither_amp: 0.8             # m/s^2, lateral observability dither amplitude
       dither_freq: 0.5            # Hz, lateral dither frequency
       dither_min_range: 10.0      # m, suppress dither inside this range (don't disturb terminal)

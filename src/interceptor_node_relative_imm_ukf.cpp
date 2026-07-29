@@ -1143,13 +1143,10 @@ private:
         this->declare_parameter<int>("camera.width_px", 640);
         this->declare_parameter<int>("camera.height_px", 480);
         this->declare_parameter<double>("camera.fov_deg", 60.0);
-        this->declare_parameter<double>("camera.mount_pitch_deg", 0.0);
-        // Semi-strapdown single-axis pitch gimbal: the camera boresight is servo-stabilized to
-        // near-horizontal (down-gaze = gimbal_bias_deg) regardless of body pitch, with a small
-        // servo lag. The ACTUAL gimbal angle is measured and published in real time; the node
-        // consumes it to rebuild R_b2c per frame: R_b2c = Rx(gimbal_angle) * R_b2c_base, where
-        // Rx uses [[1,0,0],[0,c,-s],[0,s,c]] and POSITIVE angle = down-gaze. When enabled the
-        // fixed mount_pitch is ignored (the gimbal replaces the fixed mount).
+        // Semi-strapdown single-axis pitch gimbal: gimbal_bias_deg is the UNIFIED camera down-gaze
+        // angle (positive = down). Used for both the gimbal (world-stabilized boresight) and the
+        // fixed mount (body-relative). The gimbal rebuilds R_b2c from q_C_W each frame; the fixed
+        // mount uses the initial value.
         this->declare_parameter<bool>("camera.use_gimbal", false);
         this->declare_parameter<double>("camera.gimbal_bias_deg", 5.0);
         this->declare_parameter<double>("physics.g", 9.81);
@@ -1158,10 +1155,10 @@ private:
         this->declare_parameter<double>("controller.K_att", 9.0);
         this->declare_parameter<double>("controller.K_yaw", 5.0);
         this->declare_parameter<double>("controller.v_des", 15.0);
-        this->declare_parameter<double>("controller.max_tilt_deg", 35.0);
+        this->declare_parameter<double>("physics.max_tilt_deg", 35.0);
         this->declare_parameter<double>("controller.fov_keep_margin", 0.85);
         this->declare_parameter<double>("controller.axial_jerk_max", 15.0);
-        this->declare_parameter<double>("controller.max_body_rate", 3.0);
+        this->declare_parameter<double>("physics.max_body_rate", 3.0);
         this->declare_parameter<double>("controller.terminal_brake_range", 5.0);
         this->declare_parameter<double>("controller.terminal_brake_floor", 1.0);
         this->declare_parameter<double>("controller.terminal_range", 10.0);
@@ -1169,7 +1166,7 @@ private:
         this->declare_parameter<double>("controller.v_pn_ref", 12.0);
         this->declare_parameter<double>("controller.max_att_rate", 3.5);   // Fix G: clamp |d(phi/theta)_cmd/dt| (was 5)
         this->declare_parameter<double>("controller.att_ref_tc", 0.15);
-        this->declare_parameter<double>("controller.max_tilt_terminal_deg", 45.0);
+        this->declare_parameter<double>("physics.max_tilt_terminal_deg", 45.0);
         this->declare_parameter<double>("controller.terminal_tilt_range", 15.0);
         this->declare_parameter<double>("controller.terminal_decel_range", 30.0);
         this->declare_parameter<double>("controller.v_terminal", 12.0);
@@ -1178,7 +1175,7 @@ private:
         // Guidance tuning (set_guidance_tuning) — operator-facing knobs promoted from hardcoded.
         this->declare_parameter<double>("controller.K_fwd", 2.0);       // axial accel gain
         this->declare_parameter<double>("controller.K_az", 2.0);        // vertical-speed tracking gain
-        this->declare_parameter<double>("controller.a_z_limit", 8.0);  // vertical accel clamp (m/s^2)
+        this->declare_parameter<double>("physics.a_z_limit", 8.0);  // vertical accel clamp (m/s^2)
         this->declare_parameter<double>("controller.dither_amp", 0.8);  // m/s^2, lateral observability dither
         this->declare_parameter<double>("controller.dither_freq", 0.5); // Hz
         this->declare_parameter<double>("controller.dither_min_range", 10.0); // m, suppress dither inside
@@ -1187,8 +1184,8 @@ private:
         // Vertical cascade (cascaded velocity-limited altitude track). Set v_climb/v_descent to the
         // airframe's real climb/sink capability (m/s) so the commanded rate is achievable; K_dz_up/dn
         // (1/s, closure tau=1/K) tune responsiveness independently for climb vs descent.
-        this->declare_parameter<double>("controller.v_climb", 8.0);     // m/s, max commanded climb rate (cap)
-        this->declare_parameter<double>("controller.v_descent", 8.0);   // m/s, max commanded sink rate (cap)
+        this->declare_parameter<double>("physics.v_climb", 8.0);     // m/s, max commanded climb rate (cap)
+        this->declare_parameter<double>("physics.v_descent", 8.0);   // m/s, max commanded sink rate (cap)
         this->declare_parameter<double>("controller.K_dz_up", 2.0);     // 1/s, climb responsiveness (upper target)
         this->declare_parameter<double>("controller.K_dz_dn", 1.0);     // 1/s, descent responsiveness (lower target; < K_up to avoid over-dive)
         this->declare_parameter<double>("estimation.W_guess", 1.5);
@@ -1206,30 +1203,20 @@ private:
         cam_width_ = this->get_parameter("camera.width_px").as_int();
         cam_height_ = this->get_parameter("camera.height_px").as_int();
         cam_fov_deg_ = this->get_parameter("camera.fov_deg").as_double();
-        const double pitch_deg = this->get_parameter("camera.mount_pitch_deg").as_double();
         const bool use_simulation = this->get_parameter("use_simulation").as_bool();
         use_simulation_ = use_simulation;   // mirrors InterceptorNodeBase; gates gyro collision detect
         // FLU(body)→RDF(cam) standard extrinsic — a frame convention, not a tuning param.
         R_b2c_base_ << 0.0, -1.0, 0.0,
                        0.0,  0.0, -1.0,
                        1.0,  0.0,  0.0;
-        const double p_rad = -pitch_deg * M_PI / 180.0;
-        Eigen::Matrix3d R_pitch;
-        R_pitch << 1.0, 0.0, 0.0,
-                   0.0, std::cos(p_rad), -std::sin(p_rad),
-                   0.0, std::sin(p_rad), std::cos(p_rad);
         g_ = this->get_parameter("physics.g").as_double();
         g_drag_coeff_ = this->get_parameter("physics.drag_coeff").as_double();
         use_gimbal_ = this->get_parameter("camera.use_gimbal").as_bool();
         gimbal_bias_rad_ = this->get_parameter("camera.gimbal_bias_deg").as_double() * M_PI / 180.0;
-        if (use_gimbal_) {
-            // Gimbal replaces the fixed mount. R_b2c_ is rebuilt from q_C_W every camera frame in
-            // bbox_callback; this is only the pre-first-/fpv/gimbal-msg placeholder (a level-body
-            // bias down-gaze body->camera mount). gimbal_received_ stays false until the first msg.
-            R_b2c_ = gimbal_R_b2c(gimbal_bias_rad_);
-        } else {
-            R_b2c_ = R_pitch * R_b2c_base_;
-        }
+        // gimbal_bias_deg (positive = down-gaze) is the unified camera tilt for BOTH the gimbal
+        // (world-stabilized) and the fixed mount (body-relative). The gimbal rebuilds R_b2c_ from
+        // q_C_W each frame; the fixed mount keeps this initial value.
+        R_b2c_ = gimbal_R_b2c(gimbal_bias_rad_);
 
         // dt_cam_ is adaptive (measured from bbox timestamps in bbox_callback); initial 0.033 = 30Hz.
         W_guess_ = this->get_parameter("estimation.W_guess").as_double();
@@ -1248,16 +1235,16 @@ private:
         double K_att = this->get_parameter("controller.K_att").as_double();
         double K_yaw = this->get_parameter("controller.K_yaw").as_double();
         double v_des = this->get_parameter("controller.v_des").as_double();
-        double max_tilt = this->get_parameter("controller.max_tilt_deg").as_double();
+        double max_tilt = this->get_parameter("physics.max_tilt_deg").as_double();
         double fov_keep = this->get_parameter("controller.fov_keep_margin").as_double();
         double jerk = this->get_parameter("controller.axial_jerk_max").as_double();
-        double max_body_rate = this->get_parameter("controller.max_body_rate").as_double();
+        double max_body_rate = this->get_parameter("physics.max_body_rate").as_double();
         double terminal_brake_range = this->get_parameter("controller.terminal_brake_range").as_double();
         double terminal_brake_floor = this->get_parameter("controller.terminal_brake_floor").as_double();
         double v_pn_ref = this->get_parameter("controller.v_pn_ref").as_double();
         double max_att_rate = this->get_parameter("controller.max_att_rate").as_double();
         double att_ref_tc = this->get_parameter("controller.att_ref_tc").as_double();
-        double max_tilt_terminal_deg = this->get_parameter("controller.max_tilt_terminal_deg").as_double();
+        double max_tilt_terminal_deg = this->get_parameter("physics.max_tilt_terminal_deg").as_double();
         double terminal_tilt_range = this->get_parameter("controller.terminal_tilt_range").as_double();
         double terminal_decel_range = this->get_parameter("controller.terminal_decel_range").as_double();
         double v_terminal = this->get_parameter("controller.v_terminal").as_double();
@@ -1273,7 +1260,7 @@ private:
         const bool enable_fov_clamp = this->get_parameter("controller.enable_fov_clamp").as_bool();
         controller_ = std::make_unique<AdvancedHybridController>(
             N, K_att, K_yaw, v_des, max_tilt,
-            fov_half_v, fov_half_h, fov_keep, jerk, enable_fov_clamp, pitch_deg * M_PI / 180.0,
+            fov_half_v, fov_half_h, fov_keep, jerk, enable_fov_clamp, gimbal_bias_rad_,
             max_body_rate, terminal_brake_range, terminal_brake_floor, terminal_bbox_size,
             v_pn_ref, max_att_rate, att_ref_tc,
             max_tilt_terminal_deg, terminal_tilt_range, terminal_decel_range, v_terminal);
@@ -1283,14 +1270,14 @@ private:
         controller_->set_gimbal(use_gimbal_, gimbal_bias_rad_);
         controller_->set_g(g_);
         controller_->set_vertical_climb(
-            this->get_parameter("controller.v_climb").as_double(),
-            this->get_parameter("controller.v_descent").as_double(),
+            this->get_parameter("physics.v_climb").as_double(),
+            this->get_parameter("physics.v_descent").as_double(),
             this->get_parameter("controller.K_dz_up").as_double(),
             this->get_parameter("controller.K_dz_dn").as_double());
         controller_->set_guidance_tuning(
             this->get_parameter("controller.K_fwd").as_double(),
             this->get_parameter("controller.K_az").as_double(),
-            this->get_parameter("controller.a_z_limit").as_double(),
+            this->get_parameter("physics.a_z_limit").as_double(),
             this->get_parameter("controller.dither_amp").as_double(),
             this->get_parameter("controller.dither_freq").as_double(),
             this->get_parameter("controller.dither_min_range").as_double());
