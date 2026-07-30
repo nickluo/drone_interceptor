@@ -79,10 +79,10 @@ private:
         p_cam(2) = std::max(p_cam(2), 0.5);
         const double u = focal_length * p_cam(0) / p_cam(2);
         const double v = focal_length * p_cam(1) / p_cam(2);
-        // Clamp W_est to physical range to prevent negative-width sigma points from
+        // Clamp w_est to physical range to prevent negative-width sigma points from
         // creating asymmetric measurement predictions that bias the UKF update.
-        const double W_est = clamp(x(9), 0.9, 2.5);
-        const double s = focal_length * W_est / p_cam(2);
+        const double w_est = clamp(x(9), 0.5, 4.0);
+        const double s = focal_length * w_est / p_cam(2);
         return Eigen::Vector3d(u, v, s);
     }
     // Relative-state motion models. State x = [r(3), v_rel(3), a_t(3), W(1)] in a gravity-aligned
@@ -391,7 +391,7 @@ private:
 public:
     double dt_cam;
     double focal_length;
-    double W_guess;
+    double w_guess;
     Eigen::Matrix3d R_b2c;
     // Range below which the monocular width/scale is frozen. Mid-course W is well observable
     // (~1.5); freezing it before the terminal phase (default 15 m) stops a bad close-range
@@ -423,13 +423,13 @@ public:
 
     RelativeIMMUKFEstimator(double dt_cam_val, double focal_length_val, double W_guess_val,
                             const Eigen::Matrix3d& R_b2c_val, double drag_coeff_val)
-        : dt_cam(dt_cam_val), focal_length(focal_length_val), W_guess(W_guess_val), R_b2c(R_b2c_val)
+        : dt_cam(dt_cam_val), focal_length(focal_length_val), w_guess(W_guess_val), R_b2c(R_b2c_val)
     {
         imm_ukf = std::make_unique<RobustIMMEstimator10D>(drag_coeff_val);
     }
 
-    void update_process_noise(double r_norm, double W_est, double bbox_s = 0.0) {
-        (void)W_est;
+    void update_process_noise(double r_norm, double w_est, double bbox_s = 0.0) {
+        (void)w_est;
         const double q_scale = 1.0;
         const double r_freeze = width_freeze_range_;
         const double snr_factor = bbox_s > 0.0 ? clamp(bbox_s / 40.0, 0.1, 1.0) : 1.0;
@@ -460,7 +460,7 @@ public:
         } else if (!has_frozen_width) {
             // Clamp at capture time: an un-clamped x(9) (e.g. 0.10 from a bad UKF update) would
             // otherwise be frozen permanently and corrupt every subsequent measurement prediction.
-            frozen_width = clamp(imm_ukf->x(9), 1.0, 1.8);
+            frozen_width = clamp(imm_ukf->x(9), 0.8 * w_guess, 1.5 * w_guess);
             has_frozen_width = true;
         }
 
@@ -478,7 +478,7 @@ public:
             if (diverged) {
                 filter.x.setZero();
                 filter.x.segment<3>(0) = 10.0 * los_dir;   // relative pos along last LOS
-                filter.x(9) = W_guess;
+                filter.x(9) = w_guess;
                 filter.P = Eigen::MatrixXd::Zero(kStateDim, kStateDim);
                 filter.P.diagonal() << 100.0, 100.0, 100.0, 25.0, 25.0, 25.0, 10.0, 10.0, 10.0, 1.0;
                 continue;
@@ -491,7 +491,7 @@ public:
             }
             for (int i = 3; i < 6; ++i) filter.x(i) = clamp(filter.x(i), -30.0, 30.0);
             for (int i = 6; i < 9; ++i) filter.x(i) = clamp(filter.x(i), -15.0, 15.0);
-            filter.x(9) = clamp(filter.x(9), 0.8, 1.8);
+            filter.x(9) = clamp(filter.x(9), 0.8 * w_guess, 1.5 * w_guess);
 
             if (has_frozen_width) {
                 filter.x(9) = frozen_width;
@@ -524,7 +524,7 @@ public:
             imm_ukf->P.col(9).setZero();
             imm_ukf->P(9, 9) = 1e-8;
         } else {
-            imm_ukf->x(9) = clamp(imm_ukf->x(9), 1.2, 1.8);
+            imm_ukf->x(9) = clamp(imm_ukf->x(9), 0.8 * w_guess, 1.5 * w_guess);
         }
     }
 
@@ -617,7 +617,7 @@ public:
             // sanitize_filters already bounds v_rel to +-30.)
             return {true, imm_ukf->x};
         } else {
-            const double W_init = clamp(W_guess, 0.5, 4.0);
+            const double W_init = clamp(w_guess, 0.5, 4.0);
             const double r0 = clamp(focal_length * W_init / std::max(1.0, bbox_s), 10.0, 300.0);
             Eigen::VectorXd x0 = Eigen::VectorXd::Zero(kStateDim);
             x0.segment<3>(0) = r0 * los_nav;            // relative pos = range * LOS (no uav_pos)
@@ -1105,7 +1105,7 @@ public:
 
         focal_length_ = (cam_width_ / 2.0) / std::tan((cam_fov_deg_ * M_PI / 180.0) / 2.0);
 
-        estimator_ = std::make_unique<RelativeIMMUKFEstimator>(dt_cam_, focal_length_, W_guess_, R_b2c_, g_drag_coeff_);
+        estimator_ = std::make_unique<RelativeIMMUKFEstimator>(dt_cam_, focal_length_, w_guess_, R_b2c_, g_drag_coeff_);
 
         mission_sub_ = this->create_subscription<std_msgs::msg::Bool>(
             "/fpv/mission_launch", 10, std::bind(&InterceptorNodeRelativeIMMUKF::mission_callback, this, std::placeholders::_1));
@@ -1188,7 +1188,7 @@ private:
         this->declare_parameter<double>("physics.v_descent", 8.0);   // m/s, max commanded sink rate (cap)
         this->declare_parameter<double>("controller.K_dz_up", 2.0);     // 1/s, climb responsiveness (upper target)
         this->declare_parameter<double>("controller.K_dz_dn", 1.0);     // 1/s, descent responsiveness (lower target; < K_up to avoid over-dive)
-        this->declare_parameter<double>("estimation.W_guess", 1.5);
+        this->declare_parameter<double>("estimation.w_guess", 1.5);
         this->declare_parameter<double>("estimation.vel_smooth_tc", 0.25);  // Fix B: target-vel EMA (s, 0=off)
         // Accelerometer bias in body frame, subtracted before the strapdown preintegration.
         // The Python-harness sim publishes a bias-free IMU (zeros); set calibrated values on real HW.
@@ -1218,8 +1218,7 @@ private:
         // q_C_W each frame; the fixed mount keeps this initial value.
         R_b2c_ = gimbal_R_b2c(gimbal_bias_rad_);
 
-        // dt_cam_ is adaptive (measured from bbox timestamps in bbox_callback); initial 0.033 = 30Hz.
-        W_guess_ = this->get_parameter("estimation.W_guess").as_double();
+        w_guess_ = this->get_parameter("estimation.w_guess").as_double();
         control_rate_ = this->get_parameter("control.rate").as_double();
         const double rate_tc = this->get_parameter("control.rate_tc").as_double();
         const bool rate_attenuation = this->get_parameter("control.rate_control_attenuation").as_bool();
@@ -1252,10 +1251,10 @@ private:
         double fov_half_h = (cam_width_ / 2.0) / std::max(1.0, focal_length_);
         // Compute terminal_bbox_size from camera intrinsics so the brake triggers at the correct
         // range regardless of focal length. bbox_size = focal * W / range, so at terminal_brake_range:
-        // terminal_bbox_size = focal * W_guess / terminal_brake_range. For AirSim (focal=831, W=1.5,
+        // terminal_bbox_size = focal * w_guess / terminal_brake_range. For AirSim (focal=831, W=1.5,
         // range=5): 249px. For Python sim (focal=554, W=1.5, range=5): 166px. Previously hardcoded
         // 80px which triggered full brake at ~15m in AirSim (bbox=83px at R=15), stalling the UAV.
-        const double terminal_bbox_size = focal_length_ * W_guess_ / std::max(0.1, terminal_brake_range);
+        const double terminal_bbox_size = focal_length_ * w_guess_ / std::max(0.1, terminal_brake_range);
 
         const bool enable_fov_clamp = this->get_parameter("controller.enable_fov_clamp").as_bool();
         controller_ = std::make_unique<AdvancedHybridController>(
@@ -1290,7 +1289,7 @@ private:
     }
 
     void reset_estimator() {
-        estimator_ = std::make_unique<RelativeIMMUKFEstimator>(dt_cam_, focal_length_, W_guess_, R_b2c_, g_drag_coeff_);
+        estimator_ = std::make_unique<RelativeIMMUKFEstimator>(dt_cam_, focal_length_, w_guess_, R_b2c_, g_drag_coeff_);
     }
 
     void reset_control_cache() {
@@ -1460,10 +1459,10 @@ private:
         }
 
         RCLCPP_INFO_THROTTLE(this->get_logger(), *this->get_clock(), THROTTLE_INTERVAL_MS,
-            "rel=[%.2f %.2f %.2f] vel=[%.2f %.2f %.2f] W_est=%.2f r_meas=%.1f r_est=%.1f",
+            "rel=[%.2f %.2f %.2f] vel=[%.2f %.2f %.2f] w_est=%.2f r_meas=%.1f r_est=%.1f",
             r_est(0), r_est(1), r_est(2), v_est(0), v_est(1), v_est(2),
             estimator_->imm_ukf->x(9),
-            (has_bbox && s > 0.1) ? (focal_length_ * estimator_->W_guess / s) : 0.0,
+            (has_bbox && s > 0.1) ? (focal_length_ * estimator_->w_guess / s) : 0.0,
             r_est.norm());
 
         // IMM diagnostic: mode probabilities, per-filter vel, and key P diagonals. Helps locate
@@ -1917,7 +1916,7 @@ private:
 
     double dt_cam_ = 0.033;          // s, camera-frame dt (adaptive; updated from bbox timestamps)
     double last_bbox_cam_t_ = -1.0;  // last bbox timestamp (for dt_cam_ measurement)
-    double W_guess_ = 1.5;
+    double w_guess_ = 1.5;
     double control_rate_ = 100.0;
 
     std::unique_ptr<RelativeIMMUKFEstimator> estimator_;
@@ -1951,7 +1950,7 @@ private:
         double timestamp = 0.0;
         Eigen::Vector3d target_pos = Eigen::Vector3d::Zero();
         Eigen::Vector3d target_vel = Eigen::Vector3d::Zero();
-        double W_est = 0.0;
+        double w_est = 0.0;
         double r_meas = 0.0;
         double los_az = 0.0;
         Eigen::Matrix3d R_b2n = Eigen::Matrix3d::Identity();

@@ -128,3 +128,4 @@ interceptor_node_relative_imm_ukf:
       # Output smoothing of the estimator's RELATIVE velocity (Fix B): EMA before it drives
       # guidance / the speed-aware brake floor. 0 disables.
       vel_smooth_tc: 0.25          # s, EMA time constant on the relative-velocity estimate
+      w_guess: 1.5
