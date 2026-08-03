@@ -26,7 +26,7 @@ interceptor_node_relative_imm_ukf:
       max_tilt_terminal_deg: 45.0 # deg, terminal-phase bank limit
       max_body_rate: 3.0          # rad/s, hard cap on |omega_x/y/z| (attitude-loop / detector limit)
       a_z_limit: 8.0             # m/s^2, vertical accel clamp (thrust limit)
-      v_climb: 20.0               # m/s, max commanded climb rate
+      v_climb: 15.0               # m/s, max commanded climb rate
       v_descent: 15.0             # m/s, max commanded sink rate
 
     # Perception parameters
@@ -116,9 +116,9 @@ interceptor_node_relative_imm_ukf:
       # Guidance tuning (operator-facing, promoted from hardcoded constants):
       K_fwd: 2.0                  # axial accel gain a_fwd = K_fwd*(v_des - v_fwd)
       K_az: 2.0                   # vertical-speed tracking gain a_z = K_az*(v_z_desired - v_z)
-      dither_amp: 0.8             # m/s^2, lateral observability dither amplitude
-      dither_freq: 0.5            # Hz, lateral dither frequency
-      dither_min_range: 10.0      # m, suppress dither inside this range (don't disturb terminal)
+      dither_amp: 1.0             # m/s^2, lateral observability dither amplitude (2.0 caused W_est cascade in AirSim; 1.0 is the middle ground)
+      dither_freq: 0.3            # Hz, lateral dither frequency
+      dither_min_range: 15.0       # m, suppress dither inside this range (don't disturb terminal)
 
     # State estimation aiding
     estimation:

@@ -81,7 +81,7 @@ private:
         const double v = focal_length * p_cam(1) / p_cam(2);
         // Clamp w_est to physical range to prevent negative-width sigma points from
         // creating asymmetric measurement predictions that bias the UKF update.
-        const double w_est = clamp(x(9), 0.5, 4.0);
+        const double w_est = clamp(x(9), 0.3, 5.0);
         const double s = focal_length * w_est / p_cam(2);
         return Eigen::Vector3d(u, v, s);
     }
@@ -413,6 +413,7 @@ public:
 
     double last_cap_time = 0.0;
     bool has_last_cap_time = false;
+    double w_init_time = -1.0;   // first measurement time — for Q(9,9) time annealing
 
     // Soft-recovery: first measurement after a bbox dropout uses inflated measurement noise so the
     // large innovation does not slam the state (especially vel) to an extreme value.
@@ -428,13 +429,17 @@ public:
         imm_ukf = std::make_unique<RobustIMMEstimator10D>(drag_coeff_val);
     }
 
-    void update_process_noise(double r_norm, double w_est, double bbox_s = 0.0) {
+    void update_process_noise(double r_norm, double w_est, double bbox_s, double obs_duration) {
         (void)w_est;
         const double q_scale = 1.0;
         const double r_freeze = width_freeze_range_;
         const double snr_factor = bbox_s > 0.0 ? clamp(bbox_s / 40.0, 0.1, 1.0) : 1.0;
         const double q_w_scale = std::pow(clamp((r_norm - r_freeze) / 20.0, 0.0, 1.0), 2.0);
-        const double q_w_dynamic = 0.005 * q_w_scale * snr_factor;
+        // Time-based annealing: W is a physical constant, so as observations accumulate, Q_w decays
+        // exponentially → W_est "locks in" its converged value and resists late-time noise. tau=4s.
+        constexpr double w_converge_tau = 6.0;
+        const double anneal = std::exp(-std::max(0.0, obs_duration) / w_converge_tau);
+        const double q_w_dynamic = 0.01 * anneal * q_w_scale * snr_factor;
         // Relative-state: v_rel is driven by the a_own predict (high-quality, IMU preintegration).
         // The monocular measurement constrains v_rel only weakly (depth is noisy), so a large Q_vel
         // makes the update TRUST the lagged measurement and pull v_rel back toward it (under-playing
@@ -460,7 +465,7 @@ public:
         } else if (!has_frozen_width) {
             // Clamp at capture time: an un-clamped x(9) (e.g. 0.10 from a bad UKF update) would
             // otherwise be frozen permanently and corrupt every subsequent measurement prediction.
-            frozen_width = clamp(imm_ukf->x(9), 0.8 * w_guess, 1.5 * w_guess);
+            frozen_width = clamp(imm_ukf->x(9), 0.3, 5.0);
             has_frozen_width = true;
         }
 
@@ -491,7 +496,7 @@ public:
             }
             for (int i = 3; i < 6; ++i) filter.x(i) = clamp(filter.x(i), -30.0, 30.0);
             for (int i = 6; i < 9; ++i) filter.x(i) = clamp(filter.x(i), -15.0, 15.0);
-            filter.x(9) = clamp(filter.x(9), 0.8 * w_guess, 1.5 * w_guess);
+            filter.x(9) = clamp(filter.x(9), 0.3, 5.0);
 
             if (has_frozen_width) {
                 filter.x(9) = frozen_width;
@@ -524,7 +529,7 @@ public:
             imm_ukf->P.col(9).setZero();
             imm_ukf->P(9, 9) = 1e-8;
         } else {
-            imm_ukf->x(9) = clamp(imm_ukf->x(9), 0.8 * w_guess, 1.5 * w_guess);
+            imm_ukf->x(9) = clamp(imm_ukf->x(9), 0.3, 5.0);
         }
     }
 
@@ -544,7 +549,7 @@ public:
             const double w_prev = imm_ukf->x(9);
             const double r_norm = imm_ukf->x.segment<3>(0).norm();
             const Eigen::Vector3d a_own = dv_own / std::max(dt_cam, 1e-3);
-            update_process_noise(r_norm, w_prev);
+            update_process_noise(r_norm, w_prev, 0.0, t_now - w_init_time);
             // ALWAYS predict r forward using ownship motion (a_own). The absolute-state estimator
             // could skip the predict for a stationary target; the RELATIVE position r = target - own
             // moves by the ownship's motion EVERY frame. Skipping the predict freezes r while the
@@ -586,7 +591,7 @@ public:
         if (initialized) {
             const double dt_meas = has_last_cap_time ? clamp(t_now - last_cap_time, 0.001, 0.1) : dt_cam;
             const Eigen::Vector3d a_own = dv_own / std::max(dt_meas, 1e-3);
-            update_process_noise(imm_ukf->x.segment<3>(0).norm(), imm_ukf->x(9), bbox_s);
+            update_process_noise(imm_ukf->x.segment<3>(0).norm(), imm_ukf->x(9), bbox_s, t_now - w_init_time);
             imm_ukf->predict(dt_meas, a_own);
 
             // Size-plausibility gate (close range only, see size_gate_range_): reject detections
@@ -605,7 +610,20 @@ public:
             }
 
             for (auto& filter : imm_ukf->filters) filter.R = R_k;
+            const double w_before = imm_ukf->x(9);
             imm_ukf->update(z_pixel, R_n2c, focal_length);
+            // W_est rate limiter: cap |ΔW| per update to prevent the positive-feedback cascade
+            // where one noisy bbox (at a dither extreme) crashes W, which shifts range/dz, which
+            // reinforces the wrong W on the next update. ±0.05/frame ≈ ±1.5/s at 30Hz — still
+            // converges to the true W within ~1-2s for W_guess errors up to ~1m.
+            {
+                constexpr double w_max_delta = 0.05;
+                const double w_after = clamp(imm_ukf->x(9), w_before - w_max_delta, w_before + w_max_delta);
+                imm_ukf->x(9) = w_after;
+                for (auto& filter : imm_ukf->filters) {
+                    filter.x(9) = clamp(filter.x(9), w_before - w_max_delta, w_before + w_max_delta);
+                }
+            }
 
             last_cap_time = t_now;
             has_last_cap_time = true;
@@ -617,7 +635,7 @@ public:
             // sanitize_filters already bounds v_rel to +-30.)
             return {true, imm_ukf->x};
         } else {
-            const double W_init = clamp(w_guess, 0.5, 4.0);
+            const double W_init = clamp(w_guess, 0.3, 5.0);
             const double r0 = clamp(focal_length * W_init / std::max(1.0, bbox_s), 10.0, 300.0);
             Eigen::VectorXd x0 = Eigen::VectorXd::Zero(kStateDim);
             x0.segment<3>(0) = r0 * los_nav;            // relative pos = range * LOS (no uav_pos)
@@ -634,6 +652,7 @@ public:
             imm_ukf->x = x0;
             imm_ukf->P = P0;
             initialized = true;
+            w_init_time = t_now;
             last_cap_time = t_now;
             has_last_cap_time = true;
 
@@ -770,6 +789,7 @@ public:
         ydot_ema_ = 0.0;
         atp_ema_ = 0.0;
         aown_perp_ema_ = 0.0;
+        last_los_dt_ = 0.02;
     }
     void set_a_z_slew(double v) { a_z_slew_ = (v > 0.0) ? v : 1e9; }  // <=0 disables the slew limit
     void set_lateral_decay_floor(double v) { lateral_decay_floor_ = clamp(v, 0.0, 1.0); }
@@ -1774,6 +1794,12 @@ private:
                 last_dv_own_.setZero();
                 last_imu_time_ = -1.0;
                 sim_start_time_ = -1.0;
+                gimbal_received_ = false;
+                latest_gimbal_q_ = Eigen::Quaterniond::Identity();
+                latest_gyro_ = Eigen::Vector3d::Zero();
+                latest_R_b2n_ = Eigen::Matrix3d::Identity();
+                last_bbox_cam_t_ = -1.0;
+                dt_cam_ = 0.033;
             }
             last_cmd_ = Eigen::Vector3d::Zero();
             has_target_vel_smoothed_ = false;
@@ -1787,6 +1813,7 @@ private:
             captured_ = false;
             min_range_seen_ = 1e9;
             collision_detected_ = false;
+            yaw_align_init_ = false;
             {
                 std::lock_guard<std::mutex> ol(odom_mtx_);
                 v_own_brake_.setZero();
