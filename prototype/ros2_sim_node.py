@@ -83,12 +83,13 @@ DRAG_COEFF = _CFG.get('physics', {}).get('drag_coeff', 0.1625)
 CONTROL_RATE = _CFG.get('control', {}).get('rate', 100.0)
 RATE_TAU = _CFG.get('control', {}).get('rate_tc', 0.02)
 
-# Camera intrinsics
+# Camera intrinsics — fov_deg is the HORIZONTAL FOV; focal from width, vertical FOV derived.
 CAM_WIDTH_PX = int(_CFG.get('camera', {}).get('width_px', 960))
 CAM_HEIGHT_PX = int(_CFG.get('camera', {}).get('height_px', 960))
 CAM_FOV_DEG = _CFG.get('camera', {}).get('fov_deg', 60.0)
 FOCAL_LENGTH = (CAM_WIDTH_PX / 2.0) / math.tan(math.radians(CAM_FOV_DEG) / 2.0)
-FOV_HALF_RAD = math.radians(CAM_FOV_DEG / 2.0)
+FOV_HALF_H = math.atan2(CAM_WIDTH_PX / 2.0, FOCAL_LENGTH)   # horizontal half-FOV (rad)
+FOV_HALF_V = math.atan2(CAM_HEIGHT_PX / 2.0, FOCAL_LENGTH)  # vertical half-FOV (rad, < FOV_HALF_H for wide sensors)
 
 # Camera frame rate (fixed for the sim — the C++ node measures dt_cam adaptively from timestamps)
 CAM_RATE = 30.0
@@ -247,7 +248,7 @@ def step_quadrotor(state, throttle, omega_cmd, dt):
 # ============================================================================
 # Camera projection (mirror C++ h_meas_pixel + project)
 # ============================================================================
-def project_target(uav_pos, R_b2n, target_pos, target_width, focal_length, fov_half):
+def project_target(uav_pos, R_b2n, target_pos, target_width, focal_length, fov_half_h, fov_half_v):
     """Return (u, v, size, in_fov) — pixel coords centered on image center."""
     rel_p = target_pos - uav_pos
     R_n2c = R_B2C @ R_b2n.T
@@ -257,8 +258,10 @@ def project_target(uav_pos, R_b2n, target_pos, target_width, focal_length, fov_h
     u = focal_length * p_cam[0] / p_cam[2]
     v = focal_length * p_cam[1] / p_cam[2]
     s = focal_length * target_width / p_cam[2]
-    angle = math.atan2(math.sqrt(p_cam[0] ** 2 + p_cam[1] ** 2), p_cam[2])
-    in_fov = angle < fov_half
+    # Separate h/v FOV check (non-square sensors have v_fov < h_fov)
+    angle_h = abs(math.atan2(p_cam[0], p_cam[2]))
+    angle_v = abs(math.atan2(p_cam[1], p_cam[2]))
+    in_fov = (angle_h < fov_half_h) and (angle_v < fov_half_v)
     return u, v, s, in_fov
 
 
@@ -338,7 +341,7 @@ def target_init_for_fov(scenario, fov_name):
     uav_pos = np.array(scenario['uav_init'], dtype=float)
     R_b2n = euler_to_R(0.0, 0.0, scenario['uav_yaw'])
     R_b2c = Rx(GIMBAL_BIAS) @ R_B2C_BASE                       # gimbal starts at the bias
-    ray_cam = np.array([nx * math.tan(FOV_HALF_RAD), ny * math.tan(FOV_HALF_RAD), 1.0])
+    ray_cam = np.array([nx * math.tan(FOV_HALF_H), ny * math.tan(FOV_HALF_V), 1.0])
     ray_world = R_b2n @ R_b2c.T @ ray_cam
     ray_world /= np.linalg.norm(ray_world)
     nominal_range = float(np.linalg.norm(np.array(scenario['target_init'], dtype=float) - uav_pos))
@@ -401,7 +404,8 @@ class SimNode(Node):
         self.launch_timer = self.create_timer(1.0, self.launch_once)
 
         self.get_logger().info(
-            f"Sim node ready. focal={FOCAL_LENGTH:.1f} fov={CAM_FOV_DEG} "
+            f"Sim node ready. focal={FOCAL_LENGTH:.1f} h_fov={CAM_FOV_DEG} "
+            f"v_fov={2*math.degrees(FOV_HALF_V):.1f} res={CAM_WIDTH_PX}x{CAM_HEIGHT_PX} "
             f"gimbal(tau={GIMBAL_TAU}s bias={math.degrees(GIMBAL_BIAS):.1f}deg)")
 
     def launch_once(self):
@@ -565,7 +569,7 @@ class SimNode(Node):
         t = time.monotonic() - self.start_time
         u, v, s, in_fov = project_target(
             self.uav.pos, self.uav.R_b2n, self.target_pos,
-            self.scenario['target_width'], FOCAL_LENGTH, FOV_HALF_RAD)
+            self.scenario['target_width'], FOCAL_LENGTH, FOV_HALF_H, FOV_HALF_V)
         has_bbox = in_fov
         # dropout
         if has_bbox and self.scenario['dropout'] is not None:

@@ -42,9 +42,9 @@ interceptor_node_relative_imm_ukf:
 
     # Camera Intrinsic parameters
     camera:
-      width_px: 960
-      height_px: 960
-      fov_deg: 60.0
+      width_px: 1920
+      height_px: 1200
+      fov_deg: 72.0          # horizontal FOV; vertical FOV derived from aspect ratio (~48.8°)
       # Semi-strapdown single-axis pitch gimbal: servo keeps the boresight near-horizontal in the
       # world frame regardless of body pitch (with servo lag). The ACTUAL camera-to-world orientation
       # q_C_W is published on /fpv/gimbal (sensor_msgs/Imu, orientation = camera->world quaternion) —
