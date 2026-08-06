@@ -119,6 +119,11 @@ interceptor_node_relative_imm_ukf:
       dither_amp: 1.0             # m/s^2, lateral observability dither amplitude (2.0 caused W_est cascade in AirSim; 1.0 is the middle ground)
       dither_freq: 0.3            # Hz, lateral dither frequency
       dither_min_range: 15.0       # m, suppress dither inside this range (don't disturb terminal)
+      # Radar mid-course smoothness: EMA on the range feeding the turn-radius speed cap + terminal
+      # decel ramp. The 10 Hz radar range carries ~4 m noise; fed 1:1 into sqrt(g*tan(max_tilt)*r) it
+      # swings v_des_eff and brakes every cycle. Lag is conservative on closing (over-estimates range
+      # -> cap allows slightly more speed, decel later). 0 = off. Drop to 0.2 if radar_only regresses.
+      range_smooth_tc: 0.3        # s, EMA time constant on the axial-chain range (0=off)
 
     # State estimation aiding
     estimation:
@@ -129,3 +134,65 @@ interceptor_node_relative_imm_ukf:
       # guidance / the speed-aware brake floor. 0 disables.
       vel_smooth_tc: 0.25          # s, EMA time constant on the relative-velocity estimate
       w_guess: 1.5
+
+    # ------------------------------------------------------------------------------------------
+    # Radar relay (mid-course guidance)
+    # ------------------------------------------------------------------------------------------
+    # An external radar tracks BOTH the target and the interceptor and reports each as a
+    # world-ENU nav_msgs/Odometry (pose = position, twist.linear = velocity, header.stamp = the
+    # MEASUREMENT epoch, not the publish time). The node differences the pair into a relative
+    # [r, v_rel] measurement, extrapolates it over the reported latency, and feeds it to the same
+    # IMM-UKF as a linear observation of x[0:6]. This carries the interceptor to the target long
+    # before the target is inside the camera FOV.
+    #
+    # Handover: while the target is BOTH inside the FOV and still on the radar track, the target
+    # width falls out of the pinhole relation W = bbox_size * r_radar / focal. That value is
+    # median-filtered over handover_frames and then LOCKED — it is the confidence anchor for the
+    # monocular terminal range r = focal*W/bbox_size once the radar is dropped.
+    radar:
+      enable: true                # set true when a radar relay feed is available
+      topic_target: "/fpv/radar/target"
+      topic_interceptor: "/fpv/radar/interceptor"
+      pos_std: 3.0                 # m, 1-sigma per axis (models a 1-5 m radar position error)
+      vel_std: 1.0                 # m/s, 1-sigma per axis
+      pair_window: 0.15            # s, max allowed stamp skew between the target/interceptor pair
+      timeout: 1.0                 # s, radar track considered stale beyond this age
+      max_delay_comp: 0.3          # s, cap on the latency extrapolation (radar lag is 50-100 ms)
+      max_range: 800.0             # m, sanitizer range ceiling while radar is enabled
+      handover_frames: 10          # consecutive RADAR-VALIDATED vision frames for the width fix + lock
+      lock_min_duration: 0.7       # s, the run must also span this long — a burst of consecutive
+                                   # false positives clears a pure frame count in a fraction of a second
+      width_window: 1.5            # s, rolling window for the width-median buffer. The buffer is no
+                                   # longer wiped on a single missed frame; stale samples age out over
+                                   # this window instead, so the width lock survives transient radar
+                                   # stalls / rejected bboxes. MAD outlier rejection runs on top of it.
+      handover_max_range: 200.0    # m, do not derive a width from a radar range beyond this
+      # False-positive rejection. The detector fires on clouds/structures at long range and ONE fused
+      # phantom pixel measurement walks the monocular width — and with it the whole range scale —
+      # off (observed w_est 1.50 -> 0.66). Every bbox is checked against the radar track BEFORE it
+      # reaches the filter, not just before the handover.
+      bbox_gate: true
+      bbox_range_ratio: 2.0        # max focal*W/bbox_size vs radar-range ratio (only once W is locked)
+      width_min: 0.3               # m, clamp on the derived target width
+      width_max: 5.0               # m
+      disable_after_lock: true     # once vision is locked AND delivering, the radar contributes
+                                   # nothing: its metre-level noise can only degrade a converged
+                                   # monocular solution, and its range knowledge is already baked
+                                   # into the locked target width. It re-engages as soon as vision
+                                   # stops delivering (vision_hold) — i.e. when the pass has failed.
+      vision_lost_timeout: 1.5     # s, vision gone this long -> guidance ownership reverts to radar
+      vision_hold: 0.35            # s, how long a bbox counts as "current" before radar re-engages
+      # Ownship velocity aiding: own_vel_ is otherwise an unbounded IMU integral running from the
+      # MISSION trigger, and it damps the vertical loop — a long wait for the FCU to accept external
+      # control (GUIDED) is enough to poison it. The radar measures it directly.
+      own_vel_aiding: true
+      own_vel_tc: 5.0              # s, DRIFT TRIM only. own_vel_ also damps the vertical loop, which
+                                   # needs its high-frequency content: a short time constant here
+                                   # hands that loop a 10 Hz lag-delayed signal and it oscillates
+                                   # (throttle bang-bangs between its clamps). Keep >> 1/K_az.
+      # Radar world frame -> IMU-referenced estimator frame yaw. Guidance mixes the two
+      # (los_az = atan2(r) - imu_yaw), so an offset here flies the interceptor at a constant angle
+      # off the target. Read the actual value off the [FRAME] log line, then set it here.
+      yaw_offset_deg: 0.0
+      handover_max_bearing_err: 0.20  # rad, camera-vs-radar LOS azimuth disagreement that rejects a
+                                      # detection for both the width fix and the visual lock

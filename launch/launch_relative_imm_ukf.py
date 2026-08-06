@@ -25,6 +25,13 @@ def generate_launch_description():
         description='Set to True to run in simulation mode, False for real hardware.'
     )
 
+    # Radar relay mid-course guidance (see the radar block in relative_imm_ukf_params.yaml)
+    # use_radar_arg = DeclareLaunchArgument(
+    #     'use_radar',
+    #     default_value='False',
+    #     description='Set to True to consume the radar relay feed for mid-course guidance.'
+    # )
+
     interceptor_node = Node(
         package='drone_interceptor',
         executable='interceptor_node_relative_imm_ukf',
@@ -33,12 +40,14 @@ def generate_launch_description():
         parameters=[
             config_file,
             {'use_simulation': LaunchConfiguration('use_simulation')}
+            # ,{'radar.enable': LaunchConfiguration('use_radar')}
         ],
         emulate_tty=True,
         arguments=['--ros-args', '--log-level', 'INFO']
     )
-    
+
     return LaunchDescription([
         use_simulation_arg,
+        # use_radar_arg,
         interceptor_node
     ])

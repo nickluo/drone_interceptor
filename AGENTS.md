@@ -49,6 +49,61 @@ utils.h                                  — DroneEKF(19D), MissionStateMachine,
 - **Thread safety**: `std::mutex` (not shared_mutex)
 - **Topics**: imu=`/mavros/imu/data`, bbox=`/fpv/target_bbox`, odom=`/fpv/odom`, mission_launch=`/fpv/tracker_trigger`, mission=`/fpv/mission_start`, control=`/fpv/control_command`, mission_state=`/fpv/mission_state`
 
+### Radar relay mid-course guidance (IMM-UKF variant only)
+
+Optional second measurement source, off by default (`radar.enable`). Carries the interceptor to the
+target before the target is inside the camera FOV, then hands over to vision.
+
+- **Input**: two `nav_msgs/Odometry` at ~10 Hz — `/fpv/radar/target` and `/fpv/radar/interceptor`,
+  world ENU, `twist.linear` in the SAME world frame (radar measures ground velocity, not body).
+  `header.stamp` is the **measurement epoch**, not the publish time — that is how the node recovers
+  the 50-100 ms link latency.
+- **Pairing**: samples matched by stamp within `radar.pair_window`; `t_meas = min(stamps)` plus a
+  last-fused guard makes a dropped leg skip rather than fuse a mismatched pair.
+- **Fusion**: relative measurement `z = [r, v_rel] = [p_t - p_i, v_t - v_i]`, extrapolated over the
+  lag, applied as a LINEAR update (`H = [I6|0]`, `update_posvel`) — valid outside the FOV where the
+  pixel model is not. Seeds the filter when it is not yet initialized.
+- **Single time base**: `advance_time()` gives every source (bbox / bbox-dropout coast / radar) a
+  predict dt of "time since the previous estimator step", so 30 Hz vision and 10 Hz radar never
+  double-propagate. The IMU `dv_own` accumulator is drained by whichever source ran.
+- **Mid-course guidance**: radar fills the control cache with `bbox_size = 0` (terminal brake stays
+  disarmed) and an ANALYTIC LOS rate `(r x v)_z / |r_xy|^2` — differencing a 10 Hz metre-noisy
+  bearing would inject ~0.3 rad/s into the PN lateral command.
+- **Every bbox is gated on radar consistency** (`radar.bbox_gate`), not just the handover decision.
+  A detection whose LOS is more than `radar.handover_max_bearing_err` off the radar track — or,
+  once the width is locked, whose implied range `focal*W/s` disagrees with the radar range by more
+  than `radar.bbox_range_ratio` — is treated as "no detection" and never reaches the filter. One
+  fused phantom is enough to walk the monocular width off (observed `w_est` 1.50 -> 0.66 in AirSim
+  while the estimate slewed tens of metres).
+- **Width handover**: while the target is in frame AND the radar track is still valid,
+  `W = bbox_size * r_radar / focal`, median over `radar.handover_frames` VALIDATED frames, then
+  **locked** (`lock_width`). Confidence anchor for the monocular terminal range `r = focal*W/s`.
+- **Visual lock needs a stable run AND a fixed width**: `radar.handover_frames` consecutive
+  validated frames, at least `radar.lock_min_duration` of elapsed time, and the width already
+  fixed from the radar (unless no radar track ever arrived). Locking before the width is fixed
+  runs the terminal range on the configured guess and nothing pins W afterwards — it drifts with
+  every update (observed `w_est` 1.9 -> 2.3 in AirSim).
+- **Terminal vision guidance is exclusive.** Once vision is locked AND delivering, the radar stops
+  contributing entirely (`radar.disable_after_lock`): its metre-level noise can only degrade a
+  converged monocular solution, and its range knowledge is already baked into the locked width. It
+  re-engages as soon as vision stops delivering for `radar.vision_hold` — i.e. when the pass failed.
+- **States**: `INITIALIZING -> BLIND_FLIGHT` on radar acquisition, `-> TRACKING` on visual lock.
+  Vision gone > `radar.vision_lost_timeout` hands guidance ownership back to radar.
+- **Frame cross-check**: with the target in frame, the camera LOS azimuth and the radar LOS azimuth
+  must agree. The `[FRAME]` log line reports the difference; a STEADY nonzero value is the
+  radar/IMU world-frame yaw mismatch — dial it out with `radar.yaw_offset_deg`. A frame that
+  disagrees by more than `radar.handover_max_bearing_err` rejects the detection for both the width
+  fix and the visual lock.
+- **Ownship velocity trim**: the radar's interceptor track corrects the IMU strapdown `own_vel_`,
+  which otherwise integrates unbounded from the MISSION trigger (a long wait for GUIDED is enough
+  to poison it). `radar.own_vel_tc` must stay LONG (~5 s): `own_vel_` also damps the vertical loop,
+  and blending in a 10 Hz lag-delayed velocity at a short time constant makes that loop oscillate.
+- **States**: `INITIALIZING -> BLIND_FLIGHT` on radar acquisition, `-> TRACKING` on visual lock.
+  Vision gone > `radar.vision_lost_timeout` reverts to radar.
+- **Producer**: `airsim_tracker/radar_relay_node.py` (see that package). It also publishes
+  `/fpv/radar_state` (`std_msgs/Int8`, same encoding as `/fpv/tracker_state`) which `apm_bridge`
+  uses to allow the MISSION trigger on a radar lock alone.
+
 ## Build
 
 ```bash
@@ -100,6 +155,8 @@ cd ~/workspace/fpv_ws && colcon build --packages-select drone_interceptor
 | `prototype/drone_model_dq.py` | DQ dynamics + cost + solver code generation |
 | `prototype/drone_model_quaternion.py` | Quaternion dynamics + cost + solver code generation |
 | `config/*_params.yaml` | Runtime parameters (real hardware vs AirSim vs IMM-UKF) |
+| `prototype/ros2_sim_node.py` | ROS2 harness driving the real C++ node (incl. simulated radar relay) |
+| `prototype/run_scenario.sh` | One-shot scenario runner: launches the node, drives it, prints the summary |
 
 ## Pitfalls
 
@@ -109,4 +166,9 @@ cd ~/workspace/fpv_ws && colcon build --packages-select drone_interceptor
 - Always use solver output even with status≠0 (suboptimal solution > fallback)
 - `penalty_coeff` must be TTA-based with cap at 30 to prevent close-range solver explosion
 - `relative_imm_ukf` node: `use_simulation` defaults `False` in launch — verify before AirSim runs
+- Radar relay is OFF unless `radar.enable` / `launch_relative_imm_ukf.py use_radar:=True`
+- The width handover is only as good as `focal_length_`, which comes from `camera.width_px` and
+  `camera.fov_deg`. `airsim_settings.json` (30° / 960x960) does NOT match the launch defaults
+  (72° / 1920x1200) — a 35% focal error that corrupts both the handover width and the terminal
+  monocular range. Align them before any AirSim run.
 - `acados`/`blasfeo`/`hpipm`/`Eigen` not declared in `package.xml` — `rosdep` won't install; manual system install required

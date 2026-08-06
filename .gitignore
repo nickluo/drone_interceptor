@@ -2,9 +2,10 @@
 __pycache__/
 build/
 c_generated_code/
-prototype/*.json
-prototype/*.txt
-prototype/*.csv
-prototype/*.png
+prototype/**/*.json
+prototype/**/*.txt
+prototype/**/*.csv
+prototype/**/*.png
+prototype/**/*.log
 .agents/
 skills-lock.json

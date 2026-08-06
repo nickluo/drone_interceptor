@@ -43,6 +43,9 @@ ros2 launch drone_interceptor launch_relative_imm_ukf.py   # IMM-UKF estimator +
 
 ros2 launch drone_interceptor airsim_launch.py             # quaternion node, AirSim sim params
 ros2 launch drone_interceptor airsim_launch_dq.py          # DQ node, AirSim sim params
+
+# IMM-UKF with radar relay mid-course guidance (needs airsim_tracker/radar_launch.py running)
+ros2 launch drone_interceptor launch_relative_imm_ukf.py use_radar:=True
 ```
 
 Each launch loads a YAML from `config/` (`*_params.yaml`). AirSim configs differ mainly in `execution_delay` (10 ms vs 50 ms on hardware). Note: `use_simulation` defaults to `False` in the IMM-UKF launch — verify it before AirSim runs.
@@ -52,7 +55,8 @@ Each launch loads a YAML from `config/` (`*_params.yaml`). AirSim configs differ
 There is **no formal unit-test suite** — `ament_lint_common` is declared but no gtest/pytest targets are wired in CMake. Algorithm verification lives in `prototype/`:
 
 - `prototype/sim_test_relative_imm_ukf.py` — pure-Python mirror of the C++ IMM-UKF + PN/IBVS controller run against simplified quadrotor dynamics + camera model. This is the de-facto test for the estimator/controller.
-- `prototype/ros2_sim_node.py` — ROS2 simulation harness that publishes `/fpv/odom` + `/fpv/target_bbox` and consumes `/fpv/control_command`; runs scenarios (nominal, crossing, maneuvering, dropout, noise, wrong_w) producing the `*.csv`/`*_summary.txt`/`*.png` results in `prototype/`.
+- `prototype/ros2_sim_node.py` — ROS2 simulation harness that publishes `/fpv/odom` + `/fpv/target_bbox` and consumes `/fpv/control_command`; runs scenarios (nominal, crossing, maneuvering, dropout, noise, wrong_w) producing the `*.csv`/`*_summary.txt`/`*.png` results in `prototype/`. It also simulates the radar relay (`radar_relay`, `radar_far`, `radar_maneuver`, `radar_only` scenarios, or `--radar` on any scenario) with the same noise/latency model as the AirSim radar node.
+- `prototype/run_scenario.sh <scenario>` — one-shot runner: launches the C++ node (auto-enabling `use_radar` for `radar*` scenarios), drives it, tears both down, prints the summary.
 - `prototype/solver_acmpc_trt_dq.py` — TensorRT prototype of a learned AC-MPC DQ-NMPC policy (separate exploration track, not compiled into the C++ nodes).
 
 There is no linter/CI config actually enabled in CMake.
@@ -70,6 +74,7 @@ InterceptorNodeRelativeIMMUKF (standalone rclcpp::Node, NOT a base subclass)
 
 - **NMPC variants**: `InterceptorNodeBase` (in `src/interceptor_node_base.{h,cpp}`) owns the full algorithm skeleton via 13 pure virtual methods; the two subclasses supply state-representation-specific accessors and the acados solver binding. Two-phase init: the base constructor only declares params; the subclass calls `initialize()` after the vtable is ready.
 - **IMM-UKF variant** (`src/interceptor_node_relative_imm_ukf.cpp`) is fully standalone — no `InterceptorNodeBase`, no acados. It estimates the **absolute target** state (the NMPC variants estimate target state relative to the interceptor's ego-state via `DroneEKF` in `utils.h`).
+- **Radar relay** (IMM-UKF variant only, `radar.enable`, off by default): `/fpv/radar/target` + `/fpv/radar/interceptor` (`nav_msgs/Odometry`, world ENU, `header.stamp` = measurement epoch) are differenced into a relative `[r, v_rel]` linear UKF update, giving mid-course guidance while the target is still outside the camera FOV. On visual acquisition the target width is fixed from `bbox_size * r_radar / focal` and locked, anchoring the monocular terminal range. Producer is `airsim_tracker/radar_relay_node.py`. Full contract in `AGENTS.md`.
 - **Control flow**: vision bbox → state estimation (DroneEKF 19D, or IMM-UKF 10D) → guidance (NMPC at range, switching to True Proportional Navigation for terminal intercept) → `quadrotor_msgs::ControlCommand` = `collective_thrust` + body rates `[omega_x, omega_y, omega_z]`, published on `/fpv/control_command` at ~50 Hz.
 
 ROS2 topics are identical across variants so any node drives the same low-level flight controller: subs `/fpv/odom`, `/fpv/target_bbox`, `/mavros/imu/data` (IMM-UKF), `/fpv/gimbal` (NMPC hardware), `/fpv/tracker_trigger`; pubs `/fpv/control_command`, `/fpv/mission_state`, `/mavros/statustext/send`. `utils.h` (header-only) holds `DroneEKF`, `MissionStateMachine`, `EMAFilter`, `CameraIntrinsics`.

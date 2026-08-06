@@ -133,22 +133,24 @@ private:
     }
 
     static Eigen::VectorXd f_rotor(const Eigen::VectorXd& x, double dt, const Eigen::Vector3d& a_own,
-                                   double g_drag_coeff) {
+                                   double /*g_drag_coeff*/) {
         Eigen::VectorXd x_new = x;
         const Eigen::Vector3d v = x.segment<3>(3);      // v_rel
         const Eigen::Vector3d a_t = x.segment<3>(6);    // target own accel
         const Eigen::Vector3d a_rel = a_t - a_own;
-        // NOTE: the original absolute-state f_rotor modeled target aerodynamic drag as
-        // a_real = a_thrust - k_drag*|v_target|*v_target. In relative coordinates v_target is
-        // UNOBSERVABLE (it would need ownship vel). Substituting v_rel is wrong: when the target is
-        // static but the ownship is moving, |v_rel| is large and the drag term spuriously brakes the
-        // Target aerodynamic drag (restored): a_drag = -k*|v|*v. In relative coordinates v_rel is an
-        // approximation of v_target (exact for a static ownship; ownship motion is captured separately
-        // via a_own). With drag_coeff=0 the model reverts to pure accel-relaxation (tau=2s).
-        const Eigen::Vector3d a_drag = -g_drag_coeff * v.norm() * v;
-        const Eigen::Vector3d a_rel_total = a_rel + a_drag;
-        x_new.segment<3>(0) = x.segment<3>(0) + v * dt + 0.5 * a_rel_total * dt * dt;
-        x_new.segment<3>(3) = v + a_rel_total * dt;
+        // RELATIVE-COORDINATE DRAG IS DISABLED. The absolute-state f_rotor modeled the target's
+        // aerodynamic drag as a_drag = -k*|v_target|*v_target, but v_target is UNOBSERVABLE in this
+        // strapdown/relative variant (it would need the ownship velocity). Substituting v_rel is
+        // wrong: when the target is near-static but the ownship is closing fast, |v_rel| is large and
+        // the term spuriously brakes the RELATIVE state — at |v_rel|~15 and drag_coeff=0.1625 that is
+        // ~36 m/s^2 of phantom deceleration injected into the v_rel predict every cycle, which the
+        // radar update then yanks back, chattering v_closing and braking the mid-course flight.
+        // g_drag_coeff is intentionally ignored (kept in the signature only because it is wired
+        // through the ctor/apply_model, and the sim reuses physics.drag_coeff for the OWNship drag);
+        // the model is pure accel-relaxation with tau=2s. Do NOT re-enable without first expressing
+        // the term as a function of an observable target-velocity estimate.
+        x_new.segment<3>(0) = x.segment<3>(0) + v * dt + 0.5 * a_rel * dt * dt;
+        x_new.segment<3>(3) = v + a_rel * dt;
         x_new.segment<3>(6) = a_t * std::exp(-dt / 2.0);
         x_new(9) = x(9);
         return x_new;
@@ -268,6 +270,40 @@ public:
         }
         return likelihood;
     }
+
+    // Radar-relay measurement: a direct observation of the RELATIVE position/velocity
+    // z = [r(3), v_rel(3)] = H x with H = [I6 | 0]. Linear in the state, so a plain KF update is
+    // exact — no sigma points needed (and it stays valid at ranges where the pixel model is
+    // unusable because the target is outside the camera FOV).
+    double update_posvel(const Vector6d& z, const Matrix6d& R6) {
+        predicted = false;
+        const Vector6d y = z - x.head<6>();
+        Matrix6d S = P.topLeftCorner<6, 6>() + R6;
+        S = (S + S.transpose()) * 0.5;
+
+        Eigen::LDLT<Matrix6d> ldlt(S);
+        if (ldlt.info() != Eigen::Success) {
+            return 1e-30;
+        }
+        // P * H^T = the first 6 columns of P.
+        const Eigen::Matrix<double, kStateDim, 6> K =
+            P.leftCols<6>() * ldlt.solve(Matrix6d::Identity());
+        if (!K.allFinite() || !y.allFinite()) {
+            return 1e-30;
+        }
+
+        x = x + K * y;
+        P = P - K * S * K.transpose();
+        P = (P + P.transpose()) * 0.5;
+
+        const double det = std::max(std::abs(S.determinant()), 1e-30);
+        const double exponent = -0.5 * y.dot(ldlt.solve(y));
+        double likelihood = std::exp(clamp(exponent, -80.0, 80.0)) / std::sqrt(std::pow(2.0 * M_PI, 6) * det);
+        if (!std::isfinite(likelihood) || likelihood < 1e-30) {
+            likelihood = 1e-30;
+        }
+        return likelihood;
+    }
 };
 
 class RobustIMMEstimator10D {
@@ -351,6 +387,19 @@ public:
         for (int j = 0; j < kModeCount; ++j) {
             likelihoods(j) = filters[j].update(z_pixel, R_n2c, focal_length);
         }
+        mix_likelihoods(likelihoods);
+    }
+
+    // Radar-relay update: direct [r, v_rel] observation applied to every mode filter.
+    void update_posvel(const Vector6d& z, const Matrix6d& R6) {
+        Eigen::Vector3d likelihoods;
+        for (int j = 0; j < kModeCount; ++j) {
+            likelihoods(j) = filters[j].update_posvel(z, R6);
+        }
+        mix_likelihoods(likelihoods);
+    }
+
+    void mix_likelihoods(const Eigen::Vector3d& likelihoods) {
         mu = cbar.cwiseProduct(likelihoods);
         const double mu_sum = mu.sum();
         if (!std::isfinite(mu_sum) || mu_sum < 1e-30) {
@@ -405,6 +454,14 @@ public:
     double size_gate_range_ = 12.0;
     double size_gate_lo_ = 0.6;
     double size_gate_hi_ = 1.8;
+    // Sanitizer range ceiling. Monocular-only operation never sees a credible target past ~200 m,
+    // but a radar relay hands over tracks at several hundred metres — the node raises this when
+    // radar is enabled so the sanitizer does not fold a valid long-range track back to 120 m.
+    double max_range_ = 200.0;
+    // Set once the width has been fixed from a radar-range + bbox-size handover. sanitize_filters
+    // then keeps the freeze regardless of range (the normal freeze releases above
+    // width_freeze_range_, which would let a converged handover width drift again).
+    bool width_externally_locked_ = false;
 
     std::unique_ptr<RobustIMMEstimator10D> imm_ukf;
     bool initialized = false;
@@ -427,6 +484,98 @@ public:
         : dt_cam(dt_cam_val), focal_length(focal_length_val), w_guess(W_guess_val), R_b2c(R_b2c_val)
     {
         imm_ukf = std::make_unique<RobustIMMEstimator10D>(drag_coeff_val);
+    }
+
+    // Single time base shared by every measurement source (camera bbox, camera dropout coast, radar
+    // relay). The predict dt is always "time since the previous estimator step", so mixing a 30 Hz
+    // vision stream with a 10 Hz radar stream never double-propagates: whichever source runs next
+    // advances the filters by exactly the elapsed interval, and the IMU dv_own accumulator drained
+    // by that same source covers exactly the same window.
+    double advance_time(double t_now) {
+        const double dt = has_last_cap_time ? clamp(t_now - last_cap_time, 0.001, 0.3) : dt_cam;
+        last_cap_time = t_now;
+        has_last_cap_time = true;
+        return dt;
+    }
+
+    // Fix the target width from an external, trusted source (radar range x bbox size at handover).
+    // Terminal monocular range r = focal*W/s is only as good as W, so pinning it at handover is
+    // what makes the vision terminal phase metrically consistent with the radar mid-course track.
+    void lock_width(double W) {
+        const double w = clamp(W, 0.3, 5.0);
+        w_guess = w;
+        frozen_width = w;
+        has_frozen_width = true;
+        width_externally_locked_ = true;
+        for (auto& filter : imm_ukf->filters) {
+            filter.x(9) = w;
+            filter.P.row(9).setZero();
+            filter.P.col(9).setZero();
+            filter.P(9, 9) = 1e-8;
+        }
+        imm_ukf->compute_state_estimate();
+        imm_ukf->x(9) = w;
+    }
+
+    // Radar-relay measurement of the RELATIVE state: z = [r, v_rel] in world frame G. Used for
+    // mid-course guidance before the target enters the camera FOV, and as the metric anchor for the
+    // vision handover. dv_own is the IMU-preintegrated ownship velocity change over the same window
+    // as the predict (drained by the caller), exactly as in process_camera.
+    std::pair<bool, Eigen::VectorXd> process_radar(const Eigen::Vector3d& r_meas,
+                                                   const Eigen::Vector3d& v_meas,
+                                                   double t_now, const Eigen::Vector3d& dv_own,
+                                                   double pos_std, double vel_std) {
+        Matrix6d R6 = Matrix6d::Zero();
+        for (int i = 0; i < 3; ++i) {
+            R6(i, i) = pos_std * pos_std;
+            R6(i + 3, i + 3) = vel_std * vel_std;
+        }
+
+        if (!initialized) {
+            Eigen::VectorXd x0 = Eigen::VectorXd::Zero(kStateDim);
+            x0.segment<3>(0) = r_meas;
+            x0.segment<3>(3) = v_meas;
+            x0(9) = clamp(w_guess, 0.3, 5.0);
+
+            Eigen::MatrixXd P0 = Eigen::MatrixXd::Zero(kStateDim, kStateDim);
+            const double pv = pos_std * pos_std;
+            const double vv = vel_std * vel_std;
+            P0.diagonal() << pv, pv, pv, vv, vv, vv, 10.0, 10.0, 10.0, 0.25;
+            for (auto& filter : imm_ukf->filters) {
+                filter.x = x0;
+                filter.P = P0;
+                filter.predicted = false;
+            }
+            imm_ukf->x = x0;
+            imm_ukf->P = P0;
+            initialized = true;
+            w_init_time = t_now;
+            last_cap_time = t_now;
+            has_last_cap_time = true;
+            if (r_meas.norm() > 1e-3) {
+                last_los_nav = r_meas.normalized();
+                has_last_los_nav = true;
+            }
+            sanitize_filters();
+            return {true, imm_ukf->x};
+        }
+
+        const double dt = advance_time(t_now);
+        const Eigen::Vector3d a_own = dv_own / std::max(dt, 1e-3);
+        update_process_noise(imm_ukf->x.segment<3>(0).norm(), imm_ukf->x(9), 0.0, t_now - w_init_time);
+        imm_ukf->predict(dt, a_own);
+
+        Vector6d z;
+        z.head<3>() = r_meas;
+        z.tail<3>() = v_meas;
+        imm_ukf->update_posvel(z, R6);
+
+        if (r_meas.norm() > 1e-3) {
+            last_los_nav = r_meas.normalized();
+            has_last_los_nav = true;
+        }
+        sanitize_filters();
+        return {true, imm_ukf->x};
     }
 
     void update_process_noise(double r_norm, double w_est, double bbox_s, double obs_duration) {
@@ -453,7 +602,7 @@ public:
     void sanitize_filters() {
         // Relative-state form: r_norm is just |x[0:3]| (no uav_pos subtraction). On divergence,
         // reset along the last observed LOS direction at a nominal range.
-        bool should_freeze = false;
+        bool should_freeze = width_externally_locked_;
         for (auto& filter : imm_ukf->filters) {
             if (filter.x.segment<3>(0).norm() < width_freeze_range_) {
                 should_freeze = true;
@@ -491,8 +640,8 @@ public:
 
             const Eigen::Vector3d rel_p = filter.x.segment<3>(0);
             const double r_norm = rel_p.norm();
-            if (r_norm > 200.0) {
-                filter.x.segment<3>(0) = rel_p / std::max(r_norm, 1e-6) * 120.0;
+            if (r_norm > max_range_) {
+                filter.x.segment<3>(0) = rel_p / std::max(r_norm, 1e-6) * (0.6 * max_range_);
             }
             for (int i = 3; i < 6; ++i) filter.x(i) = clamp(filter.x(i), -30.0, 30.0);
             for (int i = 6; i < 9; ++i) filter.x(i) = clamp(filter.x(i), -15.0, 15.0);
@@ -548,13 +697,14 @@ public:
             }
             const double w_prev = imm_ukf->x(9);
             const double r_norm = imm_ukf->x.segment<3>(0).norm();
-            const Eigen::Vector3d a_own = dv_own / std::max(dt_cam, 1e-3);
+            const double dt_coast = advance_time(t_now);
+            const Eigen::Vector3d a_own = dv_own / std::max(dt_coast, 1e-3);
             update_process_noise(r_norm, w_prev, 0.0, t_now - w_init_time);
             // ALWAYS predict r forward using ownship motion (a_own). The absolute-state estimator
             // could skip the predict for a stationary target; the RELATIVE position r = target - own
             // moves by the ownship's motion EVERY frame. Skipping the predict freezes r while the
             // ownship keeps flying -> unbounded drift the moment the target leaves the FOV.
-            imm_ukf->predict(dt_cam, a_own);
+            imm_ukf->predict(dt_coast, a_own);
             // Coast: assume the target stops ACCELERATING (a_t->0, constant-velocity target) but
             // DO NOT touch v_rel. In relative coordinates v_rel = v_target - v_own; zeroing or
             // decaying it would erase the ownship's ongoing motion from r's predict. Keep v_rel;
@@ -589,7 +739,7 @@ public:
         }
 
         if (initialized) {
-            const double dt_meas = has_last_cap_time ? clamp(t_now - last_cap_time, 0.001, 0.1) : dt_cam;
+            const double dt_meas = advance_time(t_now);
             const Eigen::Vector3d a_own = dv_own / std::max(dt_meas, 1e-3);
             update_process_noise(imm_ukf->x.segment<3>(0).norm(), imm_ukf->x(9), bbox_s, t_now - w_init_time);
             imm_ukf->predict(dt_meas, a_own);
@@ -733,6 +883,14 @@ public:
     double dither_amp_ = 0.8;          // m/s^2, lateral dither amplitude
     double dither_freq_ = 0.5;         // Hz, lateral dither frequency
     double dither_min_range_ = 10.0;   // m, suppress dither inside this range (don't disturb terminal)
+    // Axial-only range EMA (radar smoothness): isolates the turn-radius cap + terminal-decel ramp
+    // from 10 Hz radar single-sample range noise. r_norm elsewhere (PN, dz, APN) stays unsmoothed.
+    // Lag is conservative during closing (over-estimates range -> cap allows slightly more speed,
+    // decel engages slightly later), so it biases against the over-braking we are fixing.
+    double r_norm_smooth_tc_ = 0.0;    // s, 0 = off (passthrough)
+    double r_norm_ema_ = 0.0;
+    double last_rn_ema_t_ = -1.0;
+    bool   has_rn_ema_ = false;
     // Geometric APN: recover the target lateral accel from TRUE-PN geometry + IMU (NOT the
     // estimator a_t state — unobservable with a single bbox): a_t_perp = range*ydot +
     // 2*lambda_dot*v_range + a_own_perp, where ydot = d(lambda_dot)/dt. Leads a turning target.
@@ -790,6 +948,9 @@ public:
         atp_ema_ = 0.0;
         aown_perp_ema_ = 0.0;
         last_los_dt_ = 0.02;
+        r_norm_ema_ = 0.0;
+        last_rn_ema_t_ = -1.0;
+        has_rn_ema_ = false;
     }
     void set_a_z_slew(double v) { a_z_slew_ = (v > 0.0) ? v : 1e9; }  // <=0 disables the slew limit
     void set_lateral_decay_floor(double v) { lateral_decay_floor_ = clamp(v, 0.0, 1.0); }
@@ -820,6 +981,8 @@ public:
         dither_freq_     = std::max(0.01, dither_freq);
         dither_min_range_= std::max(1.0, dither_min_range);
     }
+    // Axial-only range EMA time constant (radar smoothness). <=0 disables (passthrough r_norm).
+    void set_range_smooth_tc(double tc) { r_norm_smooth_tc_ = std::max(0.0, tc); }
 
     // Decoupled control (odometry-free, exact mirror of the Python prototype). Inputs:
     //   r_est, v_est : RELATIVE target pos/vel in world frame G (estimator state directly)
@@ -839,9 +1002,26 @@ public:
                                         double v_z = 0.0, double target_speed = 0.0,
                                         double los_rate = 0.0,
                                         const Eigen::Vector3d& a_own_world = Eigen::Vector3d::Zero(),
-                                        double boresight_el_meas = std::numeric_limits<double>::quiet_NaN()) {
+                                        double boresight_el_meas = std::numeric_limits<double>::quiet_NaN(),
+                                        bool radar_owns_guidance = false) {
         (void)v_est;
         const double r_norm = r_est.norm();
+        // Axial-only range EMA (radar smoothness): r_norm carries +-~4 m of 10 Hz radar noise; fed
+        // 1:1 into the turn-radius cap (sqrt(g*tan*r)) it swings v_des_eff and brakes every cycle.
+        // Smooth it ONLY for the axial chain (cap + terminal decel). Lag is conservative on closing.
+        double r_norm_axial = r_norm;
+        if (r_norm_smooth_tc_ > 1e-6) {
+            if (has_rn_ema_ && t > last_rn_ema_t_ && (t - last_rn_ema_t_) < 1.0) {
+                const double dt_rn = t - last_rn_ema_t_;
+                const double a_rn = clamp(dt_rn / r_norm_smooth_tc_, 0.0, 1.0);
+                r_norm_ema_ += a_rn * (r_norm - r_norm_ema_);
+                r_norm_axial = r_norm_ema_;
+            } else {
+                r_norm_ema_ = r_norm;
+                has_rn_ema_ = true;
+            }
+        }
+        last_rn_ema_t_ = t;
 
         // ---- (A) Bearing-only lateral guidance -------------------------------------------
         // LOS rate from the measured bearing ONLY (clean, no 1/r blowup, no v_est noise).
@@ -876,7 +1056,10 @@ public:
         const double turn_sign = (lambda_dot >= 0.0) ? 1.0 : -1.0;
         Eigen::Vector2d a_lat_world = turn_sign * a_lat_mag * e_perp_xy;
         // Active observability dither (mid-course only): lateral sinusoid for monocular scale/depth.
-        if (dither_amp_ > 0.0 && r_norm > dither_min_range_) {
+        // Suppressed while the radar owns guidance: the radar gives absolute scale directly, so the
+        // monocular-observability job the dither does is redundant during radar-only flight, and the
+        // 0.3 Hz lateral sinusoid only adds an airspeed oscillation. Re-engages at/after vision lock.
+        if (dither_amp_ > 0.0 && r_norm > dither_min_range_ && !radar_owns_guidance) {
             const double a_dither = dither_amp_ * std::sin(2.0 * M_PI * dither_freq_ * t);
             a_lat_world += a_dither * e_perp_xy;
         }
@@ -912,9 +1095,9 @@ public:
         double v_des_eff = v_des;
         // Range-based terminal decel schedule: arrive at the terminal phase ~v_terminal (slower),
         // where the same bank gives ~2x the turn rate. Feedforward on the monocular range estimate.
-        if (r_norm < terminal_decel_range_) {
+        if (r_norm_axial < terminal_decel_range_) {
             const double v_term_eff = std::min(std::max(v_terminal_, target_speed + 1.5), v_des);
-            const double frac = clamp((terminal_decel_range_ - r_norm) /
+            const double frac = clamp((terminal_decel_range_ - r_norm_axial) /
                                       std::max(terminal_decel_range_ - terminal_brake_range_, 1.0), 0.0, 1.0);
             v_des_eff = v_des + (v_term_eff - v_des) * frac;   // ramp v_des -> v_term_eff (<= v_des)
         }
@@ -924,7 +1107,7 @@ public:
         // target inside that -> overshoot/fly-by (AirSim v_des=20 ~60% vs v_des=15 ~80%; the Python
         // sim's ideal rate loop hides it). Bites only at close range (at r=40 m the cap is ~20 m/s).
         // The brake floor below still keeps enough closing to gain on a moving target.
-        v_des_eff = std::min(v_des_eff, std::sqrt(g * std::tan(max_tilt_rad) * r_norm));
+        v_des_eff = std::min(v_des_eff, std::sqrt(g * std::tan(max_tilt_rad) * r_norm_axial));
         const double bbox_engage = terminal_bbox_size_ * 0.2;   // engage at ~5x brake_range
         if (bbox_size > bbox_engage) {
             const double prox = clamp((bbox_size - bbox_engage) /
@@ -1154,6 +1337,22 @@ public:
         control_pub_ = this->create_publisher<quadrotor_msgs::msg::ControlCommand>("/fpv/control_command", 10);
         mission_state_pub_ = this->create_publisher<std_msgs::msg::Bool>("/fpv/mission_state", 10);
 
+        if (radar_enable_) {
+            estimator_->max_range_ = radar_max_range_;
+            radar_target_sub_ = this->create_subscription<nav_msgs::msg::Odometry>(
+                radar_topic_target_, 10,
+                [this](const nav_msgs::msg::Odometry::SharedPtr msg) { radar_callback(msg, true); },
+                sub_options);
+            radar_own_sub_ = this->create_subscription<nav_msgs::msg::Odometry>(
+                radar_topic_own_, 10,
+                [this](const nav_msgs::msg::Odometry::SharedPtr msg) { radar_callback(msg, false); },
+                sub_options);
+            RCLCPP_INFO(this->get_logger(),
+                "Radar relay ENABLED: target=%s interceptor=%s pos_std=%.1fm vel_std=%.1fm/s handover=%d frames",
+                radar_topic_target_.c_str(), radar_topic_own_.c_str(),
+                radar_pos_std_, radar_vel_std_, handover_frames_);
+        }
+
         mission_state_.set(MissionState::IDLE);
         RCLCPP_INFO(this->get_logger(), "Relative IMM-UKF node ready (ODOMETRY-FREE, IMU strapdown). IMU=/mavros/imu/data BBox=/fpv/target_bbox Launch=/fpv/tracker_trigger Control=/fpv/control_command");
     }
@@ -1199,6 +1398,7 @@ private:
         this->declare_parameter<double>("controller.dither_amp", 0.8);  // m/s^2, lateral observability dither
         this->declare_parameter<double>("controller.dither_freq", 0.5); // Hz
         this->declare_parameter<double>("controller.dither_min_range", 10.0); // m, suppress dither inside
+        this->declare_parameter<double>("controller.range_smooth_tc", 0.3); // s, EMA on the range feeding the turn-radius cap + terminal decel (0=off; radar smoothness)
         this->declare_parameter<double>("controller.lateral_decay_floor", 0.4);  // Fix D: close-range a_lat floor
         this->declare_parameter<double>("controller.lateral_decay_start", 25.0); // Fix F: range lateral attenuation begins (m)
         // Vertical cascade (cascaded velocity-limited altitude track). Set v_climb/v_descent to the
@@ -1217,6 +1417,48 @@ private:
         this->declare_parameter<double>("control.rate_tc", 0.02);
         this->declare_parameter<bool>("control.rate_control_attenuation", true);
         this->declare_parameter<bool>("use_simulation", false);
+        // ---- Radar relay (mid-course guidance before the target enters the camera FOV) --------
+        // An external radar tracks BOTH the target and the interceptor and reports each as a
+        // world-ENU nav_msgs/Odometry at ~10 Hz with metre-level noise and 50-100 ms latency. The
+        // node differences the pair into a relative measurement, delay-compensates it, and feeds it
+        // to the same IMM-UKF as a direct [r, v_rel] observation.
+        this->declare_parameter<bool>("radar.enable", false);
+        this->declare_parameter<std::string>("radar.topic_target", "/fpv/radar/target");
+        this->declare_parameter<std::string>("radar.topic_interceptor", "/fpv/radar/interceptor");
+        this->declare_parameter<double>("radar.pos_std", 3.0);        // m, 1-sigma per axis
+        this->declare_parameter<double>("radar.vel_std", 1.0);        // m/s, 1-sigma per axis
+        this->declare_parameter<double>("radar.pair_window", 0.15);   // s, max target/own stamp skew
+        this->declare_parameter<double>("radar.timeout", 1.0);        // s, track considered stale
+        this->declare_parameter<double>("radar.max_delay_comp", 0.3); // s, cap on latency extrapolation
+        this->declare_parameter<double>("radar.max_range", 800.0);    // m, sanitizer ceiling with radar
+        // Handover: consecutive vision frames required to declare a visual lock, and the window in
+        // which the radar range + bbox size fixes the target width for terminal guidance.
+        this->declare_parameter<int>("radar.handover_frames", 10);
+        this->declare_parameter<double>("radar.handover_max_range", 200.0);
+        this->declare_parameter<double>("radar.width_min", 0.3);
+        this->declare_parameter<double>("radar.width_max", 5.0);
+        this->declare_parameter<bool>("radar.disable_after_lock", true);
+        this->declare_parameter<double>("radar.vision_lost_timeout", 1.5);
+        // vision_hold is how long a bbox counts as "current": past it the radar takes the filter
+        // and guidance back immediately instead of dead-reckoning.
+        this->declare_parameter<double>("radar.vision_hold", 0.35);
+        // The radar reports the interceptor's OWN world velocity — the only drift-free correction
+        // available for the IMU strapdown own_vel_ that damps the vertical loop.
+        this->declare_parameter<bool>("radar.own_vel_aiding", true);
+        this->declare_parameter<double>("radar.own_vel_tc", 5.0);
+        // Yaw rotation from the radar world frame into the IMU-referenced estimator world frame.
+        // Nonzero only when the FCU heading reference is offset from the radar ENU x-axis; the
+        // handover bearing check measures exactly this angle and logs it.
+        this->declare_parameter<double>("radar.yaw_offset_deg", 0.0);
+        this->declare_parameter<double>("radar.handover_max_bearing_err", 0.20);
+        // False-positive rejection. The detector fires on clouds/structures at long range and ONE
+        // fused phantom pixel measurement is enough to drag the monocular width — and with it the
+        // whole range scale — off. Every bbox is checked against the radar track before it reaches
+        // the filter, not just before the handover.
+        this->declare_parameter<bool>("radar.bbox_gate", true);
+        this->declare_parameter<double>("radar.bbox_range_ratio", 2.0);
+        this->declare_parameter<double>("radar.lock_min_duration", 0.7);
+        this->declare_parameter<double>("radar.width_window", 1.5); // s, rolling window for the width median (survives transient misses)
     }
 
     void load_parameters() {
@@ -1231,6 +1473,14 @@ private:
                        1.0,  0.0,  0.0;
         g_ = this->get_parameter("physics.g").as_double();
         g_drag_coeff_ = this->get_parameter("physics.drag_coeff").as_double();
+        // physics.drag_coeff models the OWNship aero drag in the sim; the RELATIVE-state f_rotor
+        // ignores it (see f_rotor comment). Logged once so an operator setting it is not surprised.
+        if (g_drag_coeff_ > 1e-3) {
+            RCLCPP_INFO(this->get_logger(),
+                "physics.drag_coeff=%.4f is IGNORED by the relative-state f_rotor "
+                "(kept for the sim's ownship drag); rotor mode runs as pure accel-relaxation tau=2s.",
+                g_drag_coeff_);
+        }
         use_gimbal_ = this->get_parameter("camera.use_gimbal").as_bool();
         gimbal_bias_rad_ = this->get_parameter("camera.gimbal_bias_deg").as_double() * M_PI / 180.0;
         // gimbal_bias_deg (positive = down-gaze) is the unified camera tilt for BOTH the gimbal
@@ -1300,16 +1550,44 @@ private:
             this->get_parameter("controller.dither_amp").as_double(),
             this->get_parameter("controller.dither_freq").as_double(),
             this->get_parameter("controller.dither_min_range").as_double());
+        controller_->set_range_smooth_tc(this->get_parameter("controller.range_smooth_tc").as_double());
         vel_smooth_tc_ = this->get_parameter("estimation.vel_smooth_tc").as_double();
         const std::vector<double> bias = this->get_parameter("imu_bias").as_double_array();
         if (bias.size() == 3) {
             imu_bias_ = Eigen::Vector3d(bias[0], bias[1], bias[2]);
         }
 
+        radar_enable_ = this->get_parameter("radar.enable").as_bool();
+        radar_topic_target_ = this->get_parameter("radar.topic_target").as_string();
+        radar_topic_own_ = this->get_parameter("radar.topic_interceptor").as_string();
+        radar_pos_std_ = std::max(0.1, this->get_parameter("radar.pos_std").as_double());
+        radar_vel_std_ = std::max(0.05, this->get_parameter("radar.vel_std").as_double());
+        radar_pair_window_ = this->get_parameter("radar.pair_window").as_double();
+        radar_timeout_ = this->get_parameter("radar.timeout").as_double();
+        radar_max_delay_comp_ = this->get_parameter("radar.max_delay_comp").as_double();
+        radar_max_range_ = this->get_parameter("radar.max_range").as_double();
+        handover_frames_ = std::max(1, static_cast<int>(this->get_parameter("radar.handover_frames").as_int()));
+        handover_max_range_ = this->get_parameter("radar.handover_max_range").as_double();
+        width_min_ = this->get_parameter("radar.width_min").as_double();
+        width_max_ = this->get_parameter("radar.width_max").as_double();
+        radar_disable_after_lock_ = this->get_parameter("radar.disable_after_lock").as_bool();
+        vision_lost_timeout_ = this->get_parameter("radar.vision_lost_timeout").as_double();
+        radar_vision_hold_ = this->get_parameter("radar.vision_hold").as_double();
+        radar_own_vel_aiding_ = this->get_parameter("radar.own_vel_aiding").as_bool();
+        radar_own_vel_tc_ = std::max(0.05, this->get_parameter("radar.own_vel_tc").as_double());
+        handover_max_bearing_err_ = this->get_parameter("radar.handover_max_bearing_err").as_double();
+        radar_bbox_gate_ = this->get_parameter("radar.bbox_gate").as_bool();
+        radar_bbox_range_ratio_ = std::max(1.1, this->get_parameter("radar.bbox_range_ratio").as_double());
+        lock_min_duration_ = this->get_parameter("radar.lock_min_duration").as_double();
+        width_window_s_ = std::max(0.1, this->get_parameter("radar.width_window").as_double());
+        const double radar_yaw_off = this->get_parameter("radar.yaw_offset_deg").as_double() * M_PI / 180.0;
+        radar_R_yaw_ = Eigen::AngleAxisd(radar_yaw_off, Eigen::Vector3d::UnitZ()).toRotationMatrix();
+        vision_locked_ = !radar_enable_;
     }
 
     void reset_estimator() {
         estimator_ = std::make_unique<RelativeIMMUKFEstimator>(dt_cam_, focal_length_, w_guess_, R_b2c_, g_drag_coeff_);
+        if (radar_enable_) estimator_->max_range_ = radar_max_range_;
     }
 
     void reset_control_cache() {
@@ -1322,6 +1600,347 @@ private:
         const auto period = std::chrono::duration<double>(1.0 / control_rate_);
         control_timer_ = this->create_wall_timer(
             period, std::bind(&InterceptorNodeRelativeIMMUKF::control_timer_callback, this), timer_callback_group_);
+    }
+
+    // Output smoothing of the estimator's RELATIVE velocity (Fix B): EMA the raw v_rel so a
+    // single-frame swing never reaches guidance. Shared by the vision and radar paths so a
+    // mid-course -> terminal handover does not step the velocity fed to the controller.
+    Eigen::Vector3d smooth_rel_vel(const Eigen::Vector3d& v_raw, double t_now) {
+        if (vel_smooth_tc_ <= 1e-6) return v_raw;
+        if (has_target_vel_smoothed_ && t_now > last_vel_smooth_t_ &&
+            (t_now - last_vel_smooth_t_) < 1.0) {
+            const double a = clamp((t_now - last_vel_smooth_t_) / vel_smooth_tc_, 0.0, 1.0);
+            target_vel_smoothed_ += a * (v_raw - target_vel_smoothed_);
+        } else {
+            target_vel_smoothed_ = v_raw;
+        }
+        last_vel_smooth_t_ = t_now;
+        has_target_vel_smoothed_ = true;
+        return target_vel_smoothed_;
+    }
+
+    // ---- Radar relay -------------------------------------------------------------------------
+    // Each report carries ONE object (target or interceptor) as a world-ENU nav_msgs/Odometry,
+    // stamped with the MEASUREMENT epoch: the radar publisher holds every sample for the sensor
+    // latency before sending, so header.stamp is genuinely in the past and the lag is recoverable.
+    // A relative measurement needs both objects, so samples are paired by stamp.
+    void radar_callback(const nav_msgs::msg::Odometry::SharedPtr msg, bool is_target) {
+        RadarSample s;
+        s.stamp = rclcpp::Time(msg->header.stamp).seconds();
+        s.pos = Eigen::Vector3d(msg->pose.pose.position.x, msg->pose.pose.position.y,
+                                msg->pose.pose.position.z);
+        s.vel = Eigen::Vector3d(msg->twist.twist.linear.x, msg->twist.twist.linear.y,
+                                msg->twist.twist.linear.z);
+        if (!s.pos.allFinite() || !s.vel.allFinite()) return;
+        s.valid = true;
+        {
+            std::lock_guard<std::mutex> lock(radar_mtx_);
+            if (is_target) { radar_target_ = s; ++radar_msg_target_; }
+            else { radar_own_ = s; ++radar_msg_own_; }
+        }
+        fuse_radar();
+    }
+
+    void fuse_radar() {
+        if (!mission_state_.is_active()) return;
+
+        RadarSample tgt, own;
+        {
+            std::lock_guard<std::mutex> lock(radar_mtx_);
+            tgt = radar_target_;
+            own = radar_own_;
+        }
+        if (!tgt.valid || !own.valid) return;
+        if (std::abs(tgt.stamp - own.stamp) > radar_pair_window_) {
+            RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 2000,
+                "Radar pair rejected: target/interceptor stamps %.3fs apart (radar.pair_window=%.3f)",
+                std::abs(tgt.stamp - own.stamp), radar_pair_window_);
+            return;
+        }
+
+        const double t_meas = std::min(tgt.stamp, own.stamp);
+        const double now = this->get_clock()->now().seconds();
+
+        std::lock_guard<std::mutex> lock(estimator_mtx_);
+        if (t_meas <= radar_last_fused_t_ + 1e-6) return;   // this pair was already consumed
+        radar_last_fused_t_ = t_meas;
+
+        // Latency compensation: extrapolate the relative position from the measurement epoch to
+        // `now` along the measured relative velocity. Both objects are sampled at the same instant,
+        // so the ownship leg of the extrapolation is carried by v_meas as well.
+        // radar_R_yaw_ rotates the radar world frame onto the IMU-referenced estimator frame; the
+        // guidance mixes the two (los_az = atan2(r) - imu_yaw), so a yaw offset here flies the
+        // interceptor at a constant angle off the target.
+        const double lag = clamp(now - t_meas, 0.0, radar_max_delay_comp_);
+        const Eigen::Vector3d v_meas = radar_R_yaw_ * (tgt.vel - own.vel);
+        const Eigen::Vector3d r_meas = radar_R_yaw_ * (tgt.pos - own.pos) + v_meas * lag;
+
+        radar_rel_pos_ = r_meas;
+        radar_rel_time_ = now;
+        radar_has_rel_ = true;
+
+        // Ownship velocity aiding. own_vel_ is otherwise an unbounded IMU integral running since the
+        // MISSION trigger, and it damps the vertical loop — a long wait for the FCU to accept
+        // external control is enough to poison it. This is a slow DRIFT TRIM, not a replacement:
+        // the vertical loop needs own_vel_'s high-frequency content, and blending in a 10 Hz,
+        // lag-delayed radar velocity at a short time constant adds enough phase lag to make that
+        // loop oscillate (throttle bang-bangs between its clamps and takes the whole attitude loop
+        // with it). Keep own_vel_tc long compared with the vertical-loop time constant.
+        if (radar_own_vel_aiding_) {
+            const Eigen::Vector3d v_own_radar = radar_R_yaw_ * own.vel;
+            const double dt_aid = (radar_own_vel_t_ > 0.0)
+                ? clamp(now - radar_own_vel_t_, 0.001, 1.0) : radar_own_vel_tc_;
+            radar_own_vel_t_ = now;
+            std::lock_guard<std::mutex> ol(odom_mtx_);
+            if (!own_vel_aided_) {
+                own_vel_ = v_own_radar;   // strapdown has no absolute anchor: hard-seed the first fix
+                own_vel_aided_ = true;
+            } else {
+                own_vel_ += clamp(dt_aid / radar_own_vel_tc_, 0.0, 1.0) * (v_own_radar - own_vel_);
+            }
+        }
+
+        const bool vision_fresh = (now - last_vision_time_) < radar_vision_hold_;
+        // Terminal vision guidance owns the endgame outright: once vision is locked AND delivering,
+        // the radar contributes nothing — its metre-level noise can only degrade a converged
+        // monocular solution, and the radar's range knowledge has already been transferred into the
+        // locked target width. It re-engages the moment vision stops delivering, i.e. when the pass
+        // has failed, which is why the hold is short (radar.vision_hold) rather than a latch.
+        if (radar_disable_after_lock_ && vision_locked_ && vision_fresh) return;
+
+        Eigen::Vector3d dv_own = Eigen::Vector3d::Zero();
+        {
+            std::lock_guard<std::mutex> ol(odom_mtx_);
+            if (last_imu_time_ < 0.0 || !yaw_align_init_) {
+                RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 1000,
+                    "Radar track received but IMU not ready yet");
+                return;
+            }
+            dv_own = dv_own_accum_;
+            dv_own_accum_.setZero();
+            last_dv_own_ = dv_own;
+        }
+
+        const bool was_initialized = estimator_->initialized;
+        // Window the IMU accumulator actually covers — the interval since the previous estimator
+        // step, whichever source produced it. Needed for a_own below: dividing by the camera dt
+        // would treble it whenever radar is the only measurement source.
+        const double dt_step = estimator_->has_last_cap_time
+            ? clamp(now - estimator_->last_cap_time, 0.001, 0.3) : dt_cam_;
+        const auto result = estimator_->process_radar(r_meas, v_meas, now, dv_own,
+                                                      radar_pos_std_, radar_vel_std_);
+        if (!result.first) return;
+        if (!was_initialized) {
+            transition_to_state(MissionState::BLIND_FLIGHT, "Radar relay acquired target");
+            RCLCPP_INFO(this->get_logger(),
+                "Radar handover start: r=[%.1f %.1f %.1f] |r|=%.1fm |v_rel|=%.1fm/s lag=%.0fms",
+                r_meas(0), r_meas(1), r_meas(2), r_meas.norm(), v_meas.norm(), lag * 1000.0);
+        }
+
+        // Guidance stays on the radar unless vision is BOTH locked and current: the pixel
+        // measurement is still fused above either way, this only decides who owns the command.
+        if (!vision_locked_ || !vision_fresh) {
+            fill_cache_from_radar(result.second, now, dt_step);
+        }
+
+        RCLCPP_INFO_THROTTLE(this->get_logger(), *this->get_clock(), THROTTLE_INTERVAL_MS * 5,
+            "[RADAR] meas=[%.1f %.1f %.1f] est=[%.1f %.1f %.1f] |r|=%.1f lag=%.0fms",
+            r_meas(0), r_meas(1), r_meas(2),
+            result.second(0), result.second(1), result.second(2),
+            result.second.segment<3>(0).norm(), lag * 1000.0);
+    }
+
+    // Mid-course guidance cache from the radar-driven estimate. Same contract as the vision path
+    // (bbox_size = 0 so the terminal brake stays disarmed), but the LOS rate is taken ANALYTICALLY
+    // from the filtered relative state instead of differencing the bearing: at 10 Hz with
+    // metre-level position noise, bearing differencing would inject ~0.3 rad/s straight into the
+    // PN lateral command.
+    void fill_cache_from_radar(const Eigen::VectorXd& state, double t_now, double dt_step) {
+        const Eigen::Vector3d r_est = state.segment<3>(0);
+        const Eigen::Vector3d v_est = smooth_rel_vel(state.segment<3>(3), t_now);
+
+        const double los_az_world = std::atan2(r_est(1), r_est(0));
+        const double los_el = std::asin(clamp(r_est(2) / std::max(r_est.norm(), 0.1), -1.0, 1.0));
+        const double r_xy2 = std::max(r_est(0) * r_est(0) + r_est(1) * r_est(1), 1.0);
+        const double raw_rate = (r_est(0) * v_est(1) - r_est(1) * v_est(0)) / r_xy2;
+        constexpr double alpha_radar_los = 0.3;
+        los_rate_ema_ = has_prev_los_
+            ? (1.0 - alpha_radar_los) * los_rate_ema_ + alpha_radar_los * raw_rate
+            : raw_rate;
+        prev_los_az_world_ = los_az_world;
+        prev_los_t_ = t_now;
+        has_prev_los_ = true;
+
+        ControlCacheData cache;
+        cache.valid = true;
+        cache.has_bbox = false;
+        cache.r_est = r_est;
+        cache.v_est = v_est;
+        cache.los_az_world = los_az_world;
+        cache.los_el = los_el;
+        cache.los_rate = los_rate_ema_;
+        cache.source_time = t_now;
+        cache.update_time = this->get_clock()->now().seconds();
+        cache.bbox_size = 0.0;
+        cache.target_speed = std::min(v_est.norm(), 15.0);
+        cache.a_own = last_dv_own_ / std::max(dt_step, 1e-3);
+        {
+            std::lock_guard<std::mutex> cache_lock(control_cache_mtx_);
+            control_cache_ = cache;
+        }
+    }
+
+    // Transition bookkeeping run on every bbox message while the radar relay is active.
+    // Called with estimator_mtx_ held.
+    //
+    // Width handover: the monocular scale W is the one quantity a single camera cannot observe, and
+    // the whole terminal range estimate r = focal*W/s rides on it. During the overlap window — the
+    // target is inside the FOV AND the radar still has a valid range — W falls straight out of the
+    // pinhole relation W = s * r_radar / focal. Averaging over handover_frames rejects per-frame
+    // bbox noise; the result is then LOCKED so the terminal phase runs on a trusted scale instead
+    // of the configured guess.
+    // A detection that disagrees with the radar track is a false positive, and ONE fused phantom
+    // pixel measurement is enough to walk the monocular width off (observed w_est 1.50 -> 0.66 with
+    // the estimate slewing tens of metres). Angular check always; the range check only once the
+    // width is trusted, because r = focal*W/s is meaningless before that.
+    bool bbox_matches_radar(const Eigen::Vector3d& los_nav, double bbox_s, double* d_az_out) {
+        if (!radar_bbox_gate_) return true;
+        const bool radar_fresh = radar_has_rel_ &&
+            (this->get_clock()->now().seconds() - radar_rel_time_) < radar_timeout_;
+        const double r_radar = radar_rel_pos_.norm();
+        if (!radar_fresh || r_radar < 1.0 || los_nav.norm() < 0.5) return true;
+
+        const Eigen::Vector3d u_radar = radar_rel_pos_ / r_radar;
+        const double az_cam = std::atan2(los_nav(1), los_nav(0));
+        const double az_radar = std::atan2(u_radar(1), u_radar(0));
+        if (d_az_out) {
+            *d_az_out = std::atan2(std::sin(az_cam - az_radar), std::cos(az_cam - az_radar));
+        }
+
+        const double d_ang = std::acos(clamp(los_nav.normalized().dot(u_radar), -1.0, 1.0));
+        if (d_ang > handover_max_bearing_err_) {
+            RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 500,
+                "[BBOX-REJECT] LOS %.1fdeg off the radar track (limit %.1f), bbox=%.0fpx",
+                d_ang * 180.0 / M_PI, handover_max_bearing_err_ * 180.0 / M_PI, bbox_s);
+            return false;
+        }
+        if (width_locked_ && bbox_s > 1.0) {
+            const double r_vis = focal_length_ * estimator_->imm_ukf->x(9) / bbox_s;
+            const double ratio = r_vis / r_radar;
+            if (ratio > radar_bbox_range_ratio_ || ratio < 1.0 / radar_bbox_range_ratio_) {
+                RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 500,
+                    "[BBOX-REJECT] implied range %.0fm vs radar %.0fm, bbox=%.0fpx",
+                    r_vis, r_radar, bbox_s);
+                return false;
+            }
+        }
+        return true;
+    }
+
+    // Called with only radar-validated frames. bbox_ok false means "no usable detection this frame"
+    // — either the detector saw nothing or the detection failed the radar cross-check.
+    void update_vision_handover(bool bbox_ok, double bbox_s, double t_now, double d_az) {
+        if (!bbox_ok) {
+            vision_frames_ = 0;   // the vision LOCK still requires an unbroken run (false-positive guard)
+            vision_lock_t0_ = -1.0;
+            // The width buffer is NOT cleared here: a single transient missed frame (radar stall,
+            // one rejected bbox) no longer throws away the accumulated width samples. The rolling
+            // window below ages them out instead, so the width lock survives brief gaps.
+            if (vision_locked_ && (t_now - last_vision_time_) > vision_lost_timeout_) {
+                vision_locked_ = false;
+                RCLCPP_WARN(this->get_logger(),
+                    "Vision gone %.1fs — radar relay owns guidance again",
+                    t_now - last_vision_time_);
+            }
+            return;
+        }
+        last_vision_time_ = t_now;
+
+        const bool radar_fresh = radar_has_rel_ &&
+            (this->get_clock()->now().seconds() - radar_rel_time_) < radar_timeout_;
+
+        // A STEADY difference here is the radar/IMU world-frame yaw mismatch (dial it out with
+        // radar.yaw_offset_deg); azimuth only, that is the component a yaw offset corrupts.
+        if (radar_fresh && std::isfinite(d_az)) {
+            bearing_err_ema_ = has_bearing_err_ ? (0.8 * bearing_err_ema_ + 0.2 * d_az) : d_az;
+            has_bearing_err_ = true;
+            RCLCPP_INFO_THROTTLE(this->get_logger(), *this->get_clock(), 1000,
+                "[FRAME] cam-radar az diff=%.1f deg (ema %.1f) — a steady value is radar.yaw_offset_deg",
+                d_az * 180.0 / M_PI, bearing_err_ema_ * 180.0 / M_PI);
+        }
+        if (!width_locked_ && radar_fresh && bbox_s > 1.0) {
+            // Filtered, radar-anchored range (the same quantity the controller trusts) — strictly
+            // lower-variance than the raw single-sample radar_rel_pos_, so the locked width does not
+            // inherit per-sample latency-extrapolation noise/bias. Runs before process_camera, i.e. on
+            // the pre-camera-update (radar-predicted) blended state — exactly the independent anchor.
+            const double r_filter = estimator_ ? estimator_->imm_ukf->x.head<3>().norm() : 0.0;
+            if (r_filter > 1.0 && r_filter < handover_max_range_) {
+                const double w_meas = clamp(bbox_s * r_filter / focal_length_, width_min_, width_max_);
+                width_samples_.push_back({w_meas, t_now});
+                // Rolling window: age out stale samples so a transient missed frame (which no longer
+                // wipes the buffer) does not leave stale data, and the median tracks a moving range.
+                width_samples_.erase(
+                    std::remove_if(width_samples_.begin(), width_samples_.end(),
+                                   [&](const WidthSample& s){ return (t_now - s.t) > width_window_s_; }),
+                    width_samples_.end());
+                if (estimator_) estimator_->w_guess = w_meas;   // helps a monocular-only re-init
+                if (static_cast<int>(width_samples_.size()) >= handover_frames_) {
+                    // MAD outlier rejection: a phantom bbox that passes the bearing gate but has a wild
+                    // size is rejected instead of contaminating the median (observed w_est 1.5 -> 0.66).
+                    std::vector<double> ws;
+                    for (const auto& s : width_samples_) ws.push_back(s.w);
+                    std::sort(ws.begin(), ws.end());
+                    const double med = ws[ws.size() / 2];
+                    double mad = 0.0;
+                    for (double w : ws) mad += std::abs(w - med);
+                    mad /= std::max((size_t)1, ws.size());
+                    constexpr double kappa = 3.0;
+                    std::vector<double> kept;
+                    for (const auto& s : width_samples_) {
+                        if (mad < 1e-6 || std::abs(s.w - med) <= kappa * 1.4826 * mad) kept.push_back(s.w);
+                    }
+                    if (!kept.empty()) std::sort(kept.begin(), kept.end());
+                    const double w_fused = kept.empty() ? med : kept[kept.size() / 2];
+                    if (estimator_) estimator_->lock_width(w_fused);
+                    width_locked_ = true;
+                    RCLCPP_INFO(this->get_logger(),
+                        "[HANDOVER] Target width fixed from radar range: W=%.2fm "
+                        "(median %.2f, kept %zu/%zu, r_filter=%.1fm bbox=%.1fpx focal=%.0f)",
+                        w_fused, med, kept.size(), ws.size(), r_filter, bbox_s, focal_length_);
+                }
+            } else {
+                RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 2000,
+                    "Width fix skipped: filtered range %.0fm outside (1, %.0f]m",
+                    r_filter, handover_max_range_);
+            }
+        }
+
+        if (!vision_locked_) {
+            if (vision_frames_ == 0) vision_lock_t0_ = t_now;
+            ++vision_frames_;
+            // Frame count AND elapsed time: a burst of consecutive false positives can clear a pure
+            // frame count in a fraction of a second, which is how a phantom took the terminal phase.
+            const bool run_ok = vision_frames_ >= handover_frames_ &&
+                                (t_now - vision_lock_t0_) >= lock_min_duration_;
+            // Handing the endgame to vision before the radar has fixed the width would run the
+            // terminal range r = focal*W/s on the configured GUESS, and nothing would pin W
+            // afterwards — it drifts with every update. Only skip this when there is no radar at all.
+            const bool width_ready = width_locked_ || !radar_has_rel_;
+            if (run_ok && width_ready) {
+                vision_locked_ = true;
+                RCLCPP_INFO(this->get_logger(),
+                    "[HANDOVER] Visual lock: %d validated frames over %.1fs, W=%.2fm%s "
+                    "— terminal guidance on vision, radar standing by",
+                    vision_frames_, t_now - vision_lock_t0_,
+                    estimator_ ? estimator_->imm_ukf->x(9) : 0.0,
+                    width_locked_ ? " (radar-fixed)" : " (guess, no radar)");
+                transition_to_state(MissionState::TRACKING, "Vision lock acquired");
+            } else if (run_ok) {
+                RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 2000,
+                    "Visual run stable (%d frames) but the target width is not radar-fixed yet "
+                    "— terminal vision guidance withheld", vision_frames_);
+            }
+        }
     }
 
     void bbox_callback(const vision_msgs::msg::Detection2D::SharedPtr msg) {
@@ -1392,40 +2011,44 @@ private:
             estimator_->R_b2c = R_b2c_;
         }
 
+        // Needs the rebuilt R_b2c_, so it runs here rather than at message intake.
+        bool bbox_ok = has_bbox;
+        if (radar_enable_) {
+            double d_az = std::numeric_limits<double>::quiet_NaN();
+            if (has_bbox) {
+                const Eigen::Vector3d los_nav_meas =
+                    pixel_to_los_nav(u, v, focal_length_, R_b2n, R_b2c_);
+                bbox_ok = bbox_matches_radar(los_nav_meas, s, &d_az);
+            }
+            update_vision_handover(bbox_ok, s, t_now, d_az);
+        }
+
         const bool was_initialized = estimator_->initialized;
-        const auto result = estimator_->process_camera(has_bbox, u, v, s, t_now, R_b2n, dv_own);
+        const auto result = estimator_->process_camera(bbox_ok, u, v, s, t_now, R_b2n, dv_own);
 
         if (!was_initialized && estimator_->initialized) {
             transition_to_state(MissionState::TRACKING, "Target initialized");
         }
         RCLCPP_INFO_THROTTLE(this->get_logger(), *this->get_clock(), THROTTLE_INTERVAL_MS,
-            "bbox=%d size=%.1f init=%d->%d", has_bbox, s, was_initialized, estimator_->initialized);
+            "bbox=%d%s size=%.1f init=%d->%d", has_bbox, (has_bbox && !bbox_ok) ? "(rejected)" : "",
+            s, was_initialized, estimator_->initialized);
 
         if (!estimator_->initialized) return;
 
+        // Mid-course: the radar relay owns guidance until the visual lock is confirmed. The pixel
+        // measurement was still fused above — only the control cache stays on the radar solution,
+        // so a couple of noisy first detections cannot yank the command.
+        if (!vision_locked_) return;
+
         // Relative-state estimator: x[0:3] IS the relative position, x[3:6] the relative velocity.
         Eigen::Vector3d r_est = result.second.segment<3>(0);
-        Eigen::Vector3d rel_vel_now = result.second.segment<3>(3);
-        // Output smoothing of the relative velocity (Fix B): EMA the raw UKF v_rel so single-frame
-        // swings do not reach guidance. vel_smooth_tc_<=0 disables it.
-        if (vel_smooth_tc_ > 1e-6) {
-            if (has_target_vel_smoothed_ && t_now > last_vel_smooth_t_ &&
-                (t_now - last_vel_smooth_t_) < 1.0) {
-                const double a = clamp((t_now - last_vel_smooth_t_) / vel_smooth_tc_, 0.0, 1.0);
-                target_vel_smoothed_ += a * (rel_vel_now - target_vel_smoothed_);
-            } else {
-                target_vel_smoothed_ = rel_vel_now;
-            }
-            last_vel_smooth_t_ = t_now;
-            has_target_vel_smoothed_ = true;
-            rel_vel_now = target_vel_smoothed_;
-        }
+        const Eigen::Vector3d rel_vel_now = smooth_rel_vel(result.second.segment<3>(3), t_now);
         const Eigen::Vector3d v_est = rel_vel_now;   // relative velocity (no ownship vel available)
 
         double los_az_world = std::atan2(r_est(1), r_est(0));
         double los_el = std::asin(clamp(r_est(2) / std::max(r_est.norm(), 0.1), -1.0, 1.0));
 
-        if (has_bbox) {
+        if (bbox_ok) {
             // bbox is real-time: capture orientation == current orientation.
             const Eigen::Vector3d los_nav = pixel_to_los_nav(u, v, focal_length_, R_b2n, R_b2c_);
             los_az_world = std::atan2(los_nav(1), los_nav(0));
@@ -1458,7 +2081,7 @@ private:
 
         ControlCacheData cache;
         cache.valid = true;
-        cache.has_bbox = has_bbox;
+        cache.has_bbox = bbox_ok;
         cache.r_est = r_est;
         cache.v_est = v_est;
         cache.los_az_world = los_az_world;
@@ -1466,7 +2089,7 @@ private:
         cache.los_rate = los_rate_ema_;
         cache.source_time = t_now;
         cache.update_time = this->get_clock()->now().seconds();
-        cache.bbox_size = s;
+        cache.bbox_size = bbox_ok ? s : 0.0;
         // Relative-speed proxy (ownship absolute speed unobservable without odom): drives the
         // speed-aware terminal-brake floor. Mirror of the Python prototype's target_speed.
         cache.target_speed = std::min(rel_vel_now.norm(), 15.0);
@@ -1498,6 +2121,14 @@ private:
 
     void control_timer_callback() {
         if (!mission_state_.is_active() || !controller_) return;
+
+        // Silent radar is otherwise invisible: the node just behaves like the vision-only variant.
+        if (radar_enable_ && !radar_has_rel_) {
+            RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 2000,
+                "Radar ENABLED but no usable track yet (%s: %lu msgs, %s: %lu msgs)",
+                radar_topic_target_.c_str(), radar_msg_target_,
+                radar_topic_own_.c_str(), radar_msg_own_);
+        }
 
         ControlCacheData cache;
         {
@@ -1719,7 +2350,8 @@ private:
         const auto ctrl = controller_->compute_control(roll, pitch, yaw, cache.r_est, cache.v_est,
                                                        los_az, cache.los_el, t_rel, v_closing,
                                                        cache.bbox_size, v_z, cache.target_speed,
-                                                       cache.los_rate, cache.a_own, boresight_el_meas);
+                                                       cache.los_rate, cache.a_own, boresight_el_meas,
+                                                       (radar_enable_ && radar_has_rel_ && !vision_locked_));
         if (!std::isfinite(ctrl[0]) || !std::isfinite(ctrl[1]) || !std::isfinite(ctrl[2]) || !std::isfinite(ctrl[3])) {
             RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), THROTTLE_INTERVAL_MS*4,
                 "Skipping non-finite control command");
@@ -1788,6 +2420,27 @@ private:
             reset_estimator();
             reset_control_cache();
             if (controller_) controller_->reset_dynamic_state();
+            vision_locked_ = !radar_enable_;
+            vision_frames_ = 0;
+            last_vision_time_ = -1.0;
+            width_locked_ = false;
+            width_samples_.clear();
+            radar_last_fused_t_ = -1.0;
+            radar_rel_time_ = -1.0;
+            radar_has_rel_ = false;
+            radar_rel_pos_.setZero();
+            radar_own_vel_t_ = -1.0;
+            own_vel_aided_ = false;
+            bearing_err_ema_ = 0.0;
+            has_bearing_err_ = false;
+            vision_lock_t0_ = -1.0;
+            radar_msg_target_ = 0;
+            radar_msg_own_ = 0;
+            {
+                std::lock_guard<std::mutex> rl(radar_mtx_);
+                radar_target_ = RadarSample();
+                radar_own_ = RadarSample();
+            }
             {
                 std::lock_guard<std::mutex> ol(odom_mtx_);
                 dv_own_accum_.setZero();
@@ -1957,8 +2610,67 @@ private:
     rclcpp::Subscription<sensor_msgs::msg::Imu>::SharedPtr imu_sub_;
     rclcpp::Subscription<vision_msgs::msg::Detection2D>::SharedPtr bbox_sub_;
     rclcpp::Subscription<sensor_msgs::msg::Imu>::SharedPtr gimbal_sub_;
+    rclcpp::Subscription<nav_msgs::msg::Odometry>::SharedPtr radar_target_sub_;
+    rclcpp::Subscription<nav_msgs::msg::Odometry>::SharedPtr radar_own_sub_;
     rclcpp::Publisher<quadrotor_msgs::msg::ControlCommand>::SharedPtr control_pub_;
     rclcpp::Publisher<std_msgs::msg::Bool>::SharedPtr mission_state_pub_;
+
+    // ---- Radar relay state -------------------------------------------------------------------
+    struct RadarSample {
+        bool valid = false;
+        double stamp = 0.0;                              // measurement epoch (NOT arrival time)
+        Eigen::Vector3d pos = Eigen::Vector3d::Zero();    // world ENU
+        Eigen::Vector3d vel = Eigen::Vector3d::Zero();    // world ENU
+    };
+    std::mutex radar_mtx_;
+    RadarSample radar_target_;
+    RadarSample radar_own_;
+    bool radar_enable_ = false;
+    std::string radar_topic_target_ = "/fpv/radar/target";
+    std::string radar_topic_own_ = "/fpv/radar/interceptor";
+    double radar_pos_std_ = 3.0;
+    double radar_vel_std_ = 1.0;
+    double radar_pair_window_ = 0.15;
+    double radar_timeout_ = 1.0;
+    double radar_max_delay_comp_ = 0.3;
+    double radar_max_range_ = 800.0;
+    bool radar_disable_after_lock_ = true;
+    double radar_vision_hold_ = 0.35;
+    bool radar_own_vel_aiding_ = true;
+    double radar_own_vel_tc_ = 5.0;
+    double radar_own_vel_t_ = -1.0;
+    bool own_vel_aided_ = false;
+    double handover_max_bearing_err_ = 0.20;
+    bool radar_bbox_gate_ = true;
+    double radar_bbox_range_ratio_ = 2.0;
+    double lock_min_duration_ = 0.7;
+    double vision_lock_t0_ = -1.0;
+    uint64_t radar_msg_target_ = 0;
+    uint64_t radar_msg_own_ = 0;
+    Eigen::Matrix3d radar_R_yaw_ = Eigen::Matrix3d::Identity();
+    // Camera-vs-radar LOS azimuth discrepancy. A steady nonzero value is the radar/IMU world-frame
+    // yaw mismatch and should be dialled out with radar.yaw_offset_deg.
+    double bearing_err_ema_ = 0.0;
+    bool has_bearing_err_ = false;
+    // Last fused relative position + when it was fused (guarded by estimator_mtx_). Kept even after
+    // the visual lock stops radar updates, because it is the range reference for the width handover.
+    double radar_last_fused_t_ = -1.0;
+    Eigen::Vector3d radar_rel_pos_ = Eigen::Vector3d::Zero();
+    double radar_rel_time_ = -1.0;
+    bool radar_has_rel_ = false;
+    // Radar -> vision handover (guarded by estimator_mtx_).
+    int handover_frames_ = 5;
+    double handover_max_range_ = 120.0;
+    double width_min_ = 0.3;
+    double width_max_ = 5.0;
+    double vision_lost_timeout_ = 1.5;
+    bool vision_locked_ = true;      // radar disabled => vision owns guidance from the first frame
+    int vision_frames_ = 0;
+    double last_vision_time_ = -1.0;
+    bool width_locked_ = false;
+    struct WidthSample { double w; double t; };
+    std::vector<WidthSample> width_samples_;
+    double width_window_s_ = 1.5;   // s, rolling window for the width-median buffer (survives transient misses)
 
     rclcpp::TimerBase::SharedPtr control_timer_;
     rclcpp::CallbackGroup::SharedPtr timer_callback_group_;

@@ -48,6 +48,11 @@ utils.h                                  — DroneEKF(19D), MissionStateMachine,
 - **Control output**: `quadrotor_msgs::ControlCommand` — `collective_thrust` + body rates `[omega_x, omega_y, omega_z]` (same topic/format as NMPC variants)
 - **Thread safety**: `std::mutex` (not shared_mutex)
 - **Topics**: imu=`/mavros/imu/data`, bbox=`/fpv/target_bbox`, odom=`/fpv/odom`, mission_launch=`/fpv/tracker_trigger`, mission=`/fpv/mission_start`, control=`/fpv/control_command`, mission_state=`/fpv/mission_state`
+- **Radar relay (optional, `radar.enable`, off by default)**: `/fpv/radar/target` + `/fpv/radar/interceptor`
+  (`nav_msgs/Odometry`, world ENU, `header.stamp` = measurement epoch) differenced into a relative
+  `[r, v_rel]` LINEAR update (`update_posvel`) for mid-course guidance outside the camera FOV. On
+  visual acquisition the target width is fixed from `bbox_size * r_radar / focal` and locked. See
+  `AGENTS.md` for the full contract.
 
 ## Build
 
@@ -109,4 +114,7 @@ cd ~/workspace/fpv_ws && colcon build --packages-select drone_interceptor
 - Always use solver output even with status≠0 (suboptimal solution > fallback)
 - `penalty_coeff` must be TTA-based with cap at 30 to prevent close-range solver explosion
 - `relative_imm_ukf` node: `use_simulation` defaults `False` in launch — verify before AirSim runs
+- Radar relay is OFF unless `radar.enable` / `launch_relative_imm_ukf.py use_radar:=True`
+- The width handover rides on `focal_length_` (from `camera.width_px` + `camera.fov_deg`);
+  `airsim_settings.json` (30° / 960x960) does NOT match the launch defaults (72° / 1920x1200)
 - `acados`/`blasfeo`/`hpipm`/`Eigen` not declared in `package.xml` — `rosdep` won't install; manual system install required

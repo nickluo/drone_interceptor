@@ -7,6 +7,8 @@ Publishes:
   /mavros/imu/data   (sensor_msgs/Imu, BEST_EFFORT) @ 100 Hz — body IMU (attitude + spec force)
   /fpv/gimbal        (sensor_msgs/Imu, BEST_EFFORT) @ 100 Hz — camera-to-world orientation q_C_W
   /fpv/target_bbox   (vision_msgs/Detection2D, BEST_EFFORT) @ 30 Hz — camera projection
+  /fpv/radar/target      (nav_msgs/Odometry) @ 10 Hz — radar relay track (noisy + delayed)
+  /fpv/radar/interceptor (nav_msgs/Odometry) @ 10 Hz — radar relay track (noisy + delayed)
   /fpv/tracker_trigger (std_msgs/Header "MISSION") — one-shot mission launch
 
 Subscribes:
@@ -22,7 +24,12 @@ Usage:
   ros2 launch drone_interceptor launch_relative_imm_ukf.py   # terminal 1
   python3 ros2_sim_node.py --scenario nominal                 # terminal 2
 
-Scenarios: nominal, crossing, maneuvering, dropout, noise, wrong_w
+  # radar relay mid-course guidance (target starts outside the camera FOV):
+  ros2 launch drone_interceptor launch_relative_imm_ukf.py use_radar:=True
+  python3 ros2_sim_node.py --scenario radar_relay
+
+Scenarios: nominal, crossing, maneuvering, dropout, noise, wrong_w,
+           radar_relay, radar_far, radar_maneuver, radar_only
 """
 
 import argparse
@@ -93,6 +100,19 @@ FOV_HALF_V = math.atan2(CAM_HEIGHT_PX / 2.0, FOCAL_LENGTH)  # vertical half-FOV 
 
 # Camera frame rate (fixed for the sim — the C++ node measures dt_cam adaptively from timestamps)
 CAM_RATE = 30.0
+
+# ---------------------------------------------------------------------------
+# Simulated radar relay. Mirrors airsim_tracker/radar_relay_node.py: ground truth for BOTH
+# vehicles, corrupted with Gaussian noise and held for a sampled latency before publishing, with
+# header.stamp = the MEASUREMENT epoch so the consumer can recover the lag.
+# ---------------------------------------------------------------------------
+RADAR_RATE = 10.0            # Hz
+RADAR_POS_NOISE = 2.0        # m, constant 1-sigma per axis
+RADAR_RANGE_NOISE_FRAC = 0.005   # extra 1-sigma as a fraction of slant range
+RADAR_POS_NOISE_MAX = 5.0    # m, cap on the total position 1-sigma
+RADAR_VEL_NOISE = 0.5        # m/s, 1-sigma per axis
+RADAR_DELAY_MIN = 0.05       # s
+RADAR_DELAY_MAX = 0.10       # s
 
 # Gimbal (bias from config; tau is sim-only — models the servo lag, no C++ counterpart)
 GIMBAL_BIAS = math.radians(_CFG.get('camera', {}).get('gimbal_bias_deg', 5.0))
@@ -311,6 +331,51 @@ SCENARIOS = {
         uav_init=[0.0, 0.0, 10.0], uav_yaw=0.0,
         sim_time=30.0, noise_pos=1.5, noise_size=2.0,
         target_width=0.8, dropout=None),
+    # --- Radar relay scenarios -------------------------------------------------------------
+    # The target starts OUTSIDE the camera FOV (bearing beyond the horizontal half-FOV) and at a
+    # range where a real detector could not resolve it anyway (detect_min_size gates the bbox on
+    # apparent size). Guidance must therefore run on the radar relay until the target is both in
+    # frame and large enough, at which point the width handover arms the vision terminal phase.
+    'radar_relay': dict(
+        target_init=[120.0, 95.0, 25.0],
+        vel_fn=lambda t: [-4.0, -3.0, 0.0],
+        uav_init=[0.0, 0.0, 10.0], uav_yaw=0.0,
+        sim_time=45.0, noise_pos=1.5, noise_size=2.0,
+        target_width=1.5, dropout=None,
+        detect_min_size=25.0, radar=True),
+    'radar_far': dict(
+        target_init=[210.0, -160.0, 40.0],
+        vel_fn=lambda t: [-6.0, 4.0, -0.5],
+        uav_init=[0.0, 0.0, 10.0], uav_yaw=0.0,
+        sim_time=60.0, noise_pos=1.5, noise_size=2.0,
+        target_width=1.5, dropout=None,
+        detect_min_size=25.0, radar=True),
+    'radar_maneuver': dict(
+        target_init=[110.0, 85.0, 30.0],
+        vel_fn=lambda t: [-12 * 0.25 * math.sin(0.25 * t) - 3.0,
+                          12 * 0.25 * math.cos(0.25 * t) - 2.0, 0.0],
+        uav_init=[0.0, 0.0, 10.0], uav_yaw=0.0,
+        sim_time=50.0, noise_pos=1.5, noise_size=2.0,
+        target_width=1.5, dropout=None,
+        detect_min_size=25.0, radar=True),
+    # Pure radar guidance: the detector never fires, so the whole engagement runs on the relay.
+    # Bounds how close radar-only guidance can get (no visual terminal phase).
+    'radar_only': dict(
+        target_init=[120.0, 95.0, 25.0],
+        vel_fn=lambda t: [-4.0, -3.0, 0.0],
+        uav_init=[0.0, 0.0, 10.0], uav_yaw=0.0,
+        sim_time=45.0, noise_pos=1.5, noise_size=2.0,
+        target_width=1.5, dropout=None,
+        detect_min_size=1e9, radar=True),
+    # Detector false positives at a random bearing and size, as observed in AirSim. The radar
+    # consistency gate must reject them: fusing one is enough to walk the monocular width off.
+    'radar_falsepos': dict(
+        target_init=[120.0, 95.0, 25.0],
+        vel_fn=lambda t: [-4.0, -3.0, 0.0],
+        uav_init=[0.0, 0.0, 10.0], uav_yaw=0.0,
+        sim_time=45.0, noise_pos=1.5, noise_size=2.0,
+        target_width=1.5, dropout=None,
+        detect_min_size=25.0, radar=True, false_positive_prob=0.25),
 }
 
 
@@ -371,6 +436,11 @@ class SimNode(Node):
         self.bbox_pub = self.create_publisher(Detection2D, '/fpv/target_bbox', reliable_qos)
         self.trigger_pub = self.create_publisher(Header, '/fpv/tracker_trigger', 10)
         self.gimbal_pub = self.create_publisher(Imu, '/fpv/gimbal', sensor_qos)
+        self.radar_enabled = bool(scenario.get('radar', False))
+        if self.radar_enabled:
+            self.radar_target_pub = self.create_publisher(Odometry, '/fpv/radar/target', reliable_qos)
+            self.radar_own_pub = self.create_publisher(Odometry, '/fpv/radar/interceptor', reliable_qos)
+            self.radar_queue = []   # (release_time, target_msg, own_msg)
 
         # Subscribers
         self.control_sub = self.create_subscription(
@@ -395,6 +465,12 @@ class SimNode(Node):
         self.intercepted = False
         self.intercept_t = -1.0
         self.min_range = 1e9
+        # Radar-relay handover metrics
+        self.first_vision_t = -1.0
+        self.first_vision_range = -1.0
+        self.min_range_before_vision = 1e9
+        self.vision_frames = 0
+        self.false_pos_emitted = 0
 
         # Timers
         self.dt_ctrl = 1.0 / CONTROL_RATE
@@ -402,11 +478,58 @@ class SimNode(Node):
         self.control_timer = self.create_timer(self.dt_ctrl, self.control_loop)
         self.cam_timer = self.create_timer(self.dt_cam, self.cam_loop)
         self.launch_timer = self.create_timer(1.0, self.launch_once)
+        if self.radar_enabled:
+            self.radar_timer = self.create_timer(1.0 / RADAR_RATE, self.radar_sample)
+            self.radar_dispatch_timer = self.create_timer(0.005, self.radar_dispatch)
 
         self.get_logger().info(
             f"Sim node ready. focal={FOCAL_LENGTH:.1f} h_fov={CAM_FOV_DEG} "
             f"v_fov={2*math.degrees(FOV_HALF_V):.1f} res={CAM_WIDTH_PX}x{CAM_HEIGHT_PX} "
             f"gimbal(tau={GIMBAL_TAU}s bias={math.degrees(GIMBAL_BIAS):.1f}deg)")
+        if self.radar_enabled:
+            det_range = (FOCAL_LENGTH * scenario['target_width'] /
+                         max(scenario.get('detect_min_size', 0.0), 1e-9))
+            self.get_logger().info(
+                f"Radar relay ON: {RADAR_RATE:.0f}Hz pos_noise={RADAR_POS_NOISE:.1f}m"
+                f"(+{RADAR_RANGE_NOISE_FRAC*100:.1f}%/range) vel_noise={RADAR_VEL_NOISE:.1f}m/s "
+                f"delay={RADAR_DELAY_MIN*1e3:.0f}-{RADAR_DELAY_MAX*1e3:.0f}ms | "
+                f"detector arms below ~{det_range:.0f}m")
+
+    # ---------------- radar relay ----------------
+    def radar_sample(self):
+        """Sample ground truth for both vehicles, corrupt it, and queue it for delayed release."""
+        if self.start_time is None:
+            return
+        rng = float(np.linalg.norm(self.target_pos - self.uav.pos))
+        pos_std = min(RADAR_POS_NOISE + RADAR_RANGE_NOISE_FRAC * rng, RADAR_POS_NOISE_MAX)
+        stamp = self.get_clock().now()
+        tgt_msg = self.build_radar_msg(stamp, self.target_pos, self.target_vel, pos_std)
+        own_msg = self.build_radar_msg(stamp, self.uav.pos, self.uav.vel, pos_std)
+        delay = float(np.random.uniform(RADAR_DELAY_MIN, RADAR_DELAY_MAX))
+        self.radar_queue.append((stamp.nanoseconds * 1e-9 + delay, tgt_msg, own_msg))
+
+    def build_radar_msg(self, stamp, pos, vel, pos_std):
+        msg = Odometry()
+        msg.header.stamp = stamp.to_msg()     # MEASUREMENT epoch, not the publish time
+        msg.header.frame_id = "map"
+        msg.child_frame_id = "map"            # twist is world-frame (radar measures ground velocity)
+        p = pos + np.random.normal(0.0, pos_std, 3)
+        v = vel + np.random.normal(0.0, RADAR_VEL_NOISE, 3)
+        msg.pose.pose.position.x = float(p[0])
+        msg.pose.pose.position.y = float(p[1])
+        msg.pose.pose.position.z = float(p[2])
+        msg.pose.pose.orientation.w = 1.0
+        msg.twist.twist.linear.x = float(v[0])
+        msg.twist.twist.linear.y = float(v[1])
+        msg.twist.twist.linear.z = float(v[2])
+        return msg
+
+    def radar_dispatch(self):
+        now = self.get_clock().now().nanoseconds * 1e-9
+        while self.radar_queue and self.radar_queue[0][0] <= now:
+            _, tgt_msg, own_msg = self.radar_queue.pop(0)
+            self.radar_target_pub.publish(tgt_msg)
+            self.radar_own_pub.publish(own_msg)
 
     def launch_once(self):
         if self.mission_launched:
@@ -571,11 +694,38 @@ class SimNode(Node):
             self.uav.pos, self.uav.R_b2n, self.target_pos,
             self.scenario['target_width'], FOCAL_LENGTH, FOV_HALF_H, FOV_HALF_V)
         has_bbox = in_fov
+        # Detector resolution limit: a real detector cannot fire on a target smaller than a few
+        # tens of pixels, which is exactly the regime the radar relay exists to cover.
+        if has_bbox and s < self.scenario.get('detect_min_size', 0.0):
+            has_bbox = False
         # dropout
         if has_bbox and self.scenario['dropout'] is not None:
             a, b = self.scenario['dropout']
             if a <= t < b:
                 has_bbox = False
+        # False positives: the AirSim detector fires on clouds/structures at long range, at a random
+        # bearing and a random (usually small) apparent size. Exercises the radar consistency gate.
+        phantom = False
+        fp_prob = self.scenario.get('false_positive_prob', 0.0)
+        if not has_bbox and fp_prob > 0.0 and np.random.random() < fp_prob:
+            u = float(np.random.uniform(-0.45, 0.45) * CAM_WIDTH_PX)
+            v = float(np.random.uniform(-0.45, 0.45) * CAM_HEIGHT_PX)
+            s = float(np.random.uniform(5.0, 35.0))
+            has_bbox = True
+            phantom = True
+            self.false_pos_emitted += 1
+        if has_bbox and not phantom:
+            self.vision_frames += 1
+            if self.first_vision_t < 0.0:
+                self.first_vision_t = t
+                self.first_vision_range = float(np.linalg.norm(self.target_pos - self.uav.pos))
+                self.get_logger().info(
+                    f"*** FIRST VISION at t={t:.2f}s range={self.first_vision_range:.1f}m "
+                    f"bbox={s:.1f}px ***")
+        elif not has_bbox and self.first_vision_t < 0.0:
+            self.min_range_before_vision = min(
+                self.min_range_before_vision,
+                float(np.linalg.norm(self.target_pos - self.uav.pos)))
         msg = Detection2D()
         msg.header.stamp = self.get_clock().now().to_msg()
         if has_bbox:
@@ -633,6 +783,17 @@ class SimNode(Node):
             f.write(f"Final range: {final_range:.2f}m\n")
             f.write(f"Max LOS rate: {max_los:.4f}rad/s\n")
             f.write(f"NaN commands: {self.log['nan_count']}\n")
+            if self.radar_enabled:
+                f.write(f"Radar relay: enabled ({RADAR_RATE:.0f}Hz, "
+                        f"{RADAR_POS_NOISE:.1f}m+{RADAR_RANGE_NOISE_FRAC*100:.1f}%/range noise, "
+                        f"{RADAR_DELAY_MIN*1e3:.0f}-{RADAR_DELAY_MAX*1e3:.0f}ms delay)\n")
+                f.write(f"Initial range: {r0:.2f}m\n")
+                f.write(f"First vision t: {self.first_vision_t:.2f}s\n")
+                f.write(f"First vision range: {self.first_vision_range:.2f}m\n")
+                f.write(f"Radar-only closure: {r0:.1f}m -> "
+                        f"{self.min_range_before_vision:.1f}m\n")
+                f.write(f"Vision frames: {self.vision_frames}\n")
+                f.write(f"False positives emitted: {self.false_pos_emitted}\n")
             f.write(f"Sim time: {self.log['t'][-1]:.2f}s\n" if self.log['t'] else "Sim time: 0\n")
         self.get_logger().info(
             f"Results: {base}.csv + {base}_summary.txt | "
@@ -648,6 +809,10 @@ def main():
                              'the scenario nominal range (world-frame velocity unchanged)')
     parser.add_argument('--sim_time', type=float, default=None,
                         help='override the scenario sim_time (s)')
+    parser.add_argument('--radar', action='store_true',
+                        help='force-enable the simulated radar relay feed for this scenario')
+    parser.add_argument('--detect_min_size', type=float, default=None,
+                        help='override the detector minimum bbox size (px); 0 = always detect')
     args = parser.parse_args()
 
     scen = dict(SCENARIOS[args.scenario])          # copy so overrides don't mutate SCENARIOS
@@ -657,6 +822,10 @@ def main():
         name = f"{args.scenario}-{args.fov_pos}"
     if args.sim_time is not None:
         scen['sim_time'] = args.sim_time
+    if args.radar:
+        scen['radar'] = True
+    if args.detect_min_size is not None:
+        scen['detect_min_size'] = args.detect_min_size
 
     rclpy.init()
     node = SimNode(name, scen)
