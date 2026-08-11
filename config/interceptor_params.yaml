@@ -60,7 +60,7 @@ interceptor_node_quaternion:
 
       # For focal length based calculation
       # settings for MV-IMX264M
-      # native_width_px: 1920
+      # native_width_px: 1536
       # focal_length_mm: 16.0
       # pixel_size_um: 3.45
 

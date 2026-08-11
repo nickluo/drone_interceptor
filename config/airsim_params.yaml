@@ -59,7 +59,7 @@ interceptor_node_quaternion:
       fov_deg: 30.0
 
       # For focal length based calculation
-      # native_width_px: 1920
+      # native_width_px: 1536
       # focal_length_mm: 12.0
       # pixel_size_um: 3.45
 

@@ -42,8 +42,8 @@ interceptor_node_relative_imm_ukf:
 
     # Camera Intrinsic parameters
     camera:
-      width_px: 1920
-      height_px: 1200
+      width_px: 1536
+      height_px: 960
       fov_deg: 72.0          # horizontal FOV; vertical FOV derived from aspect ratio (~48.8°)
       # Semi-strapdown single-axis pitch gimbal: servo keeps the boresight near-horizontal in the
       # world frame regardless of body pitch (with servo lag). The ACTUAL camera-to-world orientation
@@ -94,6 +94,27 @@ interceptor_node_relative_imm_ukf:
       # interceptor does not overshoot through the target at close range.
       terminal_brake_range: 5.0  # m, below this range engage terminal braking
       terminal_brake_floor: 1.0  # m/s, minimum desired closing speed during terminal brake
+      # Proximity brake engage point as a fraction of terminal_bbox_size (the bbox size at
+      # terminal_brake_range). The proximity brake ramps v_des_eff down to terminal_brake_floor as
+      # the bbox grows past this engage size. Engaging too early (0.2 -> r<25 m) bled speed across
+      # 25->10 m, leaving the interceptor too slow to chase a maneuvering target — it stalled and
+      # the target slid by at ~10 m. 0.4 engages at r<~12 m: keep (cap-limited) speed/energy through
+      # the approach and brake only for the final close approach. Raise to brake later (faster), lower
+      # to brake earlier (slower/steeper).
+      terminal_prox_engage: 0.4
+      # Proximity-brake energy floor as a fraction of the turn-radius cap (sqrt(g*tan(max_tilt)*r)).
+      # The brake ramps v_des_eff down to this floor at close range; 0.7 keeps it >= ~5 m/s at r=5,
+      # preserving maneuvering energy so a maneuvering target can't stall-and-escape (the size-driven
+      # v_closing is noisy in AirSim). The cap still bounds the ceiling; moving_floor still overrides
+      # for fast targets. 0 = the old fixed terminal_brake_floor (1 m/s) floor.
+      prox_floor_frac: 0.7
+      # Scales the turn-radius speed cap (the raw cap is sqrt(g*tan(max_tilt)*r)). At 1.0 the cap
+      # only binds at r~23 m for v_des=15, compressing the entire terminal brake into 23->5 m where
+      # the attitude-lag cascade drops the target out of the FOV. 0.8 binds at r~36 -> the brake is
+      # spread over 36->5 m (gentler, more turn margin), without slowing the mid-course cruise (the
+      # cap is far above v_des at range). Lower (0.7) if a high-speed entry still drops the target;
+      # raise toward 1.0 if it over-slows the approach. prox_floor_frac scales with this cap.
+      turn_radius_cap_factor: 0.8
       # Terminal authority (maneuvering-target tracking).
       terminal_tilt_range: 30.0    # m, below this range the roll clamp relaxes
       # (2) Arrive slower: ramp v_des -> v_terminal over [terminal_decel_range, terminal_brake_range]
@@ -166,6 +187,15 @@ interceptor_node_relative_imm_ukf:
                                    # longer wiped on a single missed frame; stale samples age out over
                                    # this window instead, so the width lock survives transient radar
                                    # stalls / rejected bboxes. MAD outlier rejection runs on top of it.
+      width_min_bbox: 25.0         # px, only anchor the target width from a bbox at least this large.
+                                   # A tiny long-range bbox (e.g. 16px at 186m) is over-bound by the
+                                   # visual tracker and inflates W (observed W~2.26 vs ~1.5). This gate
+                                   # shifts the width lock closer (larger, accurate bbox). Lower = lock
+                                   # sooner/farther; raise if W is still inflated.
+      width_scale: 1.0             # multiplicative correction for tracker over-bounding, applied to the
+                                   # locked width (locked_W *= width_scale). Calibrate from one run as
+                                   # true_width / locked_W — e.g. set 0.66 if it locks 2.26m for a 1.5m
+                                   # target. 1.0 = no correction.
       handover_max_range: 200.0    # m, do not derive a width from a radar range beyond this
       # False-positive rejection. The detector fires on clouds/structures at long range and ONE fused
       # phantom pixel measurement walks the monocular width — and with it the whole range scale —
@@ -175,11 +205,19 @@ interceptor_node_relative_imm_ukf:
       bbox_range_ratio: 2.0        # max focal*W/bbox_size vs radar-range ratio (only once W is locked)
       width_min: 0.3               # m, clamp on the derived target width
       width_max: 5.0               # m
-      disable_after_lock: true     # once vision is locked AND delivering, the radar contributes
-                                   # nothing: its metre-level noise can only degrade a converged
-                                   # monocular solution, and its range knowledge is already baked
-                                   # into the locked target width. It re-engages as soon as vision
-                                   # stops delivering (vision_hold) — i.e. when the pass has failed.
+      disable_after_lock: true     # once vision is locked AND delivering, the radar is fully
+                                   # disengaged (no fusion): terminal vision is PURE vision. The radar
+                                   # is for MID-COURSE only; its metre-level position noise would
+                                   # corrupt the converged monocular range (already baked into W).
+      vel_aid_after_lock: false    # OFF (default): the radar node must NOT influence terminal vision.
+                                   # Opt-in experiment: fuse radar VELOCITY (not position) while vision
+                                   # is locked to anchor the along-LOS v_closing. In AirSim this HURT
+                                   # (the lagged 10 Hz radar vel fought the 30 Hz vision update), so it
+                                   # is off — terminal vision runs pure, exactly like the no-radar case.
+      vel_aid_std: 2.5             # m/s, 1-sigma of the vel-only aid (only used if vel_aid_after_lock
+                                   # = true). Large = trust the monocular solution more.
+                                   # Lower (1.5-2.0) trusts the radar more; raise if the radar vel is
+                                   # noisy at close range or the range estimate walks.
       vision_lost_timeout: 1.5     # s, vision gone this long -> guidance ownership reverts to radar
       vision_hold: 0.35            # s, how long a bbox counts as "current" before radar re-engages
       # Ownship velocity aiding: own_vel_ is otherwise an unbounded IMU integral running from the

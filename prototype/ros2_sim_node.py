@@ -376,6 +376,33 @@ SCENARIOS = {
         sim_time=45.0, noise_pos=1.5, noise_size=2.0,
         target_width=1.5, dropout=None,
         detect_min_size=25.0, radar=True, false_positive_prob=0.25),
+
+    # ---- Terminal entry-speed tests ----
+    # Isolate the terminal vision phase from the mid-course: the interceptor starts already at
+    # cruise speed V aimed straight at the target, ~45 m out (the AirSim radar->vision handover
+    # condition). uav_vel_init is consumed in SimNode.__init__. Sweep with --v_entry.
+    'terminal_v10': dict(
+        target_init=[45.0, 0.0, 10.0], vel_fn=lambda t: [0.0, 0.0, 0.0],
+        uav_init=[0.0, 0.0, 10.0], uav_yaw=0.0, uav_vel_init=[10.0, 0.0, 0.0],
+        sim_time=12.0, noise_pos=1.5, noise_size=2.0,
+        target_width=1.5, dropout=None, detect_min_size=15.0),
+    'terminal_v15': dict(
+        target_init=[45.0, 0.0, 10.0], vel_fn=lambda t: [0.0, 0.0, 0.0],
+        uav_init=[0.0, 0.0, 10.0], uav_yaw=0.0, uav_vel_init=[15.0, 0.0, 0.0],
+        sim_time=12.0, noise_pos=1.5, noise_size=2.0,
+        target_width=1.5, dropout=None, detect_min_size=15.0),
+    'terminal_v20': dict(
+        target_init=[45.0, 0.0, 10.0], vel_fn=lambda t: [0.0, 0.0, 0.0],
+        uav_init=[0.0, 0.0, 10.0], uav_yaw=0.0, uav_vel_init=[20.0, 0.0, 0.0],
+        sim_time=12.0, noise_pos=1.5, noise_size=2.0,
+        target_width=1.5, dropout=None, detect_min_size=15.0),
+    # Lateral entry component: 15 m/s closing with ~5 m/s cross — exercises the lateral PN +
+    # close-range lateral_decay that the high-entry-speed trace flagged as a contributor.
+    'terminal_v15_cross': dict(
+        target_init=[45.0, 12.0, 10.0], vel_fn=lambda t: [-1.0, 1.0, 0.0],
+        uav_init=[0.0, 0.0, 10.0], uav_yaw=0.0, uav_vel_init=[14.0, 5.0, 0.0],
+        sim_time=12.0, noise_pos=1.5, noise_size=2.0,
+        target_width=1.5, dropout=None, detect_min_size=15.0),
 }
 
 
@@ -452,6 +479,7 @@ class SimNode(Node):
         self.uav = QuadState()
         self.uav.pos = np.array(scenario['uav_init'], dtype=float)
         self.uav.R_b2n = euler_to_R(0.0, 0.0, scenario['uav_yaw'])
+        self.uav.vel = np.array(scenario.get('uav_vel_init', np.zeros(3)), dtype=float)
         self.target_pos = np.array(scenario['target_init'], dtype=float)
         self.target_vel = np.zeros(3)
         self.latest_cmd = None  # (throttle, [wx,wy,wz], stamp)
@@ -813,6 +841,9 @@ def main():
                         help='force-enable the simulated radar relay feed for this scenario')
     parser.add_argument('--detect_min_size', type=float, default=None,
                         help='override the detector minimum bbox size (px); 0 = always detect')
+    parser.add_argument('--v_entry', type=float, default=None,
+                        help='override the interceptor entry speed (m/s): set uav_vel_init along the '
+                             '(target-init) direction at this magnitude. Sweep the terminal entry speed.')
     args = parser.parse_args()
 
     scen = dict(SCENARIOS[args.scenario])          # copy so overrides don't mutate SCENARIOS
@@ -826,6 +857,13 @@ def main():
         scen['radar'] = True
     if args.detect_min_size is not None:
         scen['detect_min_size'] = args.detect_min_size
+    if args.v_entry is not None:
+        _dir = np.array(scen['target_init'], dtype=float) - np.array(scen['uav_init'], dtype=float)
+        _dir[2] = 0.0   # keep the entry speed horizontal (aim at the target's azimuth)
+        _n = np.linalg.norm(_dir)
+        if _n > 1e-3:
+            scen['uav_vel_init'] = (_dir / _n) * float(args.v_entry)
+            name = f"{args.scenario}-v{args.v_entry}"
 
     rclpy.init()
     node = SimNode(name, scen)
