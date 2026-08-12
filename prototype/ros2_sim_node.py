@@ -403,6 +403,14 @@ SCENARIOS = {
         uav_init=[0.0, 0.0, 10.0], uav_yaw=0.0, uav_vel_init=[14.0, 5.0, 0.0],
         sim_time=12.0, noise_pos=1.5, noise_size=2.0,
         target_width=1.5, dropout=None, detect_min_size=15.0),
+    # Both radar + vision available from startup (close target). Tests the guidance-ownership logic:
+    # vision should own the cache from the first consistent bbox (skip the radar mid-course), with
+    # the radar only anchoring W. The target is close enough that the camera sees it from t=0.
+    'radar_close': dict(
+        target_init=[45.0, 5.0, 10.0], vel_fn=lambda t: [-1.5, 0.5, 0.0],
+        uav_init=[0.0, 0.0, 10.0], uav_yaw=0.0,
+        sim_time=15.0, noise_pos=1.5, noise_size=2.0,
+        target_width=1.5, dropout=None, detect_min_size=15.0, radar=True),
 }
 
 

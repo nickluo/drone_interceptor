@@ -74,7 +74,7 @@ interceptor_node_relative_imm_ukf:
       # FOV keep-in-frame guard
       enable_fov_clamp: true   # hard-clamp pitch to keep target in FOV
       fov_keep_margin: 0.65    # fraction of the FOV half-angle to keep the target within
-      axial_jerk_max: 30.0     # m/s^3, rate limit on the along-LOS accel command
+      axial_jerk_max: 12.0     # m/s^3, rate limit on |da_fwd/dt| (jerk). Lower = smoother motion (the user wants jerk→0). 12 is gentle yet responsive.
       # Speed-scheduled PN: cap the forward speed used in a_lat = N*v*lambda_dot so v_des=20 does not
       # overheat lateral authority (phi_cmd slamming to +-max_tilt -> roll limit-cycle). Steady-state
       # lateral lead above v_pn_ref is reduced (maneuvering-authority trade for attitude stability).
@@ -90,38 +90,17 @@ interceptor_node_relative_imm_ukf:
       # the body-rate decay coefficient (control.rate_control_attenuation) — this filters the
       # attitude REFERENCE, not the rate output. Higher = smoother, more lag.
       att_ref_tc: 0.15    # s, EMA time constant
-      # Terminal braking: shrink desired closing speed and add reverse axial accel so the
-      # interceptor does not overshoot through the target at close range.
-      terminal_brake_range: 5.0  # m, below this range engage terminal braking
-      terminal_brake_floor: 1.0  # m/s, minimum desired closing speed during terminal brake
-      # Proximity brake engage point as a fraction of terminal_bbox_size (the bbox size at
-      # terminal_brake_range). The proximity brake ramps v_des_eff down to terminal_brake_floor as
-      # the bbox grows past this engage size. Engaging too early (0.2 -> r<25 m) bled speed across
-      # 25->10 m, leaving the interceptor too slow to chase a maneuvering target — it stalled and
-      # the target slid by at ~10 m. 0.4 engages at r<~12 m: keep (cap-limited) speed/energy through
-      # the approach and brake only for the final close approach. Raise to brake later (faster), lower
-      # to brake earlier (slower/steeper).
-      terminal_prox_engage: 0.4
-      # Proximity-brake energy floor as a fraction of the turn-radius cap (sqrt(g*tan(max_tilt)*r)).
-      # The brake ramps v_des_eff down to this floor at close range; 0.7 keeps it >= ~5 m/s at r=5,
-      # preserving maneuvering energy so a maneuvering target can't stall-and-escape (the size-driven
-      # v_closing is noisy in AirSim). The cap still bounds the ceiling; moving_floor still overrides
-      # for fast targets. 0 = the old fixed terminal_brake_floor (1 m/s) floor.
-      prox_floor_frac: 0.7
-      # Scales the turn-radius speed cap (the raw cap is sqrt(g*tan(max_tilt)*r)). At 1.0 the cap
-      # only binds at r~23 m for v_des=15, compressing the entire terminal brake into 23->5 m where
-      # the attitude-lag cascade drops the target out of the FOV. 0.8 binds at r~36 -> the brake is
-      # spread over 36->5 m (gentler, more turn margin), without slowing the mid-course cruise (the
-      # cap is far above v_des at range). Lower (0.7) if a high-speed entry still drops the target;
-      # raise toward 1.0 if it over-slows the approach. prox_floor_frac scales with this cap.
-      turn_radius_cap_factor: 0.8
-      # Terminal authority (maneuvering-target tracking).
+      # ---- Smooth axial speed profile (replaces the old multi-stage terminal brake) ----
+      # v_des_eff(r) = v_floor + (v_des - v_floor) * r²/(r² + r0²), a single C-infinity curve.
+      # No slope discontinuities -> jerk/snap minimised. r0 = terminal_smooth_range sets the
+      # transition scale; at r=r0 the speed is the midpoint. Speed profile (v_des=15, v_floor=1):
+      #   r=50→13.8, r=30→12.2, r=15→8.0, r=10→5.3, r=5→2.4, r=1→1.06.
+      terminal_brake_floor: 15.0 # = v_des: maintain full cruise speed to impact (kinetic-energy intercept). The smooth profile becomes flat — no deceleration.
+      terminal_smooth_range: 15.0 # r0 (m) — the transition scale. Lower = decelerate sooner; higher = keep speed longer.
+      # Safety cap (only binds for fast targets where the speed-aware moving_floor overrides):
+      turn_radius_cap_factor: 3.0  # effectively disabled (3·sqrt(g·tan·r) > v_des for all practical r). Maintain v_des to impact.
+      terminal_brake_range: 5.0  # m, used by lateral_decay and coast logic (not by the speed profile)
       terminal_tilt_range: 30.0    # m, below this range the roll clamp relaxes
-      # (2) Arrive slower: ramp v_des -> v_terminal over [terminal_decel_range, terminal_brake_range]
-      #     using the (stable) range estimate. Same bank gives ~2x turn rate at the lower speed.
-      #     Floor is speed-aware (never stalls below target speed + margin).
-      terminal_decel_range: 30.0   # m, start ramping desired speed down here
-      v_terminal: 12.0             # m/s, desired speed at the terminal phase
       # Vertical-accel slew limit (Fix C/E, AirSim jitter): bounds |da_z/dt| so a monocular z-estimate
       # jump (O(10 m) in one cycle) cannot step a_z straight to +-4 and pitch the body over. Relaxed
       # 8 -> 20 (8 lagged the vertical PD loop ~1 s; 20 still softens spikes without the lag).

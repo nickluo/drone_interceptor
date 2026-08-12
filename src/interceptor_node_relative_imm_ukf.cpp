@@ -908,6 +908,10 @@ public:
     double terminal_prox_engage_frac_ = 0.4;
     // Turn-radius cap scaling factor (<1 binds the cap earlier/spreads the brake; see compute_control).
     double turn_radius_cap_factor_ = 0.8;
+    // Smooth speed-profile transition scale (r0 in v(r) = v_floor + (v_des - v_floor) * r²/(r²+r0²)).
+    double terminal_smooth_range_ = 15.0;
+    // Axial deadband: coast (a_fwd=0) within ±this of v_des_eff — kills radar-noise-driven pitch oscillation.
+    double axial_deadband_ = 1.5;
     // Proximity-brake floor as a fraction of the turn-radius cap. Prevents the brake from stalling
     // the interceptor (a maneuvering target then escapes) when the size-driven v_closing is noisy.
     double prox_floor_frac_ = 0.7;
@@ -1052,6 +1056,8 @@ public:
     // Proximity-brake engage point (fraction of terminal_bbox_size_). Higher = brake later/closer.
     void set_terminal_prox_engage(double v) { terminal_prox_engage_frac_ = clamp(v, 0.05, 0.95); }
     void set_turn_radius_cap_factor(double v) { turn_radius_cap_factor_ = clamp(v, 0.3, 1.0); }
+    void set_terminal_smooth_range(double v) { terminal_smooth_range_ = std::max(1.0, v); }
+    void set_axial_deadband(double v) { axial_deadband_ = std::max(0.0, v); }
     void set_prox_floor_frac(double v) { prox_floor_frac_ = clamp(v, 0.0, 1.0); }
 
     // Decoupled control (odometry-free, exact mirror of the Python prototype). Inputs:
@@ -1163,46 +1169,27 @@ public:
             a_lat_world += K_apn_ * a_t_perp_geom * e_perp_xy;
         }
 
-        // ---- (A) Axial guidance: fixed forward thrust, range-independent ------------------
-        double v_des_eff = v_des;
-        // Range-based terminal decel schedule: arrive at the terminal phase ~v_terminal (slower),
-        // where the same bank gives ~2x the turn rate. Feedforward on the monocular range estimate.
-        if (r_norm_axial < terminal_decel_range_) {
-            const double v_term_eff = std::min(std::max(v_terminal_, target_speed + 1.5), v_des);
-            const double frac = clamp((terminal_decel_range_ - r_norm_axial) /
-                                      std::max(terminal_decel_range_ - terminal_brake_range_, 1.0), 0.0, 1.0);
-            v_des_eff = v_des + (v_term_eff - v_des) * frac;   // ramp v_des -> v_term_eff (<= v_des)
+        // ---- (A) Axial guidance: SMOOTH speed-vs-range profile (no abrupt terminal brake) ----
+        // A single C-infinity function gently decelerates from v_des at long range toward the brake
+        // floor at close range: v(r) = v_floor + (v_des - v_floor) * r²/(r² + r0²). No discontinuities
+        // in v_des_eff or its derivative -> no abrupt a_fwd steps -> no sudden pitch maneuvers. r0
+        // (terminal_smooth_range) sets the transition scale; at r=r0 the speed is the midpoint.
+        double v_des_eff;
+        {
+            const double r = std::max(r_norm_axial, 0.1);
+            const double r0 = terminal_smooth_range_;
+            const double smooth_frac = (r * r) / (r * r + r0 * r0);
+            v_des_eff = terminal_brake_floor_ + (v_des - terminal_brake_floor_) * smooth_frac;
         }
-        // Turn-radius-aware speed cap: limit the closing speed so the minimum turn radius
-        // (v^2 / (g*tan(max_tilt))) stays inside the current range. Without this, v_des=20 yields a
-        // ~40 m min turn radius at 45 deg bank and the interceptor PHYSICALLY cannot bend onto a
-        // target inside that -> overshoot/fly-by (AirSim v_des=20 ~60% vs v_des=15 ~80%; the Python
-        // sim's ideal rate loop hides it). Bites only at close range (at r=40 m the cap is ~20 m/s).
-        // The brake floor below still keeps enough closing to gain on a moving target.
-        // Turn-radius-aware speed cap, scaled by turn_radius_cap_factor_ (<1 binds earlier). The raw
-        // cap sqrt(g*tan(max_tilt)*r) only binds at r~23 m for v=15; a high-speed terminal entry then
-        // compresses the entire brake into 23->5 m, where the attitude-lag cascade drops the target
-        // out of the FOV. Factor<1 (default 0.8) makes the cap bind at larger range (r~36 for v=15),
-        // spreading the brake and adding turn margin, without slowing the mid-course cruise (the cap
-        // is far above v_des out there). The proximity energy floor scales with this cap automatically.
-        const double turn_radius_cap = turn_radius_cap_factor_ * std::sqrt(g * std::tan(max_tilt_rad) * r_norm_axial);
-        v_des_eff = std::min(v_des_eff, turn_radius_cap);
-        const double bbox_engage = terminal_bbox_size_ * terminal_prox_engage_frac_;   // r<~12m at 0.4
-        if (bbox_size > bbox_engage) {
-            const double prox = clamp((bbox_size - bbox_engage) /
-                                      std::max(1.0, terminal_bbox_size_ - bbox_engage), 0.0, 1.0);
-            // Speed-aware brake floor: never brake below target speed + margin when the target
-            // is actually moving; a near-stationary target keeps the configured floor.
+        // Speed-aware floor: never below target speed + margin (a maneuvering target must be chased).
+        {
             const double moving_floor = (target_speed > 1.0) ? (target_speed + 1.5) : terminal_brake_floor_;
-            // Energy floor: never let the proximity brake pull v_des_eff below a fraction of the
-            // turn-radius cap. The size-driven v_closing is noisy in AirSim (P(vel) blows up), so a
-            // bare 1 m/s floor stalls the interceptor and a maneuvering target escapes. Keeping
-            // >= prox_floor_frac*cap (>= ~5 m/s at r=5) preserves maneuvering energy; the cap still
-            // bounds the ceiling and moving_floor still overrides for fast targets.
-            const double energy_floor = prox_floor_frac_ * turn_radius_cap;
-            const double floor_eff = std::min(std::max(std::max(terminal_brake_floor_, moving_floor), energy_floor), v_des);
-            v_des_eff = v_des_eff + (floor_eff - v_des_eff) * prox;
+            v_des_eff = std::max(v_des_eff, std::min(moving_floor, v_des));
         }
+        // Turn-radius safety cap: keeps the min turn radius inside the current range. Only binds when
+        // moving_floor overrides the smooth profile for a fast target; for a static/slow target the
+        // smooth profile is already well below the cap at close range.
+        v_des_eff = std::min(v_des_eff, turn_radius_cap_factor_ * std::sqrt(g * std::tan(max_tilt_rad) * r_norm_axial));
         // v_fwd_body (= v_closing from v_rel) is under-observable along-LOS until scale converges;
         // a low v_closing inflates a_fwd -> ownship over-accelerates ON-AXIS, starving lateral PN
         // lead. Scene-adaptive 3-level floor: turning target (|atp_ema| large) -> 0.88 (don't blast
@@ -1211,7 +1198,17 @@ public:
         const double v_perp = std::abs(r_norm * los_rate);
         const double v_floor_frac = (std::abs(atp_ema_) > 0.5) ? 0.88 : ((v_perp > 1.0) ? 0.82 : 0.8);
         const double v_fwd_for_afwd = std::max(v_fwd_body, v_floor_frac * v_des_eff);
-        double a_fwd = K_fwd_ * (v_des_eff - v_fwd_for_afwd);
+        // Axial deadband: coast (a_fwd=0) within ±axial_deadband_ of v_des_eff. Kills the pitch
+        // oscillation from radar v_closing noise (±1 m/s) during blind flight — the interceptor
+        // cruises at v_des±deadband (all plenty for a kinetic-energy intercept) instead of chasing
+        // every noise sample. Outside the band K_fwd applies, shifted by the deadband (no step).
+        const double v_error = v_des_eff - v_fwd_for_afwd;
+        double a_fwd;
+        if (std::abs(v_error) <= axial_deadband_) {
+            a_fwd = 0.0;
+        } else {
+            a_fwd = K_fwd_ * (v_error - std::copysign(axial_deadband_, v_error));
+        }
         if (has_last_ && t > last_t_) {
             const double dt = t - last_t_;
             if (dt > 0.0 && dt < 1.0) {
@@ -1485,7 +1482,9 @@ private:
         this->declare_parameter<double>("controller.dither_min_range", 10.0); // m, suppress dither inside
         this->declare_parameter<double>("controller.range_smooth_tc", 0.3); // s, EMA on the range feeding the turn-radius cap + terminal decel (0=off; radar smoothness)
         this->declare_parameter<double>("controller.terminal_prox_engage", 0.4); // fraction of terminal_bbox_size where the proximity brake engages (0.4 -> r<~12m; higher = brake later, keep more speed)
-        this->declare_parameter<double>("controller.turn_radius_cap_factor", 0.8); // scales the turn-radius speed cap (0.8 -> binds earlier, spreads the brake, more turn margin; 1.0 = the raw physics cap). Lower if a high-speed terminal entry still drops the target.
+        this->declare_parameter<double>("controller.turn_radius_cap_factor", 0.8); // safety cap on closing speed for turn-radius (only binds for fast targets where moving_floor overrides the smooth profile).
+        this->declare_parameter<double>("controller.terminal_smooth_range", 15.0); // r0 transition scale for the smooth speed profile v(r) = v_floor + (v_des - v_floor) * r²/(r² + r0²). Lower = decelerate sooner; higher = keep speed longer.
+        this->declare_parameter<double>("controller.axial_deadband", 1.5); // m/s, coast within ±this of v_des — kills radar-noise-driven pitch oscillation during blind flight
         this->declare_parameter<double>("controller.prox_floor_frac", 0.7); // proximity-brake floor as a fraction of the turn-radius cap (prevents close-range stall against a maneuvering target; 0 = old fixed-floor behavior)
         this->declare_parameter<double>("controller.lateral_decay_floor", 0.4);  // Fix D: close-range a_lat floor
         this->declare_parameter<double>("controller.lateral_decay_start", 25.0); // Fix F: range lateral attenuation begins (m)
@@ -1645,6 +1644,8 @@ private:
         controller_->set_range_smooth_tc(this->get_parameter("controller.range_smooth_tc").as_double());
         controller_->set_terminal_prox_engage(this->get_parameter("controller.terminal_prox_engage").as_double());
         controller_->set_turn_radius_cap_factor(this->get_parameter("controller.turn_radius_cap_factor").as_double());
+        controller_->set_terminal_smooth_range(this->get_parameter("controller.terminal_smooth_range").as_double());
+        controller_->set_axial_deadband(this->get_parameter("controller.axial_deadband").as_double());
         controller_->set_prox_floor_frac(this->get_parameter("controller.prox_floor_frac").as_double());
         vel_smooth_tc_ = this->get_parameter("estimation.vel_smooth_tc").as_double();
         const std::vector<double> bias = this->get_parameter("imu_bias").as_double_array();
@@ -1717,6 +1718,14 @@ private:
         last_vel_smooth_t_ = t_now;
         has_target_vel_smoothed_ = true;
         return target_vel_smoothed_;
+    }
+
+    // Is vision currently delivering a consistent track? True when a radar-validated bbox has been
+    // seen within vision_lost_timeout_. Used to decide guidance-cache ownership: vision owns the
+    // cache as soon as it's delivering (even before the full handover completes), radar is the
+    // fallback only when vision is absent/inconsistent for a definitive-loss period.
+    bool vision_delivering(double now) const {
+        return last_vision_time_ > 0.0 && (now - last_vision_time_) < vision_lost_timeout_;
     }
 
     // ---- Radar relay -------------------------------------------------------------------------
@@ -1844,10 +1853,11 @@ private:
                 r_meas(0), r_meas(1), r_meas(2), r_meas.norm(), v_meas.norm(), lag * 1000.0);
         }
 
-        // Radar owns the guidance cache only while vision is NOT locked (mid-course, or after a
-        // definitive vision loss). While vision is locked the cache stays on the vision solution;
-        // a brief vision dropout is handled by the control loop's terminal COAST, NOT by the radar.
-        if (!vision_locked_) {
+        // Radar owns the guidance cache only when vision is NOT delivering a consistent track
+        // (mid-course before visual acquisition, or after a definitive vision loss). When vision is
+        // delivering the vision path owns the cache — the radar's only role then is the one-time
+        // width anchor (block in update_vision_handover), not guidance.
+        if (!vision_delivering(now)) {
             fill_cache_from_radar(result.second, now, dt_step);
         }
 
@@ -2058,8 +2068,8 @@ private:
                 transition_to_state(MissionState::TRACKING, "Vision lock acquired");
             } else if (run_ok) {
                 RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 2000,
-                    "Visual run stable (%d frames) but the target width is not radar-fixed yet "
-                    "— terminal vision guidance withheld", vision_frames_);
+                    "Visual run stable (%d frames); width not radar-fixed yet (vision guidance "
+                    "already active on w_guess, W anchor pending)", vision_frames_);
             }
         }
     }
@@ -2168,10 +2178,11 @@ private:
 
         if (!estimator_->initialized) return;
 
-        // Mid-course: the radar relay owns guidance until the visual lock is confirmed. The pixel
-        // measurement was still fused above — only the control cache stays on the radar solution,
-        // so a couple of noisy first detections cannot yank the command.
-        if (!vision_locked_) return;
+        // Vision owns the guidance cache as soon as a CONSISTENT bbox is in hand (the radar is for
+        // mid-course when vision can't see the target, and for the one-time width anchor). Once
+        // vision_locked_ the cache fills every frame (even dropouts, has_bbox=false -> COAST). Pre-
+        // lock, fill only when a consistent bbox is available — the radar owns the cache otherwise.
+        if (!vision_locked_ && !bbox_ok) return;
 
         // Relative-state estimator: x[0:3] IS the relative position, x[3:6] the relative velocity.
         Eigen::Vector3d r_est = result.second.segment<3>(0);
@@ -2492,7 +2503,7 @@ private:
                                                        los_az, cache.los_el, t_rel, v_closing,
                                                        cache.bbox_size, v_z, cache.target_speed,
                                                        cache.los_rate, cache.a_own, boresight_el_meas,
-                                                       (radar_enable_ && radar_has_rel_ && !vision_locked_));
+                                                       (radar_enable_ && radar_has_rel_ && !vision_delivering(now.seconds())));
         if (!std::isfinite(ctrl[0]) || !std::isfinite(ctrl[1]) || !std::isfinite(ctrl[2]) || !std::isfinite(ctrl[3])) {
             RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), THROTTLE_INTERVAL_MS*4,
                 "Skipping non-finite control command");
