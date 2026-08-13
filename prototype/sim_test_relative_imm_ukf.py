@@ -76,19 +76,18 @@ CTRL_K_ZD = 2.0      # vertical damping on pursuer odom v_z (K_z=2 -> zeta≈0.7
 CTRL_V_DES = 20.0
 CTRL_MAX_TILT_DEG = 45.0     # user req: pitch/roll authority 45 deg (gimbal decouples camera from pitch)
 CTRL_FOV_KEEP = 1.0
-CTRL_V_RAMP = 3.0
 CTRL_JERK = 30.0      # was 15; raised so the terminal decel can shed ~9 m/s (iter 3)
 CTRL_MAX_BODY_RATE = 3.0
 CTRL_TERM_BRAKE_RANGE = 5.0
-CTRL_TERM_BRAKE_FLOOR = 1.0
+# Axial speed law: flat v_des + single adaptive turn-radius cap (mirror C++). The cap is the ONLY
+# close-range speed reducer; no smooth profile / terminal_brake_floor.
+CTRL_TURN_RADIUS_CAP_FACTOR = 1.0  # cap factor (1.0 = physics limit; <1 brakes sooner). Mirror C++.
 # Iter 1-3 terminal-authority / oscillation params (mirror C++):
 CTRL_V_PN_REF = 12.0              # cap on v_fwd in PN lateral accel (iter 1)
 CTRL_MAX_ATT_RATE = 3.5           # attitude-reference slew governor |d(phi/theta)_cmd/dt| (Fix G: was 5)
 CTRL_ATT_REF_TC = 0.15            # attitude-reference EMA time constant [s] (iter 2)
-CTRL_MAX_TILT_TERMINAL_DEG = 45.0  # roll clamp relaxes to this inside terminal_tilt_range (iter 3)
-CTRL_TERMINAL_TILT_RANGE = 30.0   # m, roll-clamp relaxation gate (iter 3)
-CTRL_TERMINAL_DECEL_RANGE = 30.0  # m, start ramping v_des -> v_terminal here (sync C++ yaml)
-CTRL_V_TERMINAL = 12.0            # m/s, desired speed at the terminal phase (sync C++ yaml)
+CTRL_MAX_TILT_TERMINAL_DEG = 55.0  # roll clamp + cap tilt inside terminal_tilt_range (raised 45->55, mirror C++)
+CTRL_TERMINAL_TILT_RANGE = 30.0   # m, roll-clamp + cap gate
 CTRL_AZ_SLEW = 20.0               # m/s^3, |da_z/dt| slew limit (Fix C/E, mirror C++ yaml controller.a_z_slew)
 CTRL_LAT_DECAY_FLOOR = 0.4        # Fix D: a_lat_mag floor at terminal_brake_range (close-range weave damp)
 CTRL_LAT_DECAY_START = 25.0       # Fix F: range at which close-range lateral attenuation begins (m, was 12)
@@ -754,19 +753,16 @@ class AdvancedHybridController:
         self.fov_half_v = (CAM_HEIGHT_PX / 2.0) / max(1.0, FOCAL_LENGTH)
         self.fov_half_h = (CAM_WIDTH_PX / 2.0) / max(1.0, FOCAL_LENGTH)
         self.fov_keep_margin = CTRL_FOV_KEEP
-        self.v_ramp_time = CTRL_V_RAMP
         self.axial_jerk_max = CTRL_JERK
         self.enable_fov_clamp = True
         self.mount_pitch = np.deg2rad(MOUNT_PITCH_DEG)
         self.max_body_rate = CTRL_MAX_BODY_RATE
         self.terminal_brake_range = CTRL_TERM_BRAKE_RANGE
-        self.terminal_brake_floor = CTRL_TERM_BRAKE_FLOOR
         self.K_pitch = 1.2
         self.K_roll = 1.0
         self.K_z = CTRL_K_Z
         self.K_zd = CTRL_K_ZD
         self.K_fwd = 2.0
-        self.terminal_bbox_size = 80.0
         self.has_gimbal = True                  # semi-strapdown pitch gimbal: boresight decoupled from theta
         self.gimbal_bias = GIMBAL_BIAS          # boresight elev = -gimbal_bias (down-gaze positive)
         self.last_axial_accel = 0.0
@@ -778,8 +774,7 @@ class AdvancedHybridController:
         self.att_ref_tc = CTRL_ATT_REF_TC
         self.max_tilt_terminal_rad = np.deg2rad(CTRL_MAX_TILT_TERMINAL_DEG)
         self.terminal_tilt_range = CTRL_TERMINAL_TILT_RANGE
-        self.terminal_decel_range = CTRL_TERMINAL_DECEL_RANGE
-        self.v_terminal = CTRL_V_TERMINAL
+        self.turn_radius_cap_factor = CTRL_TURN_RADIUS_CAP_FACTOR
         # Attitude-reference slew governor + EMA state (dedicated; axial block reuses last_t/has_last).
         self.last_phi_cmd = 0.0
         self.last_theta_cmd = 0.0
@@ -916,22 +911,14 @@ class AdvancedHybridController:
         self.atp_ema += a_atp * (a_t_perp_geom - self.atp_ema)
         if abs(a_t_perp_geom) > self.K_apn_min_at:
             a_lat_world = a_lat_world + self.K_apn * a_t_perp_geom * e_perp_xy
+        # Flat v_des + single adaptive turn-radius cap (mirror C++): no deliberate terminal brake.
+        # The cap keeps min turn radius inside the current range so the interceptor can still bend
+        # onto a dodging target. Uses the range-appropriate tilt (terminal tilt inside terminal_tilt_range).
         v_des_eff = self.v_des
-        # Range-based terminal decel schedule (iter 3): arrive at the terminal phase ~v_terminal so
-        # the same bank gives ~2x turn rate. Feedforward schedule on the monocular range estimate
-        # (not a closed loop). Guard min(v_term_eff, v_des) => no-op when v_des < v_terminal (e.g.
-        # this sim's v_des=5); only ever decelerates. Margin matches the bbox-brake moving_floor.
-        if r_norm < self.terminal_decel_range:
-            v_term_eff = min(max(self.v_terminal, target_speed + 1.5), self.v_des)
-            frac = clamp((self.terminal_decel_range - r_norm) /
-                        max(self.terminal_decel_range - self.terminal_brake_range, 1.0), 0.0, 1.0)
-            v_des_eff = self.v_des + (v_term_eff - self.v_des) * frac
-        bbox_engage = self.terminal_bbox_size * 0.2   # engage at ~5x brake_range (~25m), not 10m
-        if bbox_size > bbox_engage:
-            prox = clamp((bbox_size - bbox_engage) / max(self.terminal_bbox_size - bbox_engage, 1.0), 0.0, 1.0)
-            moving_floor = (target_speed + 1.5) if target_speed > 1.0 else self.terminal_brake_floor
-            floor_eff = min(max(self.terminal_brake_floor, moving_floor), self.v_des)
-            v_des_eff = v_des_eff + (floor_eff - v_des_eff) * prox
+        moving_floor = (target_speed + 1.5) if target_speed > 1.0 else 3.0  # 3.0 = static-target stall guard
+        v_des_eff = max(v_des_eff, min(moving_floor, self.v_des))
+        tilt_for_cap = self.max_tilt_terminal_rad if r_norm < self.terminal_tilt_range else self.max_tilt_rad
+        v_des_eff = min(v_des_eff, self.turn_radius_cap_factor * np.sqrt(G * np.tan(tilt_for_cap) * r_norm))
         # v_fwd_body (= v_closing) is under-observable along-LOS until the parallax demod anchors
         # scale (~4s); a low v_closing inflates a_fwd -> ownship over-accelerates ON-AXIS, starving
         # the lateral PN lead -> a crossing target escapes the FOV (the regression vs the absolute-
@@ -1398,7 +1385,11 @@ def run_scenario(name, target_init_pos, target_vel_fn, uav_init_pos, uav_init_ya
                     # Relative-speed proxy drives the speed-aware brake floor (ownship absolute
                     # speed unobservable without odom). v_z ownship vertical speed ≈ -v_rel[2]
                     # (target-level approximation; preserves vertical-PD damping sign).
-                    target_speed = clamp(float(np.linalg.norm(v_est)), 0.0, 15.0)
+                    # Transverse (escape) speed = |r_xy × v_xy|/|r_xy| — the part that justifies not
+                    # braking. Full |v_est| is dominated by closing speed -> circular (mirror C++ fix).
+                    r_xy = float(np.sqrt(r_est[0] * r_est[0] + r_est[1] * r_est[1]))
+                    v_transverse = abs(r_est[0] * v_est[1] - r_est[1] * v_est[0]) / r_xy if r_xy > 1e-3 else 0.0
+                    target_speed = clamp(v_transverse, 0.0, 15.0)
                     a_own_world = last_dv_own / max(dt_cam, 1e-3)   # ownship world accel (geometric-APN a_own_perp)
                     raw_ctrl = controller.compute_control(roll, pitch, yaw, r_est, v_est, los_az, los_el,
                                                           t, v_closing, bbox_size, -v_est[2], los_rate,

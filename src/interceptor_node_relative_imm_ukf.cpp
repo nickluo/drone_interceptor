@@ -895,26 +895,17 @@ public:
     double lat_decay_start_ = 25.0;     // Fix F: range at which the close-range lateral attenuation begins (m)
     double max_body_rate_ = 3.0;
     double terminal_brake_range_ = 5.0;
-    double terminal_brake_floor_ = 1.0;
     // Decoupled gains (config-driven via set_guidance_tuning).
     double K_fwd_ = 2.0;        // axial: a_fwd = K_fwd * (v_des - v_fwd_body)
     double K_az_ = 2.0;         // vertical-speed tracking gain: a_z = K_az*(v_z_desired - v_z)
     double a_z_limit_ = 8.0;    // vertical accel clamp (m/s^2) — airframe thrust/accel limit
-    double terminal_bbox_size_ = 80.0;  // bbox px at terminal_brake_range (computed from focal/W)
-    // Fraction of terminal_bbox_size_ at which the proximity brake begins to ramp in. Engaging too
-    // early (the old 0.2 -> r<25 m) bled speed across 25->10 m, leaving the interceptor too slow to
-    // chase a maneuvering target — it stalled and the target slid by. 0.4 -> r<~12 m: keep cap-speed
-    // energy through the approach, brake only for the final close approach.
-    double terminal_prox_engage_frac_ = 0.4;
-    // Turn-radius cap scaling factor (<1 binds the cap earlier/spreads the brake; see compute_control).
+    // Turn-radius cap scaling factor. The cap v ≤ factor·sqrt(g·tan(tilt)·r) is the single adaptive
+    // terminal-speed reducer (keeps min turn radius inside range). 1.0 = physics limit; <1 brakes sooner.
     double turn_radius_cap_factor_ = 0.8;
-    // Smooth speed-profile transition scale (r0 in v(r) = v_floor + (v_des - v_floor) * r²/(r²+r0²)).
-    double terminal_smooth_range_ = 15.0;
     // Axial deadband: coast (a_fwd=0) within ±this of v_des_eff — kills radar-noise-driven pitch oscillation.
     double axial_deadband_ = 1.5;
-    // Proximity-brake floor as a fraction of the turn-radius cap. Prevents the brake from stalling
-    // the interceptor (a maneuvering target then escapes) when the size-driven v_closing is noisy.
-    double prox_floor_frac_ = 0.7;
+    // Motion-dependent LOS gate widening: bearing_tol += motion_gate_factor * v_perp * delay / r.
+    double motion_gate_factor_ = 3.0;
     // Semi-strapdown single-axis pitch gimbal: keeps the camera boresight near-horizontal
     // (world elev = -gimbal_bias_) regardless of body pitch, so the vertical FOV is DECOUPLED
     // from theta_cmd. When true, the fixed-mount pitch FOV clamp is skipped and vertical
@@ -939,11 +930,11 @@ public:
     double att_ref_tc_ = 0.15;    // EMA time constant on phi_cmd/theta_cmd [s]
     double last_phi_cmd_f_ = 0.0;   // EMA-filtered reference state
     double last_theta_cmd_f_ = 0.0;
-    // Terminal authority (maneuvering-target tracking): relax roll clamp + schedule a slower approach.
-    double max_tilt_terminal_rad_ = 45.0 * M_PI / 180.0;  // roll clamp inside terminal_tilt_range_
-    double terminal_tilt_range_ = 15.0;  // m, below this range phi_cmd may use max_tilt_terminal_rad_
-    double terminal_decel_range_ = 30.0; // m, start ramping v_des -> v_terminal_ here
-    double v_terminal_ = 12.0;           // m/s, desired speed at the terminal phase (more bank agility)
+    // Terminal authority (maneuvering-target tracking): relax the roll clamp inside terminal_tilt_range_.
+    // max_tilt_terminal_rad_ is ALSO the bank used by the turn-radius speed cap in that band, so raising
+    // it both permits tighter turns AND raises the close-range speed cap (win-win for terminal maneuverability).
+    double max_tilt_terminal_rad_ = 45.0 * M_PI / 180.0;  // roll clamp + cap tilt inside terminal_tilt_range_
+    double terminal_tilt_range_ = 15.0;  // m, below this range phi_cmd and the speed cap use max_tilt_terminal_rad_
     // Active monocular-observability dither: a small lateral sinusoidal acceleration that gives
     // the ownship a horizontal parallax baseline. With x != 0 the pinhole u=fx*x/z becomes
     // sensitive to z (depth), so the depth/width degeneracy (size=fx*W/z) is broken and the
@@ -981,22 +972,18 @@ public:
                              double fov_half_v, double fov_half_h, double fov_keep_margin,
                              double axial_jerk_max, bool enable_fov_clamp,
                              double mount_pitch_rad,
-                             double max_body_rate, double terminal_brake_range, double terminal_brake_floor,
-                             double terminal_bbox_size,
+                             double max_body_rate, double terminal_brake_range,
                              double v_pn_ref, double max_att_rate, double att_ref_tc,
-                             double max_tilt_terminal_deg, double terminal_tilt_range,
-                             double terminal_decel_range, double v_terminal)
+                             double max_tilt_terminal_deg, double terminal_tilt_range)
         : N(N_val), K_att(K_att_val),
           K_yaw(K_yaw_val), v_des(v_des_val), max_tilt_rad(max_tilt_deg * M_PI / 180.0),
           fov_half_v_(fov_half_v), fov_half_h_(fov_half_h), fov_keep_margin_(fov_keep_margin),
           axial_jerk_max_(axial_jerk_max), enable_fov_clamp_(enable_fov_clamp),
           mount_pitch_(mount_pitch_rad),
           max_body_rate_(max_body_rate), terminal_brake_range_(terminal_brake_range),
-          terminal_brake_floor_(terminal_brake_floor), terminal_bbox_size_(terminal_bbox_size),
           v_pn_ref_(v_pn_ref), max_att_rate_(max_att_rate), att_ref_tc_(att_ref_tc),
           max_tilt_terminal_rad_(max_tilt_terminal_deg * M_PI / 180.0),
-          terminal_tilt_range_(terminal_tilt_range), terminal_decel_range_(terminal_decel_range),
-          v_terminal_(v_terminal) {}
+          terminal_tilt_range_(terminal_tilt_range) {}
 
     void reset_dynamic_state() {
         last_axial_accel_ = 0.0;
@@ -1053,12 +1040,12 @@ public:
     }
     // Axial-only range EMA time constant (radar smoothness). <=0 disables (passthrough r_norm).
     void set_range_smooth_tc(double tc) { r_norm_smooth_tc_ = std::max(0.0, tc); }
-    // Proximity-brake engage point (fraction of terminal_bbox_size_). Higher = brake later/closer.
-    void set_terminal_prox_engage(double v) { terminal_prox_engage_frac_ = clamp(v, 0.05, 0.95); }
+    // Turn-radius cap factor: clamped to [0.3, 1.0] (1.0 = physics limit; <1 brakes sooner). The cap is
+    // the single adaptive terminal-speed reducer (see compute_control). Out-of-range is WARNed at the
+    // call site so a stale yaml "3.0 = disabled" is not silently swallowed.
     void set_turn_radius_cap_factor(double v) { turn_radius_cap_factor_ = clamp(v, 0.3, 1.0); }
-    void set_terminal_smooth_range(double v) { terminal_smooth_range_ = std::max(1.0, v); }
     void set_axial_deadband(double v) { axial_deadband_ = std::max(0.0, v); }
-    void set_prox_floor_frac(double v) { prox_floor_frac_ = clamp(v, 0.0, 1.0); }
+    void set_motion_gate_factor(double v) { motion_gate_factor_ = std::max(0.0, v); }
 
     // Decoupled control (odometry-free, exact mirror of the Python prototype). Inputs:
     //   r_est, v_est : RELATIVE target pos/vel in world frame G (estimator state directly)
@@ -1169,27 +1156,23 @@ public:
             a_lat_world += K_apn_ * a_t_perp_geom * e_perp_xy;
         }
 
-        // ---- (A) Axial guidance: SMOOTH speed-vs-range profile (no abrupt terminal brake) ----
-        // A single C-infinity function gently decelerates from v_des at long range toward the brake
-        // floor at close range: v(r) = v_floor + (v_des - v_floor) * r²/(r² + r0²). No discontinuities
-        // in v_des_eff or its derivative -> no abrupt a_fwd steps -> no sudden pitch maneuvers. r0
-        // (terminal_smooth_range) sets the transition scale; at r=r0 the speed is the midpoint.
-        double v_des_eff;
+        // ---- (A) Axial guidance: flat v_des + single adaptive turn-radius cap ----
+        // No deliberate terminal brake: v_des_eff starts at the cruise ceiling v_des and is reduced
+        // ONLY by the turn-radius cap below (keeps min turn radius inside the current range -> the
+        // interceptor can still bend onto a dodging target). sqrt(r) is smooth; the only derivative
+        // kink is at the cap/v_des crossover (far from terminal) and is absorbed by axial_jerk_max.
+        double v_des_eff = v_des;
+        // Speed-aware floor: never below a maneuvering target's escape speed + margin (it must be chased).
+        // Static/slow target -> 3.0 m/s stall guard (the cap, not this floor, governs close-range speed).
         {
-            const double r = std::max(r_norm_axial, 0.1);
-            const double r0 = terminal_smooth_range_;
-            const double smooth_frac = (r * r) / (r * r + r0 * r0);
-            v_des_eff = terminal_brake_floor_ + (v_des - terminal_brake_floor_) * smooth_frac;
-        }
-        // Speed-aware floor: never below target speed + margin (a maneuvering target must be chased).
-        {
-            const double moving_floor = (target_speed > 1.0) ? (target_speed + 1.5) : terminal_brake_floor_;
+            const double moving_floor = (target_speed > 1.0) ? (target_speed + 1.5) : 3.0;
             v_des_eff = std::max(v_des_eff, std::min(moving_floor, v_des));
         }
-        // Turn-radius safety cap: keeps the min turn radius inside the current range. Only binds when
-        // moving_floor overrides the smooth profile for a fast target; for a static/slow target the
-        // smooth profile is already well below the cap at close range.
-        v_des_eff = std::min(v_des_eff, turn_radius_cap_factor_ * std::sqrt(g * std::tan(max_tilt_rad) * r_norm_axial));
+        // Turn-radius maneuverability cap: v ≤ factor·sqrt(g·tan(tilt)·r). Uses the range-appropriate
+        // bank (terminal tilt inside terminal_tilt_range) so the raised terminal bank translates into
+        // sustained close-range speed AND tighter turns. This is the binding terminal-speed governor.
+        const double tilt_for_cap = (r_norm_axial < terminal_tilt_range_) ? max_tilt_terminal_rad_ : max_tilt_rad;
+        v_des_eff = std::min(v_des_eff, turn_radius_cap_factor_ * std::sqrt(g * std::tan(tilt_for_cap) * r_norm_axial));
         // v_fwd_body (= v_closing from v_rel) is under-observable along-LOS until scale converges;
         // a low v_closing inflates a_fwd -> ownship over-accelerates ON-AXIS, starving lateral PN
         // lead. Scene-adaptive 3-level floor: turning target (|atp_ema| large) -> 0.88 (don't blast
@@ -1461,16 +1444,11 @@ private:
         this->declare_parameter<double>("controller.axial_jerk_max", 15.0);
         this->declare_parameter<double>("physics.max_body_rate", 3.0);
         this->declare_parameter<double>("controller.terminal_brake_range", 5.0);
-        this->declare_parameter<double>("controller.terminal_brake_floor", 1.0);
-        this->declare_parameter<double>("controller.terminal_range", 10.0);
-        this->declare_parameter<double>("controller.terminal_N", 3.0);
         this->declare_parameter<double>("controller.v_pn_ref", 12.0);
         this->declare_parameter<double>("controller.max_att_rate", 3.5);   // Fix G: clamp |d(phi/theta)_cmd/dt| (was 5)
         this->declare_parameter<double>("controller.att_ref_tc", 0.15);
         this->declare_parameter<double>("physics.max_tilt_terminal_deg", 45.0);
         this->declare_parameter<double>("controller.terminal_tilt_range", 15.0);
-        this->declare_parameter<double>("controller.terminal_decel_range", 30.0);
-        this->declare_parameter<double>("controller.v_terminal", 12.0);
         this->declare_parameter<double>("controller.a_z_slew", 20.0);   // Fix C/E: |da_z/dt| limit (m/s^3)
         this->declare_parameter<bool>("controller.enable_fov_clamp", true);
         // Guidance tuning (set_guidance_tuning) — operator-facing knobs promoted from hardcoded.
@@ -1480,12 +1458,10 @@ private:
         this->declare_parameter<double>("controller.dither_amp", 0.8);  // m/s^2, lateral observability dither
         this->declare_parameter<double>("controller.dither_freq", 0.5); // Hz
         this->declare_parameter<double>("controller.dither_min_range", 10.0); // m, suppress dither inside
-        this->declare_parameter<double>("controller.range_smooth_tc", 0.3); // s, EMA on the range feeding the turn-radius cap + terminal decel (0=off; radar smoothness)
-        this->declare_parameter<double>("controller.terminal_prox_engage", 0.4); // fraction of terminal_bbox_size where the proximity brake engages (0.4 -> r<~12m; higher = brake later, keep more speed)
-        this->declare_parameter<double>("controller.turn_radius_cap_factor", 0.8); // safety cap on closing speed for turn-radius (only binds for fast targets where moving_floor overrides the smooth profile).
-        this->declare_parameter<double>("controller.terminal_smooth_range", 15.0); // r0 transition scale for the smooth speed profile v(r) = v_floor + (v_des - v_floor) * r²/(r² + r0²). Lower = decelerate sooner; higher = keep speed longer.
+        this->declare_parameter<double>("controller.range_smooth_tc", 0.3); // s, EMA on the range feeding the turn-radius cap (0=off; radar smoothness)
+        this->declare_parameter<double>("controller.turn_radius_cap_factor", 0.8); // turn-radius maneuverability cap factor (clamped [0.3,1.0]; 1.0=physics limit). The binding terminal-speed reducer — see compute_control.
         this->declare_parameter<double>("controller.axial_deadband", 1.5); // m/s, coast within ±this of v_des — kills radar-noise-driven pitch oscillation during blind flight
-        this->declare_parameter<double>("controller.prox_floor_frac", 0.7); // proximity-brake floor as a fraction of the turn-radius cap (prevents close-range stall against a maneuvering target; 0 = old fixed-floor behavior)
+        this->declare_parameter<double>("radar.motion_gate_factor", 3.0); // widens the bbox-radar LOS gate for moving targets: bearing_tol += this * v_perp * delay / r
         this->declare_parameter<double>("controller.lateral_decay_floor", 0.4);  // Fix D: close-range a_lat floor
         this->declare_parameter<double>("controller.lateral_decay_start", 25.0); // Fix F: range lateral attenuation begins (m)
         // Vertical cascade (cascaded velocity-limited altitude track). Set v_climb/v_descent to the
@@ -1600,30 +1576,21 @@ private:
         double jerk = this->get_parameter("controller.axial_jerk_max").as_double();
         double max_body_rate = this->get_parameter("physics.max_body_rate").as_double();
         double terminal_brake_range = this->get_parameter("controller.terminal_brake_range").as_double();
-        double terminal_brake_floor = this->get_parameter("controller.terminal_brake_floor").as_double();
         double v_pn_ref = this->get_parameter("controller.v_pn_ref").as_double();
         double max_att_rate = this->get_parameter("controller.max_att_rate").as_double();
         double att_ref_tc = this->get_parameter("controller.att_ref_tc").as_double();
         double max_tilt_terminal_deg = this->get_parameter("physics.max_tilt_terminal_deg").as_double();
         double terminal_tilt_range = this->get_parameter("controller.terminal_tilt_range").as_double();
-        double terminal_decel_range = this->get_parameter("controller.terminal_decel_range").as_double();
-        double v_terminal = this->get_parameter("controller.v_terminal").as_double();
         double fov_half_v = (cam_height_ / 2.0) / std::max(1.0, focal_length_);
         double fov_half_h = (cam_width_ / 2.0) / std::max(1.0, focal_length_);
-        // Compute terminal_bbox_size from camera intrinsics so the brake triggers at the correct
-        // range regardless of focal length. bbox_size = focal * W / range, so at terminal_brake_range:
-        // terminal_bbox_size = focal * w_guess / terminal_brake_range. For AirSim (focal=831, W=1.5,
-        // range=5): 249px. For Python sim (focal=554, W=1.5, range=5): 166px. Previously hardcoded
-        // 80px which triggered full brake at ~15m in AirSim (bbox=83px at R=15), stalling the UAV.
-        const double terminal_bbox_size = focal_length_ * w_guess_ / std::max(0.1, terminal_brake_range);
 
         const bool enable_fov_clamp = this->get_parameter("controller.enable_fov_clamp").as_bool();
         controller_ = std::make_unique<AdvancedHybridController>(
             N, K_att, K_yaw, v_des, max_tilt,
             fov_half_v, fov_half_h, fov_keep, jerk, enable_fov_clamp, gimbal_bias_rad_,
-            max_body_rate, terminal_brake_range, terminal_brake_floor, terminal_bbox_size,
+            max_body_rate, terminal_brake_range,
             v_pn_ref, max_att_rate, att_ref_tc,
-            max_tilt_terminal_deg, terminal_tilt_range, terminal_decel_range, v_terminal);
+            max_tilt_terminal_deg, terminal_tilt_range);
         controller_->set_a_z_slew(this->get_parameter("controller.a_z_slew").as_double());
         controller_->set_lateral_decay_floor(this->get_parameter("controller.lateral_decay_floor").as_double());
         controller_->set_lat_decay_start(this->get_parameter("controller.lateral_decay_start").as_double());
@@ -1642,11 +1609,17 @@ private:
             this->get_parameter("controller.dither_freq").as_double(),
             this->get_parameter("controller.dither_min_range").as_double());
         controller_->set_range_smooth_tc(this->get_parameter("controller.range_smooth_tc").as_double());
-        controller_->set_terminal_prox_engage(this->get_parameter("controller.terminal_prox_engage").as_double());
-        controller_->set_turn_radius_cap_factor(this->get_parameter("controller.turn_radius_cap_factor").as_double());
-        controller_->set_terminal_smooth_range(this->get_parameter("controller.terminal_smooth_range").as_double());
+        {
+            const double trcf = this->get_parameter("controller.turn_radius_cap_factor").as_double();
+            if (trcf < 0.3 - 1e-9 || trcf > 1.0 + 1e-9) {
+                RCLCPP_WARN(this->get_logger(),
+                    "controller.turn_radius_cap_factor=%.3f is outside [0.3, 1.0] -> clamped. "
+                    "The cap is the binding terminal-speed reducer; >1.0 would disable it.", trcf);
+            }
+            controller_->set_turn_radius_cap_factor(trcf);
+        }
         controller_->set_axial_deadband(this->get_parameter("controller.axial_deadband").as_double());
-        controller_->set_prox_floor_frac(this->get_parameter("controller.prox_floor_frac").as_double());
+        controller_->set_motion_gate_factor(this->get_parameter("radar.motion_gate_factor").as_double());
         vel_smooth_tc_ = this->get_parameter("estimation.vel_smooth_tc").as_double();
         const std::vector<double> bias = this->get_parameter("imu_bias").as_double_array();
         if (bias.size() == 3) {
@@ -1781,8 +1754,17 @@ private:
         // guidance mixes the two (los_az = atan2(r) - imu_yaw), so a yaw offset here flies the
         // interceptor at a constant angle off the target.
         const double lag = clamp(now - t_meas, 0.0, radar_max_delay_comp_);
-        const Eigen::Vector3d v_meas = radar_R_yaw_ * (tgt.vel - own.vel);
-        const Eigen::Vector3d r_meas = radar_R_yaw_ * (tgt.pos - own.pos) + v_meas * lag;
+        // Online yaw correction: rotate the radar measurement by the EMA of the camera-radar az diff
+        // (bearing_err_ema_). This auto-calibrates the systematic frame misalignment that
+        // radar.yaw_offset_deg is meant to correct — no manual calibration needed. Applied here
+        // (before the UKF) so a wrong correction makes the gate TIGHTER (conservative, self-correcting)
+        // rather than looser (divergent, as a gate-side correction would be).
+        Eigen::Matrix3d R_online_yaw = Eigen::Matrix3d::Identity();
+        if (has_bearing_err_ && std::abs(bearing_err_ema_) < 0.5) {  // sanity cap: < 28.6°
+            R_online_yaw = Eigen::AngleAxisd(bearing_err_ema_, Eigen::Vector3d::UnitZ()).toRotationMatrix();
+        }
+        const Eigen::Vector3d v_meas = R_online_yaw * radar_R_yaw_ * (tgt.vel - own.vel);
+        const Eigen::Vector3d r_meas = R_online_yaw * radar_R_yaw_ * (tgt.pos - own.pos) + v_meas * lag;
 
         radar_rel_pos_ = r_meas;
         radar_rel_time_ = now;
@@ -1943,10 +1925,31 @@ private:
         }
 
         const double d_ang = std::acos(clamp(los_nav.normalized().dot(u_radar), -1.0, 1.0));
-        if (d_ang > handover_max_bearing_err_) {
+        // Range- and motion-dependent bearing tolerance. At close range with a fast-crossing target,
+        // the residual radar delay introduces a bearing error ~ v_perp * lag / r. Scale by a safety
+        // factor and add to the base tolerance. This also accommodates the radar yaw offset + noise
+        // (the base is widened to cover the ~6° steady offset the [FRAME] log reports). Together they
+        // break the reject->no-fusion->drift->reject feedback loop that grows the error to 35°.
+        double v_perp_gate = 0.0;
+        if (estimator_ && estimator_->initialized) {
+            const auto& x = estimator_->imm_ukf->x;
+            const double r_xy = std::sqrt(x(0)*x(0) + x(1)*x(1));
+            v_perp_gate = (r_xy > 1e-3)
+                ? std::abs(x(0)*x(4) - x(1)*x(3)) / r_xy : 0.0;   // |r_xy × v_xy| / |r_xy|
+        }
+        const double motion_tol = controller_->motion_gate_factor_ * v_perp_gate *
+            radar_max_delay_comp_ / std::max(r_radar, 1.0);
+        // pos_noise_tol DISABLED: the yaw auto-correction above removes the systematic 6° offset,
+        // leaving only ~5-7° random noise — well within the 11.5° base gate. A range-dependent
+        // pos-noise term was tried but it over-widened at close range and let false positives through.
+        const double pos_noise_tol = 0.0;
+        const double bearing_limit = handover_max_bearing_err_ + motion_tol + pos_noise_tol;
+        if (d_ang > bearing_limit) {
             RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 500,
-                "[BBOX-REJECT] LOS %.1fdeg off the radar track (limit %.1f), bbox=%.0fpx",
-                d_ang * 180.0 / M_PI, handover_max_bearing_err_ * 180.0 / M_PI, bbox_s);
+                "[BBOX-REJECT] LOS %.1fdeg off (limit %.1f+%.1f+%.1f=%.1f, r=%.0f v_perp=%.1f bbox=%.0fpx)",
+                d_ang * 180.0 / M_PI, handover_max_bearing_err_ * 180.0 / M_PI,
+                motion_tol * 180.0 / M_PI, pos_noise_tol * 180.0 / M_PI,
+                bearing_limit * 180.0 / M_PI, r_radar, v_perp_gate, bbox_s);
             return false;
         }
         if (width_locked_ && bbox_s > 1.0) {
@@ -1984,14 +1987,27 @@ private:
         const bool radar_fresh = radar_has_rel_ &&
             (this->get_clock()->now().seconds() - radar_rel_time_) < radar_timeout_;
 
-        // A STEADY difference here is the radar/IMU world-frame yaw mismatch (dial it out with
-        // radar.yaw_offset_deg); azimuth only, that is the component a yaw offset corrupts.
+        // Track the SYSTEMATIC yaw offset (constant frame misalignment). Subtract the expected
+        // motion-induced az diff (v_perp * delay / r) from d_az before updating the EMA — this
+        // removes the target-motion component so the EMA converges to the constant offset only.
+        // The EMA is then applied in fuse_radar as an online yaw correction (rotating the radar
+        // measurement to match the camera frame), auto-calibrating radar.yaw_offset_deg.
         if (radar_fresh && std::isfinite(d_az)) {
-            bearing_err_ema_ = has_bearing_err_ ? (0.8 * bearing_err_ema_ + 0.2 * d_az) : d_az;
+            double d_az_sys = d_az;
+            if (estimator_ && estimator_->initialized) {
+                const auto& xs = estimator_->imm_ukf->x;
+                const double rxy = std::sqrt(xs(0)*xs(0) + xs(1)*xs(1));
+                if (rxy > 1e-3) {
+                    const double vp = std::abs(xs(0)*xs(4) - xs(1)*xs(3)) / rxy;
+                    const double motion_az = vp * radar_max_delay_comp_ / rxy;
+                    d_az_sys = d_az - std::copysign(motion_az, d_az);
+                }
+            }
+            bearing_err_ema_ = has_bearing_err_ ? (0.92 * bearing_err_ema_ + 0.08 * d_az_sys) : d_az_sys;
             has_bearing_err_ = true;
             RCLCPP_INFO_THROTTLE(this->get_logger(), *this->get_clock(), 1000,
-                "[FRAME] cam-radar az diff=%.1f deg (ema %.1f) — a steady value is radar.yaw_offset_deg",
-                d_az * 180.0 / M_PI, bearing_err_ema_ * 180.0 / M_PI);
+                "[FRAME] cam-radar az diff=%.1f deg (motion-corrected %.1f, yaw_ema %.1f)",
+                d_az * 180.0 / M_PI, d_az_sys * 180.0 / M_PI, bearing_err_ema_ * 180.0 / M_PI);
         }
         if (!width_locked_ && radar_fresh && bbox_s >= width_min_bbox_) {
             // Filtered, radar-anchored range (the same quantity the controller trusts) — strictly
