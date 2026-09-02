@@ -60,7 +60,7 @@ interceptor_node_relative_imm_ukf:
     # Controller parameters
     controller:
       N: 4.5
-      K_att: 6.0     # attitude P-gain (was 9.0; lowered to damp the close-range roll limit-cycle)
+      K_att: 5.0     # attitude P-gain (was 9.0; lowered to damp the close-range roll limit-cycle)
       K_yaw: 5.0
       # --- Active vertical guidance: cascaded velocity-limited altitude track ---
       # v_z_desired = clamp(dz * K_dz, ±v_climb/v_descent); a_z = K_az*(v_z_desired - own_vz).
@@ -72,7 +72,7 @@ interceptor_node_relative_imm_ukf:
       # Cruise closing speed (m/s). Must exceed any target's speed or the interceptor cannot gain
       # on a maneuvering/crossing target; the speed-aware brake floor (see compute_control) keeps
       # the final-approach speed above the target speed so v_des sets the mid-course advantage.
-      v_des: 25.0
+      v_des: 20.0
       # FOV keep-in-frame guard
       enable_fov_clamp: true   # hard-clamp pitch to keep target in FOV
       fov_keep_margin: 0.65    # fraction of the FOV half-angle to keep the target within
@@ -221,3 +221,11 @@ interceptor_node_relative_imm_ukf:
       motion_gate_factor: 1.0        # safety factor for the motion-dependent LOS gate widening. At close range with a
                                       # fast-crossing target, the radar delay introduces a bearing error ~ v_perp * lag / r;
                                       # this scales it. 0 = fixed gate (old behavior).
+      # Re-intercept: after a terminal vision-loss MISS (target lost > vision_lost_timeout, NOT a clean
+      # hit), re-engage the radar relay for another mid-course + terminal pass instead of brake-to-hold
+      # forever. Off by default — set true (with radar.enable=true) for a second chance after the target
+      # dodges out of the FOV near intercept.
+      reintercept_enable: true       # master switch (only acts when radar.enable is also true)
+      reintercept_max: 2             # max re-intercept attempts (total terminal passes = 1 + this)
+      reintercept_kill_range: 1.0    # m; if the closest approach was <= this, assume a clean HIT (don't re-attempt). 0 = always re-attempt on vision loss.
+      reintercept_min_range: 15.0    # m; re-engage only once radar shows the target back beyond this standoff (clean re-approach). 0 = re-engage immediately.

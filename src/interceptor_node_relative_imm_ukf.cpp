@@ -1526,6 +1526,12 @@ private:
         this->declare_parameter<double>("radar.width_window", 1.5); // s, rolling window for the width median (survives transient misses)
         this->declare_parameter<double>("radar.width_min_bbox", 25.0); // px, only anchor the width from a bbox this large (a tiny long-range bbox is over-bound by the tracker -> inflated W). Shifts the lock closer where the bbox is accurate.
         this->declare_parameter<double>("radar.width_scale", 1.0);   // multiplicative correction for tracker over-bounding: locked_W *= scale. Calibrate as true_W / locked_W (e.g. 0.66 if it locks 2.26 for a 1.5 m target).
+        // Re-intercept: on a terminal vision loss (a miss, NOT a clean hit), re-engage the radar
+        // relay for another mid-course + terminal pass instead of brake-to-hold forever. Off by default.
+        this->declare_parameter<bool>("radar.reintercept_enable", false);   // master switch
+        this->declare_parameter<int>("radar.reintercept_max", 2);            // max re-intercept attempts (total terminal passes = 1 + this)
+        this->declare_parameter<double>("radar.reintercept_kill_range", 1.0);// m; if the closest approach was <= this, treat as a clean hit (don't re-attempt). 0 = always re-attempt.
+        this->declare_parameter<double>("radar.reintercept_min_range", 15.0);// m; re-engage only once radar shows the target back beyond this standoff (clean re-approach). 0 = immediate.
     }
 
     void load_parameters() {
@@ -1654,6 +1660,10 @@ private:
         width_window_s_ = std::max(0.1, this->get_parameter("radar.width_window").as_double());
         width_min_bbox_ = std::max(1.0, this->get_parameter("radar.width_min_bbox").as_double());
         width_scale_ = this->get_parameter("radar.width_scale").as_double();
+        reintercept_enable_ = this->get_parameter("radar.reintercept_enable").as_bool();
+        reintercept_max_ = std::max(0, static_cast<int>(this->get_parameter("radar.reintercept_max").as_int()));
+        reintercept_kill_range_ = std::max(0.0, this->get_parameter("radar.reintercept_kill_range").as_double());
+        reintercept_min_range_ = std::max(0.0, this->get_parameter("radar.reintercept_min_range").as_double());
         const double radar_yaw_off = this->get_parameter("radar.yaw_offset_deg").as_double() * M_PI / 180.0;
         radar_R_yaw_ = Eigen::AngleAxisd(radar_yaw_off, Eigen::Vector3d::UnitZ()).toRotationMatrix();
         vision_locked_ = !radar_enable_;
@@ -2075,6 +2085,7 @@ private:
             const bool width_ready = width_locked_ || !radar_has_rel_;
             if (run_ok && width_ready) {
                 vision_locked_ = true;
+                had_terminal_attempt_ = true;   // a terminal phase began — gates re-intercept on a later vision loss
                 RCLCPP_INFO(this->get_logger(),
                     "[HANDOVER] Visual lock: %d validated frames over %.1fs, W=%.2fm%s "
                     "— terminal guidance on vision, radar standing by",
@@ -2187,6 +2198,7 @@ private:
 
         if (!was_initialized && estimator_->initialized) {
             transition_to_state(MissionState::TRACKING, "Target initialized");
+            had_terminal_attempt_ = true;   // camera-only path: vision owns guidance from frame 0
         }
         RCLCPP_INFO_THROTTLE(this->get_logger(), *this->get_clock(), THROTTLE_INTERVAL_MS,
             "bbox=%d%s size=%.1f init=%d->%d", has_bbox, (has_bbox && !bbox_ok) ? "(rejected)" : "",
@@ -2398,6 +2410,47 @@ private:
             }
         }
 
+        // ---- Re-intercept (radar.reintercept_enable) ----------------------------------------
+        // On a terminal vision-loss MISS (target gone > vision_lost_timeout AFTER a real terminal
+        // phase) that was NOT a clean hit (closest approach > kill_range), if the radar has
+        // re-acquired the target at a standoff and attempts remain: clear the capture/dropout
+        // latches and resume radar mid-course guidance for another pass. The radar cache is already
+        // being filled again (vision_locked_ flipped false at vision_lost_timeout, reopening fuse_radar
+        // + fill_cache_from_radar). Placed BEFORE the capture/dropout blocks so the reset clears both,
+        // then execution falls through to compute_control. Self-debouncing: had_terminal_attempt_ is
+        // cleared here and only re-armed on the next vision lock.
+        {
+            const double prev_min = min_range_seen_;
+            const bool terminal_miss = had_terminal_attempt_ && !vision_delivering(now.seconds()) &&
+                                       min_range_seen_ > reintercept_kill_range_;
+            const bool radar_reacquired = radar_enable_ && radar_has_rel_ &&
+                                          radar_rel_pos_.norm() > reintercept_min_range_;
+            if (reintercept_enable_ && terminal_miss && radar_reacquired &&
+                reintercept_count_ < reintercept_max_) {
+                ++reintercept_count_;
+                captured_ = false;
+                has_frozen_cmd_ = false;
+                last_good_range_ = 1e9;
+                min_range_seen_ = 1e9;
+                min_vision_range_ = 1e9;
+                last_bbox_time_ = 0.0;
+                {
+                    std::lock_guard<std::mutex> ol(odom_mtx_);
+                    v_own_brake_.setZero();
+                    brake_vel_seeded_ = false;
+                }
+                vision_locked_ = false;          // radar owns guidance again (force; likely already false)
+                had_terminal_attempt_ = false;   // re-arms on the next vision lock
+                transition_to_state(MissionState::BLIND_FLIGHT, "Re-intercept: radar relay re-engaged");
+                RCLCPP_WARN(this->get_logger(),
+                    "[REINTERCEPT] attempt %d/%d after terminal miss (min %.1fm > kill %.1fm); "
+                    "radar standoff %.1fm — resuming mid-course relay",
+                    reintercept_count_, reintercept_max_, prev_min, reintercept_kill_range_,
+                    radar_rel_pos_.norm());
+                // fall through to normal guidance (the radar-filled cache drives compute_control)
+            }
+        }
+
         // Capture lockout: latch true once the UAV has intercepted, then BRAKE-TO-HOLD for the rest
         // of the mission. Resuming normal guidance after a close approach — bbox flickered back or
         // dead-reckon chased a reacquired target — flew the UAV 70-250 m off after an otherwise-clean
@@ -2410,13 +2463,29 @@ private:
         const bool overshot = std::abs(los_az) > (M_PI / 2.0);
         if (cache.valid) {
             min_range_seen_ = std::min(min_range_seen_, cache.r_est.norm());
+            // Vision-only running min: anchors the fly-through (range_reopened) detector. The
+            // estimator/radar cache range is INCONSISTENT with vision during a radar re-engage — radar
+            // drives min_range_seen_ down as the interceptor closes, but vision at handover still
+            // measures the standoff range, so min_range_seen_ would false-trigger a reopen the instant
+            // vision handsover. min_vision_range_ advances only on real vision frames, so a reopen
+            // requires a genuine vision close approach first.
+            if (cache.has_bbox) {
+                min_vision_range_ = std::min(min_vision_range_, cache.r_est.norm());
+            }
         }
         // Reopen: range bottomed out and has since grown past it — the UAV flew through the target.
         // Robust under a noisy close-range estimate (high-noise scenario) where los_az never cleanly
-        // flips past 90 deg. Only arms after a real close approach (min_range_seen < 15 m).
-        const bool range_reopened = has_frozen_cmd_ && min_range_seen_ < 15.0 &&
-            cache.valid && cache.r_est.norm() > min_range_seen_ + 8.0;
-        if (!captured_ && cache.valid &&
+        // flips past 90 deg. Keyed on min_vision_range_ (vision-confirmed) so it only arms after a real
+        // vision close approach — immune to the radar-cache inconsistency during radar re-engage.
+        const bool range_reopened = has_frozen_cmd_ && min_vision_range_ < 15.0 &&
+            cache.valid && cache.r_est.norm() > min_vision_range_ + 8.0;
+        // Capture is a terminal-phase concept: only arm it once a confirmed vision terminal pass has
+        // begun this engagement (had_terminal_attempt_). This suppresses a spurious range_reopened
+        // capture during radar re-engage right after a re-intercept, where the noisy post-dropout
+        // estimate dips min_range_seen_ < 15 then jumps (reads as a fly-through but is just the
+        // re-approach). Legitimate captures (close approach / overshot / real fly-through) always
+        // occur after vision engaged, so had_terminal_attempt_ is true for them.
+        if (had_terminal_attempt_ && !captured_ && cache.valid &&
             (cache.r_est.norm() < capture_range ||
              (overshot && has_frozen_cmd_ && last_good_range_ < 12.0) ||
              range_reopened)) {
@@ -2633,6 +2702,9 @@ private:
             last_bbox_time_ = 0.0;
             captured_ = false;
             min_range_seen_ = 1e9;
+            min_vision_range_ = 1e9;
+            reintercept_count_ = 0;
+            had_terminal_attempt_ = false;
             collision_detected_ = false;
             yaw_align_init_ = false;
             {
@@ -2928,6 +3000,19 @@ private:
     // reopens, the UAV flew past the target. More robust than los_az under a noisy close-range
     // estimate (high-noise scenario), where the bearing never cleanly flips past 90 deg.
     double min_range_seen_ = 1e9;
+    // Vision-only running min of r_est (advances only on cache.has_bbox frames). Anchors
+    // range_reopened so the fly-through detector isn't poisoned by the radar/estimator cache during
+    // a radar re-engage. Reset on mission launch and on each re-intercept.
+    double min_vision_range_ = 1e9;
+    // Re-intercept (radar.reintercept_enable): on a terminal vision-loss miss, re-engage the radar
+    // relay for another pass instead of holding forever. had_terminal_attempt_ gates it to a vision
+    // loss that followed a real terminal phase; reintercept_count_ bounds the attempts.
+    bool reintercept_enable_ = false;
+    int  reintercept_max_ = 2;
+    double reintercept_kill_range_ = 1.0;
+    double reintercept_min_range_ = 15.0;
+    int  reintercept_count_ = 0;
+    bool had_terminal_attempt_ = false;
     double frozen_thrust_ = 0.0;
     double frozen_rate_x_ = 0.0;
     double frozen_rate_y_ = 0.0;

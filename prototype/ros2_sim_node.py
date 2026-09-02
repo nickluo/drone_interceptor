@@ -377,6 +377,20 @@ SCENARIOS = {
         target_width=1.5, dropout=None,
         detect_min_size=25.0, radar=True, false_positive_prob=0.25),
 
+    # Re-intercept: radar mid-course -> vision handover (terminal) -> a forced bbox dropout LONGER
+    # than radar.vision_lost_timeout (1.5 s) while the radar keeps publishing -> the node must judge a
+    # terminal miss and re-engage the radar relay for a second pass. Needs radar_reintercept_enable
+    # (run_all_scenarios.sh passes radar_reintercept_enable:=true). Tune the dropout window so it
+    # lands AFTER the [HANDOVER] log and BEFORE the first pass is within kill_range; verify in the node
+    # log that [REINTERCEPT] fires and a second handover + intercept follows.
+    'radar_reintercept': dict(
+        target_init=[110.0, 55.0, 20.0],
+        vel_fn=lambda t: [-4.0, -2.0, 0.0],
+        uav_init=[0.0, 0.0, 10.0], uav_yaw=0.0,
+        sim_time=55.0, noise_pos=1.5, noise_size=2.0,
+        target_width=1.5, dropout=(5.5, 10.5),
+        detect_min_size=25.0, radar=True),
+
     # ---- Terminal entry-speed tests ----
     # Isolate the terminal vision phase from the mid-course: the interceptor starts already at
     # cruise speed V aimed straight at the target, ~45 m out (the AirSim radar->vision handover

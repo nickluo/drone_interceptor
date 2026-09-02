@@ -2,11 +2,16 @@
 # Run one relative_imm_ukf scenario end-to-end: launch the C++ node, drive it with the ROS2 sim
 # harness, then tear both down. Logs land in /tmp/imm_ukf_<scenario>.node.log.
 #
-#   ./run_scenario.sh radar_relay --radar
 #   ./run_scenario.sh nominal
+#   ./run_scenario.sh radar_reintercept radar_reintercept_enable:=true   # override a launch arg
 
-SCEN="${1:?usage: run_scenario.sh <scenario> [extra sim args...]}"
+SCEN="${1:?usage: run_scenario.sh <scenario> [node_param:=val ...] [extra sim args...]}"
 shift || true
+# Leading key:=val args are forwarded to `ros2 launch` as node-param overrides (the launch args
+# declared in launch_relative_imm_ukf.py, e.g. radar_reintercept_enable). The first arg without '='
+# starts the sim args (everything after is passed to ros2_sim_node.py).
+LPARAMS=""
+while [ $# -gt 0 ]; do case "$1" in *=*) LPARAMS="$LPARAMS $1"; shift;; *) break;; esac; done
 
 WS=/home/nick/workspace/fpv_ws
 source /opt/ros/jazzy/setup.bash
@@ -19,7 +24,7 @@ SIM_LOG="${TMPDIR:-/tmp}/imm_ukf_${SCEN}.sim.log"
 rm -f "$NODE_LOG" "$SIM_LOG"
 
 ros2 launch drone_interceptor launch_relative_imm_ukf.py \
-    use_simulation:=true >"$NODE_LOG" 2>&1 &
+    use_simulation:=true $LPARAMS >"$NODE_LOG" 2>&1 &
 LAUNCH_PID=$!
 sleep 4
 
