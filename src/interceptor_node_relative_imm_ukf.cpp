@@ -944,6 +944,18 @@ public:
     double dither_amp_ = 0.8;          // m/s^2, lateral dither amplitude
     double dither_freq_ = 0.5;         // Hz, lateral dither frequency
     double dither_min_range_ = 10.0;   // m, suppress dither inside this range (don't disturb terminal)
+    // SECOND, W-independent close gate: suppress the dither when the bbox is already LARGE in px.
+    // The dither exists to lift the size-channel SNR while the bbox is small; a large bbox means
+    // good SNR and/or a close target, where the dither only disturbs terminal precision. bbox px
+    // is a DIRECT observable, immune to the monocular (W, range) scale error that blinds
+    // dither_min_range_: W over-estimated by k over-estimates range by k, so the range gate never
+    // trips while the serpentine persists into true close range and causes a miss. 80 px chosen
+    // empirically (wrong_w x10 FOV sweep: 80px 7/10 vs 60px 5/10 vs off 6/10 — 60px cuts the
+    // dither while the W/scale estimate still needs its observability aid). At focal 1057:
+    // W 1.5 -> 20 m, W 0.8 -> 10.6 m; an over-bound tracker trips even earlier — safer. 0 = off.
+    double dither_max_bbox_ = 80.0;    // px, ALSO suppress the dither when bbox >= this size
+    double last_bbox_size_ = 0.0;      // px, last live bbox (stale-hold across dropout frames)
+    double last_bbox_t_ = -1.0;        // s, mission-relative time of last_bbox_size_
     // Axial-only range EMA (radar smoothness): isolates the turn-radius cap + terminal-decel ramp
     // from 10 Hz radar single-sample range noise. r_norm elsewhere (PN, dz, APN) stays unsmoothed.
     // Lag is conservative during closing (over-estimates range -> cap allows slightly more speed,
@@ -1008,6 +1020,8 @@ public:
         r_norm_ema_ = 0.0;
         last_rn_ema_t_ = -1.0;
         has_rn_ema_ = false;
+        last_bbox_size_ = 0.0;
+        last_bbox_t_ = -1.0;
     }
     void set_a_z_slew(double v) { a_z_slew_ = (v > 0.0) ? v : 1e9; }  // <=0 disables the slew limit
     void set_lateral_decay_floor(double v) { lateral_decay_floor_ = clamp(v, 0.0, 1.0); }
@@ -1030,13 +1044,15 @@ public:
     // Guidance tuning (operator-facing): axial gain, vertical tracking gain + accel limit, and the
     // lateral observability dither. All independent config params.
     void set_guidance_tuning(double K_fwd, double K_az, double a_z_limit,
-                             double dither_amp, double dither_freq, double dither_min_range) {
+                             double dither_amp, double dither_freq, double dither_min_range,
+                             double dither_max_bbox) {
         K_fwd_           = std::max(0.1, K_fwd);
         K_az_            = std::max(0.1, K_az);
         a_z_limit_       = std::max(1.0, a_z_limit);
         dither_amp_      = std::max(0.0, dither_amp);
         dither_freq_     = std::max(0.01, dither_freq);
         dither_min_range_= std::max(1.0, dither_min_range);
+        dither_max_bbox_ = std::max(0.0, dither_max_bbox);   // 0 disables the px gate
     }
     // Axial-only range EMA time constant (radar smoothness). <=0 disables (passthrough r_norm).
     void set_range_smooth_tc(double tc) { r_norm_smooth_tc_ = std::max(0.0, tc); }
@@ -1068,7 +1084,8 @@ public:
                                         double los_rate = 0.0,
                                         const Eigen::Vector3d& a_own_world = Eigen::Vector3d::Zero(),
                                         double boresight_el_meas = std::numeric_limits<double>::quiet_NaN(),
-                                        bool radar_owns_guidance = false) {
+                                        bool radar_owns_guidance = false,
+                                        bool radar_close_range = false) {
         (void)v_est;
         const double r_norm = r_est.norm();
         // Axial-only range EMA (radar smoothness): r_norm carries +-~4 m of 10 Hz radar noise; fed
@@ -1124,7 +1141,28 @@ public:
         // Suppressed while the radar owns guidance: the radar gives absolute scale directly, so the
         // monocular-observability job the dither does is redundant during radar-only flight, and the
         // 0.3 Hz lateral sinusoid only adds an airspeed oscillation. Re-engages at/after vision lock.
-        if (dither_amp_ > 0.0 && r_norm > dither_min_range_ && !radar_owns_guidance) {
+        // TWO additional independent close gates (a W-over-estimated range estimate keeps r_norm
+        // above dither_min_range_ forever, so the serpentine used to persist into true close range
+        // and cause misses):
+        //  (a) bbox px: a large bbox = good size-SNR / close target — the dither's job is done. This
+        //      is a DIRECT observable, immune to the monocular (W, range) scale error. Stale-hold
+        //      the last live bbox for 0.5 s (~vision_hold) so a dropout frame cannot re-arm it.
+        //  (b) radar range: a fresh radar track showing the target inside dither_radar_range — works
+        //      after the vision lock too (the radar cache keeps updating; only fusion disengages).
+        bool dither_suppressed_by_bbox = false;
+        if (dither_max_bbox_ > 0.0) {
+            double s_eff = bbox_size;
+            if (s_eff <= 0.0 && last_bbox_t_ >= 0.0 && (t - last_bbox_t_) < 0.5) {
+                s_eff = last_bbox_size_;
+            }
+            dither_suppressed_by_bbox = s_eff >= dither_max_bbox_;
+        }
+        if (bbox_size > 0.0) {
+            last_bbox_size_ = bbox_size;
+            last_bbox_t_ = t;
+        }
+        if (dither_amp_ > 0.0 && r_norm > dither_min_range_ && !radar_owns_guidance &&
+            !dither_suppressed_by_bbox && !radar_close_range) {
             const double a_dither = dither_amp_ * std::sin(2.0 * M_PI * dither_freq_ * t);
             a_lat_world += a_dither * e_perp_xy;
         }
@@ -1458,6 +1496,8 @@ private:
         this->declare_parameter<double>("controller.dither_amp", 0.8);  // m/s^2, lateral observability dither
         this->declare_parameter<double>("controller.dither_freq", 0.5); // Hz
         this->declare_parameter<double>("controller.dither_min_range", 10.0); // m, suppress dither inside
+        this->declare_parameter<double>("controller.dither_max_bbox", 80.0); // px, ALSO suppress the dither when the bbox >= this size (large bbox = good size-SNR / close target; independent of the W-derived range estimate, which is exactly what blinds dither_min_range). 0 = off.
+        this->declare_parameter<double>("controller.dither_radar_range", 20.0); // m, suppress the dither when a FRESH radar track shows the target closer than this (works after vision lock too — the radar cache keeps updating; only fusion is disengaged). 0 = off. Radar-only.
         this->declare_parameter<double>("controller.range_smooth_tc", 0.3); // s, EMA on the range feeding the turn-radius cap (0=off; radar smoothness)
         this->declare_parameter<double>("controller.turn_radius_cap_factor", 0.8); // turn-radius maneuverability cap factor (clamped [0.3,1.0]; 1.0=physics limit). The binding terminal-speed reducer — see compute_control.
         this->declare_parameter<double>("controller.axial_deadband", 1.5); // m/s, coast within ±this of v_des — kills radar-noise-driven pitch oscillation during blind flight
@@ -1532,6 +1572,17 @@ private:
         this->declare_parameter<int>("radar.reintercept_max", 2);            // max re-intercept attempts (total terminal passes = 1 + this)
         this->declare_parameter<double>("radar.reintercept_kill_range", 1.0);// m; if the closest approach was <= this, treat as a clean hit (don't re-attempt). 0 = always re-attempt.
         this->declare_parameter<double>("radar.reintercept_min_range", 15.0);// m; re-engage only once radar shows the target back beyond this standoff (clean re-approach). 0 = immediate.
+        // Post-lock width re-anchor (safety net for a badly locked W). If the locked W disagrees
+        // with the still-tracking radar for a sustained window (r_vis = focal*W/bbox vs r_radar),
+        // re-anchor W and rescale the estimator. Bounds: frame count + window span + cooldown +
+        // width_reanchor_max total corrections. No-ops without a fresh radar track.
+        this->declare_parameter<bool>("radar.width_reanchor_enable", true);
+        this->declare_parameter<double>("radar.width_reanchor_min_range", 10.0);  // m, only trust the ratio beyond this radar range (metro noise dominates closer)
+        this->declare_parameter<double>("radar.width_reanchor_max_range", 150.0); // m, only trust the ratio inside this radar range
+        this->declare_parameter<double>("radar.width_reanchor_ratio", 1.25);      // fire when |median r_vis/r_radar| outside [1/x, x]
+        this->declare_parameter<double>("radar.width_reanchor_window", 2.0);      // s, sustained-disagreement window
+        this->declare_parameter<int>("radar.width_reanchor_min_frames", 15);      // frames inside the window (>=5)
+        this->declare_parameter<int>("radar.width_reanchor_max", 2);              // max corrections per mission
     }
 
     void load_parameters() {
@@ -1613,7 +1664,8 @@ private:
             this->get_parameter("physics.a_z_limit").as_double(),
             this->get_parameter("controller.dither_amp").as_double(),
             this->get_parameter("controller.dither_freq").as_double(),
-            this->get_parameter("controller.dither_min_range").as_double());
+            this->get_parameter("controller.dither_min_range").as_double(),
+            this->get_parameter("controller.dither_max_bbox").as_double());
         controller_->set_range_smooth_tc(this->get_parameter("controller.range_smooth_tc").as_double());
         {
             const double trcf = this->get_parameter("controller.turn_radius_cap_factor").as_double();
@@ -1626,6 +1678,7 @@ private:
         }
         controller_->set_axial_deadband(this->get_parameter("controller.axial_deadband").as_double());
         controller_->set_motion_gate_factor(this->get_parameter("radar.motion_gate_factor").as_double());
+        dither_radar_range_ = std::max(0.0, this->get_parameter("controller.dither_radar_range").as_double());
         vel_smooth_tc_ = this->get_parameter("estimation.vel_smooth_tc").as_double();
         const std::vector<double> bias = this->get_parameter("imu_bias").as_double_array();
         if (bias.size() == 3) {
@@ -1664,6 +1717,14 @@ private:
         reintercept_max_ = std::max(0, static_cast<int>(this->get_parameter("radar.reintercept_max").as_int()));
         reintercept_kill_range_ = std::max(0.0, this->get_parameter("radar.reintercept_kill_range").as_double());
         reintercept_min_range_ = std::max(0.0, this->get_parameter("radar.reintercept_min_range").as_double());
+        width_reanchor_enable_ = this->get_parameter("radar.width_reanchor_enable").as_bool();
+        width_reanchor_min_range_ = std::max(1.0, this->get_parameter("radar.width_reanchor_min_range").as_double());
+        width_reanchor_max_range_ = std::max(width_reanchor_min_range_ + 10.0,
+                                             this->get_parameter("radar.width_reanchor_max_range").as_double());
+        width_reanchor_ratio_ = clamp(this->get_parameter("radar.width_reanchor_ratio").as_double(), 1.05, 3.0);
+        width_reanchor_window_ = std::max(0.5, this->get_parameter("radar.width_reanchor_window").as_double());
+        width_reanchor_min_frames_ = std::max(5, static_cast<int>(this->get_parameter("radar.width_reanchor_min_frames").as_int()));
+        width_reanchor_max_ = std::max(0, static_cast<int>(this->get_parameter("radar.width_reanchor_max").as_int()));
         const double radar_yaw_off = this->get_parameter("radar.yaw_offset_deg").as_double() * M_PI / 180.0;
         radar_R_yaw_ = Eigen::AngleAxisd(radar_yaw_off, Eigen::Vector3d::UnitZ()).toRotationMatrix();
         vision_locked_ = !radar_enable_;
@@ -2020,13 +2081,16 @@ private:
                 d_az * 180.0 / M_PI, d_az_sys * 180.0 / M_PI, bearing_err_ema_ * 180.0 / M_PI);
         }
         if (!width_locked_ && radar_fresh && bbox_s >= width_min_bbox_) {
-            // Filtered, radar-anchored range (the same quantity the controller trusts) — strictly
-            // lower-variance than the raw single-sample radar_rel_pos_, so the locked width does not
-            // inherit per-sample latency-extrapolation noise/bias. Runs before process_camera, i.e. on
-            // the pre-camera-update (radar-predicted) blended state — exactly the independent anchor.
-            const double r_filter = estimator_ ? estimator_->imm_ukf->x.head<3>().norm() : 0.0;
-            if (r_filter > 1.0 && r_filter < handover_max_range_) {
-                const double w_meas = clamp(bbox_s * r_filter / focal_length_, width_min_, width_max_);
+            // Anchor W on the RADAR relative range, NOT the estimator blend. Before the width locks,
+            // the camera size channel is scale-degenerate (s = focal*W/z), so the blend — although
+            // radar-fused — can sit anywhere along the W/r hyperbola that its pixel updates dragged
+            // it to (observed: blend 19.7 m while the radar measured ~56 m -> W locked 0.58 m for a
+            // 1.5 m target; the error is permanent once locked). radar_rel_pos_ is the raw
+            // delay-compensated radar pair — unbiased; its per-sample noise (sigma ~4 m) is removed
+            // by the median/MAD window below, which is exactly what it is for.
+            const double r_anchor = radar_rel_pos_.norm();
+            if (r_anchor > 1.0 && r_anchor < handover_max_range_) {
+                const double w_meas = clamp(bbox_s * r_anchor / focal_length_, width_min_, width_max_);
                 width_samples_.push_back({w_meas, t_now});
                 // Rolling window: age out stale samples so a transient missed frame (which no longer
                 // wipes the buffer) does not leave stale data, and the median tracks a moving range.
@@ -2062,13 +2126,13 @@ private:
                     width_locked_ = true;
                     RCLCPP_INFO(this->get_logger(),
                         "[HANDOVER] Target width fixed from radar range: W=%.2fm "
-                        "(median %.2f, scale %.3f, kept %zu/%zu, r_filter=%.1fm bbox=%.1fpx focal=%.0f)",
-                        w_fused, w_med, width_scale_, kept.size(), ws.size(), r_filter, bbox_s, focal_length_);
+                        "(median %.2f, scale %.3f, kept %zu/%zu, r_radar=%.1fm bbox=%.1fpx focal=%.0f)",
+                        w_fused, w_med, width_scale_, kept.size(), ws.size(), r_anchor, bbox_s, focal_length_);
                 }
             } else {
                 RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 2000,
-                    "Width fix skipped: filtered range %.0fm outside (1, %.0f]m",
-                    r_filter, handover_max_range_);
+                    "Width fix skipped: radar range %.0fm outside (1, %.0f]m",
+                    r_anchor, handover_max_range_);
             }
         }
 
@@ -2099,6 +2163,87 @@ private:
                     "already active on w_guess, W anchor pending)", vision_frames_);
             }
         }
+    }
+
+    // ---- Post-lock width re-anchor (radar.width_reanchor_*) --------------------------------
+    // Safety net for a badly locked W: with W inflated by k, the monocular range r = focal*W/s is
+    // inflated by the same k, which (a) blinds every close-range gate keyed on r_est — dither
+    // min-range, width freeze, size gate, coast, fly-through — and (b) wrecks terminal guidance.
+    // While vision is locked the radar fusion is disengaged, but the radar cache still updates, so
+    // the ratio r_vis/r_radar is an independent, continuously available consistency check. A
+    // SUSTAINED disagreement (median over a window, both frame count and time span) re-anchors W
+    // and rescales the estimator onto the radar-consistent scale. Bounded: cooldown after each
+    // correction + width_reanchor_max total, and the window resets whenever any gate breaks.
+    // Called from bbox_callback under estimator_mtx_ (radar_rel_pos_ writer side) BEFORE
+    // process_camera so the rescale lands before this frame's update.
+    void update_width_reanchor(bool bbox_ok, double bbox_s, double t_now) {
+        if (!width_reanchor_enable_ || width_reanchor_max_ <= 0) return;
+        const bool radar_fresh = radar_has_rel_ &&
+            (this->get_clock()->now().seconds() - radar_rel_time_) < radar_timeout_;
+        const double r_radar = radar_rel_pos_.norm();
+        const bool gates = vision_locked_ && width_locked_ && radar_fresh && bbox_ok &&
+                           bbox_s >= width_min_bbox_ &&
+                           width_reanchor_count_ < width_reanchor_max_ &&
+                           t_now >= width_reanchor_cooldown_until_;
+        if (!gates || r_radar < width_reanchor_min_range_ || r_radar > width_reanchor_max_range_) {
+            width_reanchor_samples_.clear();   // any broken gate resets the window
+            return;
+        }
+        const double w_locked = estimator_ ? estimator_->imm_ukf->x(9) : 0.0;
+        if (w_locked < 0.05 || bbox_s <= 1.0) return;
+        const double r_vis = focal_length_ * w_locked / bbox_s;   // vision-implied range
+        const double ratio = r_vis / r_radar;                     // >1: W inflated (range over-estimated)
+        // Radar glitch / bbox outlier: DROP the sample but keep the window (a single wild ratio
+        // must neither trigger nor starve the detector).
+        if (!(ratio > 0.2 && ratio < 5.0)) return;
+        width_reanchor_samples_.push_back({ratio, t_now});
+        width_reanchor_samples_.erase(
+            std::remove_if(width_reanchor_samples_.begin(), width_reanchor_samples_.end(),
+                           [&](const ReanchorSample& s){ return (t_now - s.t) > width_reanchor_window_; }),
+            width_reanchor_samples_.end());
+        const int n = static_cast<int>(width_reanchor_samples_.size());
+        if (n < width_reanchor_min_frames_) return;
+        if (t_now - width_reanchor_samples_.front().t < 0.75 * width_reanchor_window_) return;  // need a real span
+        std::vector<double> rs;
+        for (const auto& s : width_reanchor_samples_) rs.push_back(s.ratio);
+        std::sort(rs.begin(), rs.end());
+        const double med = rs[rs.size() / 2];
+        if (med > width_reanchor_ratio_ || med < 1.0 / width_reanchor_ratio_) {
+            apply_width_reanchor(med, w_locked, r_vis, r_radar, bbox_s, t_now, n);
+        }
+    }
+
+    void apply_width_reanchor(double ratio, double w_locked, double r_vis, double r_radar,
+                              double bbox_s, double t_now, int n_frames) {
+        ++width_reanchor_count_;
+        const double s_scale = 1.0 / ratio;                       // == r_radar / r_vis
+        const double w_new = clamp(w_locked / ratio, width_min_, width_max_);
+        // Rescale every IMM filter: x' = D x, P' = D P D^T with D = diag(s,s,s,1,...,1). The error
+        // is a pure SCALE error (W and pos both off by the same factor), so position-only scaling
+        // is the physically consistent correction. Velocity is NOT stepped (v_perp is scale-free
+        // via bearing; a v_los step would jolt PN mid-flight) — the 30 Hz pixel update re-converges
+        // v_los within a few frames, and the P scaling lets the update absorb the innovation.
+        for (auto& filter : estimator_->imm_ukf->filters) {
+            filter.x.segment<3>(0) *= s_scale;
+            filter.P.topLeftCorner<3, 3>() *= s_scale * s_scale;
+            filter.P.block(0, 3, 3, kStateDim - 3) *= s_scale;
+            filter.P.block(3, 0, kStateDim - 3, 3) *= s_scale;
+        }
+        estimator_->lock_width(w_new);   // re-freezes W at the corrected value + recomputes the blend
+        // Keep the estimated-range monotone trackers on the NEW scale: a post-correction growth of
+        // r_est (relative to the old minimum) would false-trigger the range_reopened fly-through
+        // capture at a moment when the interceptor is mid-approach.
+        if (min_range_seen_ < 1e8) min_range_seen_ *= s_scale;
+        if (min_vision_range_ < 1e8) min_vision_range_ *= s_scale;
+        if (last_good_range_ < 1e8) last_good_range_ *= s_scale;
+        width_reanchor_samples_.clear();
+        width_reanchor_cooldown_until_ = t_now + width_reanchor_window_;   // hysteresis
+        RCLCPP_WARN(this->get_logger(),
+            "[W-REANCHOR] %d/%d: locked W=%.2fm inconsistent with radar "
+            "(r_vis=%.1fm vs r_radar=%.1fm, ratio %.2f over %d frames) -> W=%.2fm, "
+            "rel pos rescaled x%.2f, bbox=%.1fpx",
+            width_reanchor_count_, width_reanchor_max_, w_locked, r_vis, r_radar, ratio,
+            n_frames, w_new, s_scale, bbox_s);
     }
 
     void bbox_callback(const vision_msgs::msg::Detection2D::SharedPtr msg) {
@@ -2191,6 +2336,9 @@ private:
                 bbox_ok = bbox_matches_radar(los_nav_meas, s, &d_az);
             }
             update_vision_handover(bbox_ok, s, t_now, d_az);
+            // Post-lock W/radar consistency check (safety net for a badly locked W). Must run before
+            // process_camera so a rescale lands before this frame's update.
+            update_width_reanchor(bbox_ok, s, t_now);
         }
 
         const bool was_initialized = estimator_->initialized;
@@ -2584,11 +2732,31 @@ private:
         // monocular v_est(2) used before is poorly observable and left the vertical PD to over-dive
         // on below-FOV targets — own_vel_(2) is the actual own climb/sink rate).
         const double v_z = own_vel_now(2);
+        // Radar-known close range suppresses the dither even while vision owns guidance. The radar
+        // cache keeps updating after the vision lock (fuse_radar returns early but writes
+        // radar_rel_pos_ first), so this is an independent range opinion the whole terminal phase.
+        // Copy under the estimator mutex (fuse_radar's writer side); no other lock is held here.
+        bool dither_radar_close = false;
+        if (radar_enable_ && dither_radar_range_ > 0.0) {
+            Eigen::Vector3d r_radar;
+            double t_radar;
+            bool has_rel;
+            {
+                std::lock_guard<std::mutex> lock(estimator_mtx_);
+                r_radar = radar_rel_pos_;
+                t_radar = radar_rel_time_;
+                has_rel = radar_has_rel_;
+            }
+            dither_radar_close = has_rel &&
+                (now.seconds() - t_radar) < radar_timeout_ &&
+                r_radar.norm() < dither_radar_range_;
+        }
         const auto ctrl = controller_->compute_control(roll, pitch, yaw, cache.r_est, cache.v_est,
                                                        los_az, cache.los_el, t_rel, v_closing,
                                                        cache.bbox_size, v_z, cache.target_speed,
                                                        cache.los_rate, cache.a_own, boresight_el_meas,
-                                                       (radar_enable_ && radar_has_rel_ && !vision_delivering(now.seconds())));
+                                                       (radar_enable_ && radar_has_rel_ && !vision_delivering(now.seconds())),
+                                                       dither_radar_close);
         if (!std::isfinite(ctrl[0]) || !std::isfinite(ctrl[1]) || !std::isfinite(ctrl[2]) || !std::isfinite(ctrl[3])) {
             RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), THROTTLE_INTERVAL_MS*4,
                 "Skipping non-finite control command");
@@ -2704,6 +2872,9 @@ private:
             min_range_seen_ = 1e9;
             min_vision_range_ = 1e9;
             reintercept_count_ = 0;
+            width_reanchor_samples_.clear();
+            width_reanchor_count_ = 0;
+            width_reanchor_cooldown_until_ = -1.0;
             had_terminal_attempt_ = false;
             collision_detected_ = false;
             yaw_align_init_ = false;
@@ -2915,6 +3086,22 @@ private:
     double width_window_s_ = 1.5;   // s, rolling window for the width-median buffer (survives transient misses)
     double width_min_bbox_ = 25.0;  // px, minimum bbox size to anchor the radar width (tiny far-range bboxes are over-bound)
     double width_scale_ = 1.0;      // multiplicative correction for tracker over-bounding, applied to the locked width
+    // Dither suppression when a fresh radar track is inside this range (0 = off). Radar-only; see
+    // compute_control's dither gate.
+    double dither_radar_range_ = 20.0;
+    // Post-lock width re-anchor (radar.width_reanchor_*): sustained r_vis/r_radar disagreement ->
+    // re-lock W + rescale estimator. See update_width_reanchor.
+    bool width_reanchor_enable_ = true;
+    double width_reanchor_min_range_ = 10.0;
+    double width_reanchor_max_range_ = 150.0;
+    double width_reanchor_ratio_ = 1.25;
+    double width_reanchor_window_ = 2.0;
+    int width_reanchor_min_frames_ = 15;
+    int width_reanchor_max_ = 2;
+    int width_reanchor_count_ = 0;
+    double width_reanchor_cooldown_until_ = -1.0;
+    struct ReanchorSample { double ratio; double t; };
+    std::vector<ReanchorSample> width_reanchor_samples_;
 
     rclcpp::TimerBase::SharedPtr control_timer_;
     rclcpp::CallbackGroup::SharedPtr timer_callback_group_;

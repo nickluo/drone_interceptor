@@ -17,8 +17,13 @@ WS=/home/nick/workspace/fpv_ws
 source /opt/ros/jazzy/setup.bash
 source "$WS/install/setup.bash"
 
-# Radar is enabled through the radar block in config/relative_imm_ukf_params.yaml; the launch file
-# no longer exposes an override. Non-radar scenarios simply never publish a track.
+# Radar scenarios (name starting with "radar"): the launch file OVERRIDES radar.enable with the
+# use_radar launch arg (default False), so the node needs use_radar:=true even though
+# config/relative_imm_ukf_params.yaml sets radar.enable: true. Non-radar scenarios never publish
+# a track, so the node stays pure-vision for them (exercises the no-radar path).
+case "$SCEN" in
+    radar*) LPARAMS="$LPARAMS use_radar:=true" ;;
+esac
 NODE_LOG="${TMPDIR:-/tmp}/imm_ukf_${SCEN}.node.log"
 SIM_LOG="${TMPDIR:-/tmp}/imm_ukf_${SCEN}.sim.log"
 rm -f "$NODE_LOG" "$SIM_LOG"

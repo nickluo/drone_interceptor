@@ -122,6 +122,14 @@ interceptor_node_relative_imm_ukf:
       dither_amp: 1.0             # m/s^2, lateral observability dither amplitude (2.0 caused W_est cascade in AirSim; 1.0 is the middle ground)
       dither_freq: 0.3            # Hz, lateral dither frequency
       dither_min_range: 15.0       # m, suppress dither inside this range (don't disturb terminal)
+      dither_max_bbox: 80.0        # px, ALSO suppress the dither when the bbox >= this size (large
+                                   # bbox = good size-SNR / close target — the dither's observability job is done).
+                                   # Independent of the W-derived range estimate: W over-estimated by k
+                                   # over-estimates range by k, so dither_min_range never trips and the
+                                   # serpentine used to persist into true close range (miss). 80px chosen
+                                   # empirically (wrong_w x10 FOV sweep: 80px 7/10 vs 60px 5/10 vs off 6/10).
+                                   # At focal~1057: W=1.5 -> 20m, W=0.8 -> 10.6m. 0 = off.
+                                   # fusion is disengaged). 0 = off. No-ops without a radar relay feed.
       # Radar mid-course smoothness: EMA on the range feeding the turn-radius speed cap + terminal
       # decel ramp. The 10 Hz radar range carries ~4 m noise; fed 1:1 into sqrt(g*tan(max_tilt)*r) it
       # swings v_des_eff and brakes every cycle. Lag is conservative on closing (over-estimates range
@@ -229,3 +237,16 @@ interceptor_node_relative_imm_ukf:
       reintercept_max: 2             # max re-intercept attempts (total terminal passes = 1 + this)
       reintercept_kill_range: 1.0    # m; if the closest approach was <= this, assume a clean HIT (don't re-attempt). 0 = always re-attempt on vision loss.
       reintercept_min_range: 15.0    # m; re-engage only once radar shows the target back beyond this standoff (clean re-approach). 0 = re-engage immediately.
+      # Post-lock width re-anchor (safety net for a badly locked W — the failure that keeps the
+      # dither armed at close range): with W inflated by k, the monocular range r = focal*W/bbox is
+      # inflated by k and every close-range gate keyed on it is blinded. While vision is locked the
+      # radar fusion is off but the radar cache still updates, so r_vis = focal*W/bbox is continuously
+      # checked against r_radar; a sustained disagreement re-locks W and rescales the estimator onto
+      # the radar-consistent scale. No-ops without a fresh radar track.
+      width_reanchor_enable: true
+      width_reanchor_min_range: 10.0  # m; only trust the ratio beyond this radar range (metro noise dominates closer)
+      width_reanchor_max_range: 150.0 # m; only trust the ratio inside this radar range
+      width_reanchor_ratio: 1.25      # fire when the median r_vis/r_radar is outside [1/x, x]
+      width_reanchor_window: 2.0      # s, sustained-disagreement window (needs both frames and time span)
+      width_reanchor_min_frames: 15   # frames inside the window before the median is trusted
+      width_reanchor_max: 2           # max corrections per mission (plus cooldown between)

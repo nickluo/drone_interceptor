@@ -91,6 +91,9 @@ CTRL_TERMINAL_TILT_RANGE = 30.0   # m, roll-clamp + cap gate
 CTRL_AZ_SLEW = 20.0               # m/s^3, |da_z/dt| slew limit (Fix C/E, mirror C++ yaml controller.a_z_slew)
 CTRL_LAT_DECAY_FLOOR = 0.4        # Fix D: a_lat_mag floor at terminal_brake_range (close-range weave damp)
 CTRL_LAT_DECAY_START = 25.0       # Fix F: range at which close-range lateral attenuation begins (m, was 12)
+CTRL_DITHER_MAX_BBOX = 80.0       # px, ALSO suppress the dither when bbox >= this (large bbox = good size-SNR /
+                                  # close target; DIRECT observable immune to the (W, range) scale error that
+                                  # blinds dither_min_range — mirror C++ controller.dither_max_bbox. 0 = off)
 VEL_SMOOTH_TC = 0.25              # s, EMA on target-velocity estimate (Fix B, mirror C++ estimation.vel_smooth_tc)
 COAST_RANGE = 12.0       # terminal coast-on-dropout engages below this range (mirror C++)
 COAST_MAX_DUR = 1.5      # coast on the last good cmd this long (lets a close intercept complete / bbox return)
@@ -799,6 +802,9 @@ class AdvancedHybridController:
         self.dither_amp = 0.8          # m/s^2, lateral dither amplitude (lowered: 1.5 contaminates PN turn_sign on v20)
         self.dither_freq = 0.5         # Hz, lateral dither frequency
         self.dither_min_range = 10.0   # m, suppress dither inside this range (don't disturb terminal)
+        self.dither_max_bbox = CTRL_DITHER_MAX_BBOX  # px, second close gate independent of the (W, range) scale
+        self.last_bbox_size = 0.0      # px, last live bbox (stale-hold across dropout frames, mirror C++)
+        self.last_bbox_t = -1.0
         self.K_apn = 0.8               # Geometric-APN gain on bearing-derived a_t_perp (turning-target lead)
         self.K_apn_min_at = 0.5       # m/s^2, gate |a_t_perp_geom| (ydot EMA rejects noise on static/CV; maneuvering a_t_perp~1 passes)
         # lambda_dot 2nd-derivative (ydot) EMA state for geometric APN — bearing curvature is noisy.
@@ -837,6 +843,8 @@ class AdvancedHybridController:
         self.atp_ema = 0.0
         self.aown_perp_ema = 0.0
         self.los_rate_slow = 0.0
+        self.last_bbox_size = 0.0
+        self.last_bbox_t = -1.0
 
     def compute_control(self, roll, pitch, yaw, r_est, v_est, los_az, los_el, t,
                         v_fwd_body=0.0, bbox_size=0.0, v_z=0.0, los_rate=0.0, target_speed=0.0,
@@ -879,7 +887,21 @@ class AdvancedHybridController:
         turn_sign = 1.0 if lambda_dot >= 0.0 else -1.0
         a_lat_world = turn_sign * a_lat_mag * e_perp_xy
         # Active observability dither (mid-course only): lateral sinusoid for monocular scale/depth.
-        if self.dither_amp > 0.0 and r_norm > self.dither_min_range:
+        # Second, W-independent close gate (mirror C++): suppress when the bbox is already LARGE in
+        # px — the size-SNR is then good and/or the target close, so the dither only disturbs
+        # terminal precision. Immune to the monocular scale error: W over-estimated by k keeps
+        # r_norm > dither_min_range forever while the true range is well inside it. Stale-hold the
+        # last live bbox for 0.5 s so a dropout frame cannot re-arm the dither.
+        dither_suppressed_by_bbox = False
+        if self.dither_max_bbox > 0.0:
+            s_eff = bbox_size
+            if s_eff <= 0.0 and self.last_bbox_t >= 0.0 and (t - self.last_bbox_t) < 0.5:
+                s_eff = self.last_bbox_size
+            dither_suppressed_by_bbox = s_eff >= self.dither_max_bbox
+        if bbox_size > 0.0:
+            self.last_bbox_size = bbox_size
+            self.last_bbox_t = t
+        if self.dither_amp > 0.0 and r_norm > self.dither_min_range and not dither_suppressed_by_bbox:
             a_dither = self.dither_amp * np.sin(2.0 * np.pi * self.dither_freq * t)
             a_lat_world = a_lat_world + a_dither * e_perp_xy
         # Geometric APN: classic PN (a_lat = N*v_pn*lambda_dot) assumes constant bearing, so it lags
@@ -1332,7 +1354,9 @@ def run_scenario(name, target_init_pos, target_vel_fn, uav_init_pos, uav_init_ya
                         los_rate_ema = 0.75 * los_rate_ema + 0.25 * (daz / dlos_t)
                 prev_los_az = los_az_world
                 prev_los_t = t
-                cache = (r_est, v_est, los_az_world, los_el, s, t, los_rate_ema)
+                # bbox_size 0.0 on dropout frames — mirror the C++ control-cache semantics the
+                # dither px gate's stale-hold is designed around.
+                cache = (r_est, v_est, los_az_world, los_el, (s if has_bbox else 0.0), t, los_rate_ema)
 
         # control at control rate
         if cache is not None:

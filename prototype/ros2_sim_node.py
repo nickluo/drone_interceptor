@@ -29,7 +29,7 @@ Usage:
   python3 ros2_sim_node.py --scenario radar_relay
 
 Scenarios: nominal, crossing, maneuvering, dropout, noise, wrong_w,
-           radar_relay, radar_far, radar_maneuver, radar_only
+           radar_relay, radar_far, radar_maneuver, radar_only, radar_overbound
 """
 
 import argparse
@@ -390,6 +390,22 @@ SCENARIOS = {
         sim_time=55.0, noise_pos=1.5, noise_size=2.0,
         target_width=1.5, dropout=(5.5, 10.5),
         detect_min_size=25.0, radar=True),
+
+    # Over-bounding tracker vs the width lock + the W re-anchor safety net. The bbox is inflated
+    # 1.6x until t=8s (covering the handover, which locks ~0.4s after first vision), so W locks at
+    # ~1.6x truth and the monocular range is over-estimated by ~1.6x — the exact "thinks it's far,
+    # actually close, dither stays armed" field failure. When the factor reverts at 8s, the
+    # still-tracking radar disagrees with r_vis = focal*W/bbox by a sustained ~1.6x and
+    # [W-REANCHOR] must repair the lock mid-flight (window: 8s -> ~9.6s, before the ~10.5s
+    # intercept). The bbox-px + radar dither gates independently stop the serpentine throughout.
+    'radar_overbound': dict(
+        target_init=[120.0, 95.0, 25.0],
+        vel_fn=lambda t: [-4.0, -3.0, 0.0],
+        uav_init=[0.0, 0.0, 10.0], uav_yaw=0.0,
+        sim_time=45.0, noise_pos=1.5, noise_size=2.0,
+        target_width=1.5, dropout=None,
+        detect_min_size=25.0, radar=True,
+        bbox_overbound=1.6, bbox_overbound_until=8.0),
 
     # ---- Terminal entry-speed tests ----
     # Isolate the terminal vision phase from the mid-course: the interceptor starts already at
@@ -782,6 +798,15 @@ class SimNode(Node):
             u += np.random.normal(0, self.scenario['noise_pos'])
             v += np.random.normal(0, self.scenario['noise_pos'])
             s += np.random.normal(0, self.scenario['noise_size'])
+            # Tracker over-bounding injection (the locked-W-inflated failure class): a real visual
+            # tracker over-bounds the bbox by a multiplicative factor, so the radar->vision handover
+            # locks an inflated W and the monocular range is over-estimated by the same factor.
+            # Applied AFTER detect_min_size (detection fires on the TRUE size) and to real
+            # detections only. bbox_overbound_until reverts the factor to 1.0 after t (s) so the
+            # node's W-vs-radar consistency check sees a sustained disagreement (tests re-anchor).
+            ob = float(self.scenario.get('bbox_overbound', 1.0))
+            if ob != 1.0 and t < float(self.scenario.get('bbox_overbound_until', float('inf'))):
+                s *= ob
             s = max(1.0, s)
             msg.header.frame_id = "camera_frame"
             msg.bbox.center.position.x = float(u + CAM_WIDTH_PX / 2.0)
@@ -799,6 +824,44 @@ class SimNode(Node):
         self.cam_timer.cancel()
         self.save_results()
         raise SystemExit(0)
+
+    def _dither_close_metrics(self):
+        """Dither activity inside true range < 15 m: (mean |v_lat| m/s, 0.2-0.4 Hz power fraction).
+
+        v_lat is the ownship velocity perpendicular to the TRUE LOS (xy plane) — the dither drives
+        exactly this. A dither that stays armed at close range because the monocular range is
+        over-estimated shows up as a high value; with the close gates working it collapses.
+        Returns (nan, nan) when the segment is too short to FFT (< 17 samples).
+        """
+        try:
+            t = np.asarray(self.log['t'])
+            pos = np.asarray(self.log['uav_pos'])
+            tgt = np.asarray(self.log['tgt_pos'])
+            if t.size < 17:
+                return float('nan'), float('nan')
+            dt = float(np.median(np.diff(t)))
+            if dt <= 0:
+                return float('nan'), float('nan')
+            vel = np.gradient(pos, dt, axis=0)
+            r_xy = tgt[:, :2] - pos[:, :2]
+            r_xy_norm = np.linalg.norm(r_xy, axis=1)
+            e_los = np.divide(r_xy, r_xy_norm[:, None], out=np.zeros_like(r_xy),
+                              where=r_xy_norm[:, None] > 1e-6)
+            e_perp = np.stack([-e_los[:, 1], e_los[:, 0]], axis=1)
+            v_lat = np.abs(np.einsum("ij,ij->i", vel[:, :2], e_perp))
+            true_range = np.linalg.norm(tgt - pos, axis=1)
+            mask = true_range < 15.0
+            if np.count_nonzero(mask) < 17:
+                return float('nan'), float('nan')
+            seg = v_lat[mask] - v_lat[mask].mean()
+            freqs = np.fft.rfftfreq(seg.size, d=dt)
+            spec = np.abs(np.fft.rfft(seg)) ** 2
+            band = (freqs > 0.20) & (freqs < 0.40)
+            total = float(spec.sum())
+            frac = float(spec[band].sum()) / total if (band.any() and total > 0) else float('nan')
+            return float(v_lat[mask].mean()), frac
+        except Exception:
+            return float('nan'), float('nan')
 
     def save_results(self):
         out_dir = os.path.dirname(os.path.abspath(__file__))
@@ -823,6 +886,11 @@ class SimNode(Node):
         max_los = max(self.log['los_rate']) if self.log['los_rate'] else 0.0
         r0 = self.log['range'][0] if self.log['range'] else 0.0
         single_pass = not detect_reopen(self.log['range'], r0)
+        # Dither activity in the close-range terminal window (true range < 15 m): mean lateral
+        # velocity perpendicular to the LOS + its 0.2-0.4 Hz spectral fraction (the dither band,
+        # same math as analyze_radar_scenario.py). A dither that stays armed at close range
+        # (over-estimated monocular range) shows up as a high value here.
+        dither_vlat, dither_frac = self._dither_close_metrics()
         with open(sum_path, 'w') as f:
             f.write(f"Scenario: {self.scenario_name}\n")
             f.write(f"Intercepted: {self.intercepted}\n")
@@ -833,6 +901,10 @@ class SimNode(Node):
             f.write(f"Final range: {final_range:.2f}m\n")
             f.write(f"Max LOS rate: {max_los:.4f}rad/s\n")
             f.write(f"NaN commands: {self.log['nan_count']}\n")
+            if np.isfinite(dither_vlat):
+                f.write(f"Dither |v_lat| mean (true r<15m): {dither_vlat:.2f}m/s\n")
+                if np.isfinite(dither_frac):
+                    f.write(f"Dither 0.2-0.4Hz frac (true r<15m): {dither_frac:.3f}\n")
             if self.radar_enabled:
                 f.write(f"Radar relay: enabled ({RADAR_RATE:.0f}Hz, "
                         f"{RADAR_POS_NOISE:.1f}m+{RADAR_RANGE_NOISE_FRAC*100:.1f}%/range noise, "
@@ -863,6 +935,11 @@ def main():
                         help='force-enable the simulated radar relay feed for this scenario')
     parser.add_argument('--detect_min_size', type=float, default=None,
                         help='override the detector minimum bbox size (px); 0 = always detect')
+    parser.add_argument('--bbox_overbound', type=float, default=None,
+                        help='multiply the published bbox size by this factor (simulate an '
+                             'over-bounding tracker -> inflated W lock -> over-estimated range)')
+    parser.add_argument('--bbox_overbound_until', type=float, default=None,
+                        help='revert the bbox_overbound factor to 1.0 after this sim time (s)')
     parser.add_argument('--v_entry', type=float, default=None,
                         help='override the interceptor entry speed (m/s): set uav_vel_init along the '
                              '(target-init) direction at this magnitude. Sweep the terminal entry speed.')
@@ -879,6 +956,10 @@ def main():
         scen['radar'] = True
     if args.detect_min_size is not None:
         scen['detect_min_size'] = args.detect_min_size
+    if args.bbox_overbound is not None:
+        scen['bbox_overbound'] = float(args.bbox_overbound)
+    if args.bbox_overbound_until is not None:
+        scen['bbox_overbound_until'] = float(args.bbox_overbound_until)
     if args.v_entry is not None:
         _dir = np.array(scen['target_init'], dtype=float) - np.array(scen['uav_init'], dtype=float)
         _dir[2] = 0.0   # keep the entry speed horizontal (aim at the target's azimuth)

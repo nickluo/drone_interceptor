@@ -17,7 +17,7 @@ DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$DIR"
 
 VISION_SCENARIOS=(nominal maneuvering crossing dropout noise wrong_w)
-RADAR_SCENARIOS=(radar_relay radar_maneuver radar_falsepos radar_far radar_only radar_close radar_reintercept)
+RADAR_SCENARIOS=(radar_relay radar_maneuver radar_falsepos radar_far radar_only radar_close radar_reintercept radar_overbound)
 RADAR_DOMAIN=137
 
 VISION_ONLY=0
@@ -38,7 +38,9 @@ parse_and_record() {
     local intercepted nan minr mtime
     intercepted=$(grep -i 'Intercepted:' "$f" | awk '{print $2}')
     minr=$(grep -i 'Min range:' "$f" | awk '{print $3}')
-    nan=$(grep -i 'NaN' "$f" | awk '{print $3}')
+    # Exact label match: other summary lines can legitimately contain the substring "nan"
+    # (e.g. "Dither 0.2-0.4Hz frac ...: nan" when the close-range segment is too short to FFT).
+    nan=$(grep -i '^NaN commands:' "$f" | awk '{print $3}')
     mtime=$(stat -c '%y' "$f" | cut -d. -f1)
     if [ "$intercepted" = "True" ] && [ "$nan" = "0" ]; then
         PASS=$((PASS + 1))

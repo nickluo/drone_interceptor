@@ -45,6 +45,12 @@ utils.h                                  — DroneEKF(19D), MissionStateMachine,
 - **IMU strapdown**: preintegration (alpha/beta) for ego-motion; online accel bias calibration during idle
 - **Odometry aiding**: complementary fusion at camera rate; first fix hard-seeds ego frame; disables lateral dither
 - **Controller**: PN (proportional navigation) + IBVS, FOV keep-in-frame guard, soft-start ramp, axial jerk limit
+- **Observability dither close-gates** (3 conditions, ALL must hold to dither): estimated range >
+  `controller.dither_min_range`; bbox < `controller.dither_max_bbox` px (direct observable,
+  immune to the (W, range) scale error that blinds the range gate — a large bbox = good size-SNR /
+  close target where the dither only disturbs terminal precision; 0.5 s stale-hold across dropout
+  frames); and no fresh radar track inside `controller.dither_radar_range` (works post-lock — the
+  radar cache keeps updating even after fusion disengages). 0 disables either extra gate.
 - **Control output**: `quadrotor_msgs::ControlCommand` — `collective_thrust` + body rates `[omega_x, omega_y, omega_z]` (same topic/format as NMPC variants)
 - **Thread safety**: `std::mutex` (not shared_mutex)
 - **Topics**: imu=`/mavros/imu/data`, bbox=`/fpv/target_bbox`, odom=`/fpv/odom`, mission_launch=`/fpv/tracker_trigger`, mission=`/fpv/mission_start`, control=`/fpv/control_command`, mission_state=`/fpv/mission_state`
@@ -78,6 +84,21 @@ target before the target is inside the camera FOV, then hands over to vision.
 - **Width handover**: while the target is in frame AND the radar track is still valid,
   `W = bbox_size * r_radar / focal`, median over `radar.handover_frames` VALIDATED frames, then
   **locked** (`lock_width`). Confidence anchor for the monocular terminal range `r = focal*W/s`.
+  The anchor is the RAW delay-compensated radar pair range, NOT the estimator blend — pre-lock the
+  blend is radar-fused with the scale-degenerate camera size channel and can sit far off along the
+  W/r hyperbola (observed blend 19.7 m vs radar ~56 m → W locked 0.58 m for a 1.5 m target); the
+  median/MAD window absorbs the raw range's per-sample noise.
+- **Post-lock width re-anchor** (`radar.width_reanchor_*`, safety net): with W inflated by k the
+  monocular range is inflated by k, blinding every r_est-keyed close-range gate (dither min-range,
+  width freeze, size gate, coast, fly-through) — the "thinks it's far, actually close, dither stays
+  armed" miss. After the visual lock the radar fusion stays disengaged but the radar cache keeps
+  updating, so `r_vis = focal*W_locked/bbox` is continuously ratio-checked against `r_radar`; a
+  sustained median disagreement (≥ `width_reanchor_min_frames` frames over `width_reanchor_window`,
+  ratio outside `1/width_reanchor_ratio..width_reanchor_ratio`, radar range within
+  `[min,max]_range`) re-locks W at `W/ratio` and rescales every IMM filter's position state and
+  covariance by `1/ratio` (plus the `min_range_seen_/min_vision_range_/last_good_range_` trackers,
+  so the correction cannot false-fire the fly-through capture). Bounded by a cooldown and
+  `width_reanchor_max` corrections per mission. Logs `[W-REANCHOR]`.
 - **Visual lock needs a stable run AND a fixed width**: `radar.handover_frames` consecutive
   validated frames, at least `radar.lock_min_duration` of elapsed time, and the width already
   fixed from the radar (unless no radar track ever arrived). Locking before the width is fixed

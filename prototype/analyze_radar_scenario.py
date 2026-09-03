@@ -108,11 +108,18 @@ def width_error(log_path):
         return None
     w = float(m.group(1))
     kept = re.search(r"kept (\d+)/(\d+)", txt)
+    # Post-lock W re-anchor events ([W-REANCHOR]): each carries the corrected W and the sustained
+    # r_vis/r_radar ratio that triggered it. None if the safety net never fired.
+    reanchor = [
+        {"w": float(a), "ratio": float(b)}
+        for a, b in re.findall(r"\[W-REANCHOR\].*?-> W=([\d.]+)m.*?ratio ([\d.]+)", txt)
+    ]
     return {
         "w": w,
         "err": w - TRUE_WIDTH,
         "kept": int(kept.group(1)) if kept else None,
         "total": int(kept.group(2)) if kept else None,
+        "reanchor": reanchor,
     }
 
 
@@ -184,6 +191,11 @@ def main():
     else:
         kt = f"  kept {w['kept']}/{w['total']}" if w["kept"] is not None else ""
         print(f"  width         : W={w['w']:.3f}m  err={w['err']:+.3f}m (truth {TRUE_WIDTH}){kt}")
+        if w.get("reanchor"):
+            for ra in w["reanchor"]:
+                print(f"    [W-REANCHOR] -> W={ra['w']:.3f}m  ratio={ra['ratio']:.2f}")
+        else:
+            print(f"    reanchor     : none fired")
     print()
 
 
