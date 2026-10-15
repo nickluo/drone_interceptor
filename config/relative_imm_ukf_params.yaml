@@ -1,10 +1,16 @@
 interceptor_node_relative_imm_ukf:
   ros__parameters:
+    # Validated Camera8 Betaflight SITL profile: 20 m/s guidance and climb/descent ceilings.
+    # Uses a 1536x960, 72-degree camera with capture-time bbox/LOS. Not hardware-certified tuning.
+    use_simulation: false
+    collision_min_bbox_px: 120.0
+
     # Accelerometer bias in body frame, subtracted before the strapdown preintegration
     # (dv_own = ∫(R·(f_imu − bias) − g)dt). The ROS2 Python sim harness publishes a bias-free
     # IMU, so zeros here; set calibrated values on real hardware.
     imu_bias: [0.0, 0.0, 0.0]
 
+    # Reference topic names; the current node hardcodes these instead of reading this block.
     topics:
       imu: "/mavros/imu/data"
       bbox: "/fpv/target_bbox"
@@ -22,19 +28,18 @@ interceptor_node_relative_imm_ukf:
       g: 9.81
       drag_coeff: 0.1125
       # Airframe limits (calibrate to the real platform / AirSim)
-      max_tilt_deg: 60.0          # deg, structural bank limit (mid-course)
-      max_tilt_terminal_deg: 75.0 # deg, terminal-phase bank limit. Also the tilt used by the turn-radius
-                                  # speed cap inside terminal_tilt_range, so raising it both tightens
-                                  # turns AND raises the close-range speed cap (win-win for maneuverability).
-      max_body_rate: 3.0          # rad/s, hard cap on |omega_x/y/z| (attitude-loop / detector limit)
+      max_tilt_deg: 55.0          # deg, mid-course tilt limit
+      max_tilt_terminal_deg: 45.0 # deg, terminal roll limit and tilt used by the turn-radius speed cap
+      max_body_rate: 1.0          # rad/s, hard cap on |omega_x/y/z| (attitude-loop / detector limit)
       a_z_limit: 10.0             # m/s^2, vertical accel clamp (thrust limit)
       v_climb: 20.0               # m/s, max commanded climb rate
       v_descent: 20.0             # m/s, max commanded sink rate
 
-    # Perception parameters
+    # Retained test-profile entries; the current node uses its internal measurement-noise model,
+    # not these two parameters.
     perception:
-      bbox_pos_std_dev: 1.5
-      bbox_size_std_dev: 2.0
+      bbox_pos_std_dev: 12.0
+      bbox_size_std_dev: 3.0
 
     # Delay / History
     control:
@@ -59,7 +64,7 @@ interceptor_node_relative_imm_ukf:
 
     # Controller parameters
     controller:
-      N: 4.5
+      N: 2.5
       K_att: 5.0     # attitude P-gain (was 9.0; lowered to damp the close-range roll limit-cycle)
       K_yaw: 5.0
       # --- Active vertical guidance: cascaded velocity-limited altitude track ---
@@ -67,12 +72,15 @@ interceptor_node_relative_imm_ukf:
       # v_climb/v_descent are in physics.* (airframe limits). K_dz_up/dn (1/s): responsiveness;
       # closure tau = 1/K. CLIMB uses a higher gain than DESCENT so an upper-FOV target does not
       # asymptotically stall ~1 m short, while a below-FOV target still brakes without over-dive.
-      K_dz_up: 3.0     # 1/s, climb responsiveness (1=stall-risk @v_des=20, 2.5=over-climb-risk)
-      K_dz_dn: 2.0     # 1/s, descent responsiveness (keep < K_dz_up)
+      K_dz_up: 1.5     # 1/s, climb responsiveness before coordinated/braking speed limits
+      K_dz_dn: 2.0     # 1/s, descent responsiveness
       # Cruise closing speed (m/s). Must exceed any target's speed or the interceptor cannot gain
       # on a maneuvering/crossing target; the speed-aware brake floor (see compute_control) keeps
       # the final-approach speed above the target speed so v_des sets the mid-course advantage.
-      v_des: 20.0  # General ceiling; the AirSim mission runner saves its separate tuned profile.
+      v_des: 20.0  # m/s, cruise ceiling; terminal speed is reduced by the caps below
+      use_imu_axial_speed: true   # Short-horizon IMU speed aiding; no odometry input
+      K_apn: 0.0                 # Disable noisy augmented-PN acceleration feedforward in SITL
+      axial_deadband: 0.05       # m/s, retain slow terminal closure instead of stalling
       # FOV keep-in-frame guard
       enable_fov_clamp: true   # hard-clamp pitch to keep target in FOV
       fov_keep_margin: 0.65    # fraction of the FOV half-angle to keep the target within
@@ -84,9 +92,9 @@ interceptor_node_relative_imm_ukf:
       v_pn_ref: 12.0      # m/s, cap on v_fwd in PN lateral accel
       # Attitude reference slew governor: max |d(phi_cmd)/dt|, |d(theta_cmd)/dt|. Prevents the
       # single-cycle +-max_tilt flips that bang omega_x/omega_y into +-max_body_rate saturation.
-      # Mirrors axial_jerk_max. Lower = smoother but more reference lag. Tightened 5 -> 3.5 (Fix G)
+      # Mirrors axial_jerk_max. Lower = smoother but more reference lag. Limited to 1 in SITL
       # to clamp the close-approach lateral weave (phi_cmd sign-flip -> omega_x saturation).
-      max_att_rate: 3.5   # rad/s
+      max_att_rate: 1.0   # rad/s
       # Attitude reference EMA low-pass (on phi_cmd/theta_cmd). Suppresses camera-rate content /
       # the close-range roll limit-cycle that the slew governor alone can't filter. Distinct from
       # the body-rate decay coefficient (control.rate_control_attenuation) — this filters the
@@ -96,8 +104,7 @@ interceptor_node_relative_imm_ukf:
       # The turn-radius cap keeps the minimum turn radius inside the estimated range.
       # visual_speed_gain optionally adds a direct image-size cap, independent of range scale.
       #   cap = turn_radius_cap_factor · sqrt(g · tan(tilt) · r),  tilt = max_tilt_terminal inside
-      #   terminal_tilt_range (55° here), else max_tilt (45°). At factor 1.0 / 55°:
-      #   r=30→20.5, r=15→14.5, r=5→8.4 m/s (vs 17.2 / 12.1 / 7.0 at the old 45°).
+      #   terminal_tilt_range (45° here), else max_tilt (55°).
       # (terminal_brake_floor / terminal_smooth_range removed: the smooth profile was redundant — the
       #  cap was already the binding constraint below ~45 m, so the floor was inert.)
       turn_radius_cap_factor: 0.8  # binding maneuverability cap (clamped [0.3,1.0] in the node; >1.0 warns+clamps). 1.0 = physics limit; <1 brakes sooner. NOT disabled.
@@ -111,22 +118,22 @@ interceptor_node_relative_imm_ukf:
       # inside 15 m over-corrects -> lambda_dot sign-flips -> phi_cmd rails +-max_tilt_terminal ->
       # omega_x saturates (the close-approach weave). Gently scale a_lat_mag toward this floor over
       # [terminal_brake_range, lateral_decay_start]. NOT 0 (a hard zero trailed maneuvering targets).
-      lateral_decay_floor: 0.4     # a_lat_mag floor at terminal_brake_range (0..1)
+      lateral_decay_floor: 0.1     # a_lat_mag floor at terminal_brake_range (0..1)
       # Fix F: range at which the close-range lateral attenuation begins. Widened 12 -> 25 m so the
       # 22-27 m weave zone (observed in AirSim at v_des=20) is covered. Must be > terminal_brake_range.
       lateral_decay_start: 25.0    # m, lateral attenuation begins here (ramps to floor by terminal_brake_range)
       # Guidance tuning (operator-facing, promoted from hardcoded constants):
-      K_fwd: 2.0                  # axial accel gain a_fwd = K_fwd*(v_des - v_fwd)
-      K_az: 2.0                   # vertical-speed tracking gain a_z = K_az*(v_z_desired - v_z)
+      K_fwd: 1.5                  # axial accel gain a_fwd = K_fwd*(v_des - v_fwd)
+      K_az: 4.0                   # vertical-speed tracking gain a_z = K_az*(v_z_desired - v_z)
       # Optional stopping envelope: v*delay + v^2/(2*accel) <= abs(dz).
-      # Zero acceleration disables it, preserving the general controller's previous behavior.
-      vertical_brake_accel: 0.0   # m/s^2; Camera8 high-speed mission overlay uses 6
-      vertical_brake_delay: 0.0   # s; mission overlay uses 0.5
-      visual_speed_gain: 0.0      # px*m/s; 0 disables, otherwise axial speed <= gain/bbox_size.
-                                  # Mission overlay uses 600 at 1536x960, horizontal FOV 72 deg.
+      # Zero acceleration disables it.
+      vertical_brake_accel: 6.0   # m/s^2, deceleration assumed by the stopping envelope
+      vertical_brake_delay: 0.5   # s, control-loop delay allowance
+      visual_speed_gain: 600.0    # px*m/s; 0 disables, otherwise axial speed <= gain/bbox_size.
+                                  # Calibrated at 1536x960, horizontal FOV 72 deg.
                                   # Also bounds vertical closure by axial speed * abs(dz)/horizontal range.
-      capture_range: 2.0          # estimated m; mission overlay uses 0.5. Not the test's 1 m hit threshold.
-      dither_amp: 1.0             # m/s^2, lateral observability dither amplitude (2.0 caused W_est cascade in AirSim; 1.0 is the middle ground)
+      capture_range: 0.5          # estimated m; not the test's independent 1 m hit threshold
+      dither_amp: 0.1             # m/s^2, lateral observability dither amplitude
       dither_freq: 0.3            # Hz, lateral dither frequency
       dither_min_range: 15.0       # m, suppress dither inside this range (don't disturb terminal)
       dither_max_bbox: 80.0        # px, ALSO suppress the dither when the bbox >= this size (large
@@ -151,8 +158,8 @@ interceptor_node_relative_imm_ukf:
       # Output smoothing of the estimator's RELATIVE velocity (Fix B): EMA before it drives
       # guidance / the speed-aware brake floor. 0 disables.
       vel_smooth_tc: 0.25          # s, EMA time constant on the relative-velocity estimate
-      gyro_attitude_during_mission: false  # Short-horizon gyro propagation seeded from prelaunch FC attitude.
-                                           # AirSim overlay enables it; avoids acceleration-induced tilt bias.
+      gyro_attitude_during_mission: true  # Short-horizon gyro propagation seeded from prelaunch FC attitude;
+                                          # avoids acceleration-induced tilt bias during the engagement.
       w_guess: 1.5
 
     # ------------------------------------------------------------------------------------------
@@ -170,7 +177,7 @@ interceptor_node_relative_imm_ukf:
     # median-filtered over handover_frames and then LOCKED — it is the confidence anchor for the
     # monocular terminal range r = focal*W/bbox_size once the radar is dropped.
     radar:
-      enable: true                # set true when a radar relay feed is available
+      enable: false               # Camera8 tests use vision only; enable explicitly with a radar relay
       topic_target: "/fpv/radar/target"
       topic_interceptor: "/fpv/radar/interceptor"
       pos_std: 3.0                 # m, 1-sigma per axis (models a 1-5 m radar position error)
@@ -242,7 +249,7 @@ interceptor_node_relative_imm_ukf:
       # hit), re-engage the radar relay for another mid-course + terminal pass instead of brake-to-hold
       # forever. Off by default — set true (with radar.enable=true) for a second chance after the target
       # dodges out of the FOV near intercept.
-      reintercept_enable: true       # master switch (only acts when radar.enable is also true)
+      reintercept_enable: false      # master switch (only acts when radar.enable is also true)
       reintercept_max: 2             # max re-intercept attempts (total terminal passes = 1 + this)
       reintercept_kill_range: 1.0    # m; if the closest approach was <= this, assume a clean HIT (don't re-attempt). 0 = always re-attempt on vision loss.
       reintercept_min_range: 15.0    # m; re-engage only once radar shows the target back beyond this standoff (clean re-approach). 0 = re-engage immediately.
