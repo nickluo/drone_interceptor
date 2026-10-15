@@ -21,6 +21,9 @@
 #include <vector>
 
 #include "utils.h"
+#include "guidance_limits.h"
+#include "imu_strapdown.h"
+#include "camera_pose_history.h"
 
 #ifndef M_PI
 #define M_PI 3.14159265358979323846
@@ -899,6 +902,9 @@ public:
     double K_fwd_ = 2.0;        // axial: a_fwd = K_fwd * (v_des - v_fwd_body)
     double K_az_ = 2.0;         // vertical-speed tracking gain: a_z = K_az*(v_z_desired - v_z)
     double a_z_limit_ = 8.0;    // vertical accel clamp (m/s^2) — airframe thrust/accel limit
+    double vertical_brake_accel_ = 0.0;
+    double vertical_brake_delay_ = 0.0;
+    double visual_speed_gain_ = 0.0;
     // Turn-radius cap scaling factor. The cap v ≤ factor·sqrt(g·tan(tilt)·r) is the single adaptive
     // terminal-speed reducer (keeps min turn radius inside range). 1.0 = physics limit; <1 brakes sooner.
     double turn_radius_cap_factor_ = 0.8;
@@ -1056,14 +1062,31 @@ public:
     }
     // Axial-only range EMA time constant (radar smoothness). <=0 disables (passthrough r_norm).
     void set_range_smooth_tc(double tc) { r_norm_smooth_tc_ = std::max(0.0, tc); }
+    void set_apn_gain(double gain) {
+        if (!std::isfinite(gain) || gain < 0)
+            throw std::invalid_argument("controller.K_apn must be finite and nonnegative");
+        K_apn_ = gain;
+    }
+    void set_vertical_braking(double deceleration, double delay) {
+        if (!std::isfinite(deceleration) || deceleration < 0 ||
+            !std::isfinite(delay) || delay < 0)
+            throw std::invalid_argument("invalid vertical braking parameters");
+        vertical_brake_accel_ = deceleration;
+        vertical_brake_delay_ = delay;
+    }
+    void set_visual_speed_gain(double gain) {
+        if (!std::isfinite(gain) || gain < 0)
+            throw std::invalid_argument("controller.visual_speed_gain must be finite and nonnegative");
+        visual_speed_gain_ = gain;
+    }
     // Turn-radius cap factor: clamped to [0.3, 1.0] (1.0 = physics limit; <1 brakes sooner). The cap is
-    // the single adaptive terminal-speed reducer (see compute_control). Out-of-range is WARNed at the
+    // the maneuverability-based speed reducer (see compute_control). Out-of-range is WARNed at the
     // call site so a stale yaml "3.0 = disabled" is not silently swallowed.
     void set_turn_radius_cap_factor(double v) { turn_radius_cap_factor_ = clamp(v, 0.3, 1.0); }
     void set_axial_deadband(double v) { axial_deadband_ = std::max(0.0, v); }
     void set_motion_gate_factor(double v) { motion_gate_factor_ = std::max(0.0, v); }
 
-    // Decoupled control (odometry-free, exact mirror of the Python prototype). Inputs:
+    // Odometry-free control with optional coordinated terminal speed limits. Inputs:
     //   r_est, v_est : RELATIVE target pos/vel in world frame G (estimator state directly)
     //   los_az       : target azimuth in body heading frame (rad, 0 = dead ahead)
     //   los_el       : target elevation in world frame (rad, 0 = level, negative = below)
@@ -1194,11 +1217,7 @@ public:
             a_lat_world += K_apn_ * a_t_perp_geom * e_perp_xy;
         }
 
-        // ---- (A) Axial guidance: flat v_des + single adaptive turn-radius cap ----
-        // No deliberate terminal brake: v_des_eff starts at the cruise ceiling v_des and is reduced
-        // ONLY by the turn-radius cap below (keeps min turn radius inside the current range -> the
-        // interceptor can still bend onto a dodging target). sqrt(r) is smooth; the only derivative
-        // kink is at the cap/v_des crossover (far from terminal) and is absorbed by axial_jerk_max.
+        // ---- (A) Axial guidance: cruise ceiling with maneuverability and visual proximity caps ----
         double v_des_eff = v_des;
         // Speed-aware floor: never below a maneuvering target's escape speed + margin (it must be chased).
         // Static/slow target -> 3.0 m/s stall guard (the cap, not this floor, governs close-range speed).
@@ -1208,9 +1227,12 @@ public:
         }
         // Turn-radius maneuverability cap: v ≤ factor·sqrt(g·tan(tilt)·r). Uses the range-appropriate
         // bank (terminal tilt inside terminal_tilt_range) so the raised terminal bank translates into
-        // sustained close-range speed AND tighter turns. This is the binding terminal-speed governor.
+        // sustained close-range speed AND tighter turns.
         const double tilt_for_cap = (r_norm_axial < terminal_tilt_range_) ? max_tilt_terminal_rad_ : max_tilt_rad;
         v_des_eff = std::min(v_des_eff, turn_radius_cap_factor_ * std::sqrt(g * std::tan(tilt_for_cap) * r_norm_axial));
+        // The raw image cue can brake before an overestimated monocular range catches up.
+        if (visual_speed_gain_ > 0 && bbox_size > 0)
+            v_des_eff = std::min(v_des_eff, visual_speed_gain_ / bbox_size);
         // v_fwd_body (= v_closing from v_rel) is under-observable along-LOS until scale converges;
         // a low v_closing inflates a_fwd -> ownship over-accelerates ON-AXIS, starving lateral PN
         // lead. Scene-adaptive 3-level floor: turning target (|atp_ema| large) -> 0.88 (don't blast
@@ -1260,6 +1282,18 @@ public:
             v_z_desired = clamp(dz_target * K_dz_up_, 0.0, v_climb_);
         } else {
             v_z_desired = clamp(dz_target * K_dz_dn_, -v_descent_, 0.0);
+        }
+        if (visual_speed_gain_ > 0 && bbox_size > 0) {
+            // Axial image braking must also slow the climb, or the vehicle reaches the
+            // target altitude early and passes above it while still closing horizontally.
+            const double closure_limit = vertical_closure_speed_limit(
+                v_des_eff, r_est.head<2>().norm(), dz_target);
+            v_z_desired = clamp(v_z_desired, -closure_limit, closure_limit);
+        }
+        if (vertical_brake_accel_ > 0) {
+            const double speed_limit = braking_speed_limit(std::abs(dz_target),
+                                                           vertical_brake_accel_, vertical_brake_delay_);
+            v_z_desired = clamp(v_z_desired, -speed_limit, speed_limit);
         }
         double a_z = clamp(K_az_ * (v_z_desired - v_z), -a_z_limit_, a_z_limit_);
         // Slew limit |da_z/dt|: the z-estimate can jump O(10 m) in one cycle; ramp a_z instead of
@@ -1513,6 +1547,7 @@ private:
         this->declare_parameter<double>("controller.K_dz_dn", 1.0);     // 1/s, descent responsiveness (lower target; < K_up to avoid over-dive)
         this->declare_parameter<double>("estimation.w_guess", 1.5);
         this->declare_parameter<double>("estimation.vel_smooth_tc", 0.25);  // Fix B: target-vel EMA (s, 0=off)
+        this->declare_parameter<bool>("estimation.gyro_attitude_during_mission", false);
         // Accelerometer bias in body frame, subtracted before the strapdown preintegration.
         // The Python-harness sim publishes a bias-free IMU (zeros); set calibrated values on real HW.
         this->declare_parameter<std::vector<double>>("imu_bias", {0.0, 0.0, 0.0});
@@ -1520,6 +1555,13 @@ private:
         this->declare_parameter<double>("control.rate_tc", 0.02);
         this->declare_parameter<bool>("control.rate_control_attenuation", true);
         this->declare_parameter<bool>("use_simulation", false);
+        this->declare_parameter<double>("collision_min_bbox_px", 0.0);
+        this->declare_parameter<bool>("controller.use_imu_axial_speed", false);
+        this->declare_parameter<double>("controller.K_apn", 0.8);
+        this->declare_parameter<double>("controller.vertical_brake_accel", 0.0);
+        this->declare_parameter<double>("controller.vertical_brake_delay", 0.0);
+        this->declare_parameter<double>("controller.capture_range", 2.0);
+        this->declare_parameter<double>("controller.visual_speed_gain", 0.0);
         // ---- Radar relay (mid-course guidance before the target enters the camera FOV) --------
         // An external radar tracks BOTH the target and the interceptor and reports each as a
         // world-ENU nav_msgs/Odometry at ~10 Hz with metre-level noise and 50-100 ms latency. The
@@ -1591,6 +1633,13 @@ private:
         cam_fov_deg_ = this->get_parameter("camera.fov_deg").as_double();
         const bool use_simulation = this->get_parameter("use_simulation").as_bool();
         use_simulation_ = use_simulation;   // mirrors InterceptorNodeBase; gates gyro collision detect
+        collision_min_bbox_px_ = this->get_parameter("collision_min_bbox_px").as_double();
+        use_imu_axial_speed_ = this->get_parameter("controller.use_imu_axial_speed").as_bool();
+        capture_range_ = this->get_parameter("controller.capture_range").as_double();
+        if (!std::isfinite(capture_range_) || capture_range_ <= 0)
+            throw std::invalid_argument("controller.capture_range must be finite and positive");
+        if (!std::isfinite(collision_min_bbox_px_) || collision_min_bbox_px_ < 0.0)
+            throw std::invalid_argument("collision_min_bbox_px must be finite and nonnegative");
         // FLU(body)→RDF(cam) standard extrinsic — a frame convention, not a tuning param.
         R_b2c_base_ << 0.0, -1.0, 0.0,
                        0.0,  0.0, -1.0,
@@ -1667,6 +1716,11 @@ private:
             this->get_parameter("controller.dither_min_range").as_double(),
             this->get_parameter("controller.dither_max_bbox").as_double());
         controller_->set_range_smooth_tc(this->get_parameter("controller.range_smooth_tc").as_double());
+        controller_->set_apn_gain(this->get_parameter("controller.K_apn").as_double());
+        controller_->set_vertical_braking(
+            this->get_parameter("controller.vertical_brake_accel").as_double(),
+            this->get_parameter("controller.vertical_brake_delay").as_double());
+        controller_->set_visual_speed_gain(this->get_parameter("controller.visual_speed_gain").as_double());
         {
             const double trcf = this->get_parameter("controller.turn_radius_cap_factor").as_double();
             if (trcf < 0.3 - 1e-9 || trcf > 1.0 + 1e-9) {
@@ -1680,6 +1734,7 @@ private:
         controller_->set_motion_gate_factor(this->get_parameter("radar.motion_gate_factor").as_double());
         dither_radar_range_ = std::max(0.0, this->get_parameter("controller.dither_radar_range").as_double());
         vel_smooth_tc_ = this->get_parameter("estimation.vel_smooth_tc").as_double();
+        gyro_attitude_during_mission_ = this->get_parameter("estimation.gyro_attitude_during_mission").as_bool();
         const std::vector<double> bias = this->get_parameter("imu_bias").as_double_array();
         if (bias.size() == 3) {
             imu_bias_ = Eigen::Vector3d(bias[0], bias[1], bias[2]);
@@ -2261,18 +2316,6 @@ private:
 
         const double t_now = rclcpp::Time(msg->header.stamp).seconds();
 
-        // Adaptive dt_cam_: measure the actual inter-bbox interval from timestamps. Initial value
-        // is the 30Hz guess (0.033); after the first few frames dt_cam_ tracks the real camera rate.
-        // Used by the estimator's dropout predict and the control cache's a_own = dv_own/dt_cam_.
-        if (last_bbox_cam_t_ > 0.0 && t_now > last_bbox_cam_t_) {
-            const double dt_measured = t_now - last_bbox_cam_t_;
-            if (dt_measured > 1e-3 && dt_measured < 0.2) {   // sanity: 5 Hz .. 1000 Hz
-                dt_cam_ = dt_measured;
-                if (estimator_) estimator_->dt_cam = dt_measured;
-            }
-        }
-        last_bbox_cam_t_ = t_now;
-
         const bool has_bbox = !msg->header.frame_id.empty();
         const double u = msg->bbox.center.position.x - cam_width_ / 2.0;
         const double v = msg->bbox.center.position.y - cam_height_ / 2.0;
@@ -2294,6 +2337,15 @@ private:
             R_b2n = latest_R_b2n_;
             gimbal_q_now = latest_gimbal_q_;
             gimbal_rcvd = gimbal_received_;
+            if (use_gimbal_ && gimbal_rcvd) {
+                const auto matched = gimbal_history_.at(t_now);
+                if (!matched) {
+                    RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 2000,
+                        "Skipping bbox without a timestamp-matched camera pose");
+                    return;
+                }
+                gimbal_q_now = *matched;
+            }
             // Drain the IMU-preintegration window for this camera frame: dv_own is the ownship
             // velocity change since the last camera frame (world frame G, gravity-corrected).
             dv_own = dv_own_accum_;
@@ -2301,10 +2353,19 @@ private:
             last_dv_own_ = dv_own;
         }
 
+        if (last_bbox_cam_t_ > 0.0 && t_now > last_bbox_cam_t_) {
+            const double dt_measured = t_now - last_bbox_cam_t_;
+            if (dt_measured > 1e-3 && dt_measured < 0.2) {
+                dt_cam_ = dt_measured;
+                estimator_->dt_cam = dt_measured;
+            }
+        }
+        last_bbox_cam_t_ = t_now;
+
         // Semi-strapdown gimbal: rebuild R_b2c from the ACTUAL (lagged) camera-to-world
         // orientation q_C_W so the measurement model and the LOS reconstruction match the physical
-        // camera orientation at capture time. The orientation is measured in real time, so lag is
-        // fully accounted for.
+        // camera orientation at the bbox's measurement/prediction timestamp, not the latest
+        // callback. Mixing epochs during a pitch transient invents target LOS motion and scale.
         //
         // NOTE: in gimbal mode R_b2c_ is a SYNTHETIC matrix, not a true body->camera rotation. Its
         // only purpose is to make the estimator's R_n2c = R_b2c*R_b2n^T and pixel_to_los_nav's
@@ -2369,7 +2430,7 @@ private:
         double los_el = std::asin(clamp(r_est(2) / std::max(r_est.norm(), 0.1), -1.0, 1.0));
 
         if (bbox_ok) {
-            // bbox is real-time: capture orientation == current orientation.
+            // Use the same timestamp-matched camera pose as the UKF measurement.
             const Eigen::Vector3d los_nav = pixel_to_los_nav(u, v, focal_length_, R_b2n, R_b2c_);
             los_az_world = std::atan2(los_nav(1), los_nav(0));
             los_el = std::asin(clamp(los_nav(2), -1.0, 1.0));
@@ -2472,6 +2533,18 @@ private:
                 "Skipping stale control cache: age=%.3f s", now.seconds() - cache.update_time);
             return;
         }
+        if (cache.has_bbox) {
+            // The image and its matched pose share an old epoch; guide from the
+            // short-horizon relative prediction, not the delayed camera position.
+            const double delay = clamp(now.seconds() - cache.source_time, 0.0, .25);
+            const double cos_el = std::cos(cache.los_el);
+            Eigen::Vector3d measured_ray(cos_el * std::cos(cache.los_az_world),
+                                         cos_el * std::sin(cache.los_az_world), std::sin(cache.los_el));
+            measured_ray = cache.r_est.norm() * measured_ray + cache.v_est * delay;
+            cache.r_est += cache.v_est * delay;
+            cache.los_az_world = std::atan2(measured_ray.y(), measured_ray.x());
+            cache.los_el = std::asin(clamp(measured_ray.z() / std::max(measured_ray.norm(), .1), -1.0, 1.0));
+        }
 
         Eigen::Matrix3d R_b2n;
         Eigen::Vector3d gyro = Eigen::Vector3d::Zero();
@@ -2514,6 +2587,9 @@ private:
         const double v_closing = cache.valid
             ? -cache.v_est.dot(cache.r_est) / std::max(cache.r_est.norm(), 1e-3)
             : 0.0;
+        const double axial_speed = use_imu_axial_speed_
+            ? own_vel_now.x() * std::cos(yaw) + own_vel_now.y() * std::sin(yaw)
+            : v_closing;
         double los_az = cache.los_az_world - yaw;
         los_az = std::atan2(std::sin(los_az), std::cos(los_az));
         const double t_rel = (sim_start_time >= 0.0) ? t_now - sim_start_time : 0.0;
@@ -2541,7 +2617,9 @@ private:
         // The ROS2 Python sim (use_simulation_=true) has ground-truth range and judges the intercept
         // externally (ros2_sim_node.py), so the gyro check is skipped there. On contact the body rate
         // spikes well beyond what was commanded -> declare COMPLETED (intercept success) and stop.
-        if (!use_simulation_ && !collision_detected_) {
+        if (!use_simulation_ && !collision_detected_ &&
+            (collision_min_bbox_px_ == 0.0 ||
+             (cache.has_bbox && cache.bbox_size >= collision_min_bbox_px_))) {
             const Eigen::Vector3d rate_error = gyro - last_cmd_;
             const double rate_error_norm = rate_error.norm();
             if (rate_error_norm > 4.0) {
@@ -2607,7 +2685,7 @@ private:
         //   (1) dead-reckoned range < capture_range (only fires if the estimate happens to be good), OR
         //   (2) target now BEHIND the UAV (|los_az|>90°, observable) after being close at the last
         //       detection (last_good_range < coast_range) — i.e. the UAV flew past the target.
-        constexpr double capture_range = 2.0;
+        const double capture_range = capture_range_;
         const bool overshot = std::abs(los_az) > (M_PI / 2.0);
         if (cache.valid) {
             min_range_seen_ = std::min(min_range_seen_, cache.r_est.norm());
@@ -2752,7 +2830,7 @@ private:
                 r_radar.norm() < dither_radar_range_;
         }
         const auto ctrl = controller_->compute_control(roll, pitch, yaw, cache.r_est, cache.v_est,
-                                                       los_az, cache.los_el, t_rel, v_closing,
+                                                       los_az, cache.los_el, t_rel, axial_speed,
                                                        cache.bbox_size, v_z, cache.target_speed,
                                                        cache.los_rate, cache.a_own, boresight_el_meas,
                                                        (radar_enable_ && radar_has_rel_ && !vision_delivering(now.seconds())),
@@ -2795,9 +2873,10 @@ private:
         control_pub_->publish(std::move(cmd));
 
         RCLCPP_INFO_THROTTLE(this->get_logger(), *this->get_clock(), THROTTLE_INTERVAL_MS,
-            "ctrl rel=[%.2f %.2f %.2f] vel=[%.2f %.2f %.2f] cmd=[%.2f %.2f %.2f %.2f] pitch=%.2f los_el=%.2f",
+            "ctrl rel=[%.2f %.2f %.2f] vel=[%.2f %.2f %.2f] cmd=[%.2f %.2f %.2f %.2f] pitch=%.2f los_el=%.2f own_axial=%.2f own_vz=%.2f bbox=%.1f",
             cache.r_est(0), cache.r_est(1), cache.r_est(2), cache.v_est(0), cache.v_est(1), cache.v_est(2),
-            ctrl[0], ctrl[1], ctrl[2], ctrl[3], pitch, cache.los_el);
+            ctrl[0], ctrl[1], ctrl[2], ctrl[3], pitch, cache.los_el,
+            axial_speed, v_z, cache.bbox_size);
 
         // Attitude-loop diagnostic: actual Euler angles + measured body rates (finite-differenced)
         // vs commanded body rates. Reveals whether oscillation is from cmd jumps (estimator/guidance)
@@ -2851,11 +2930,9 @@ private:
                 dv_own_accum_.setZero();
                 last_dv_own_.setZero();
                 last_imu_time_ = -1.0;
+                mission_gyro_initialized_ = false;
                 sim_start_time_ = -1.0;
-                gimbal_received_ = false;
-                latest_gimbal_q_ = Eigen::Quaterniond::Identity();
-                latest_gyro_ = Eigen::Vector3d::Zero();
-                latest_R_b2n_ = Eigen::Matrix3d::Identity();
+                // Keep measured body/camera orientation for the first post-trigger bbox.
                 last_bbox_cam_t_ = -1.0;
                 dt_cam_ = 0.033;
             }
@@ -2906,14 +2983,34 @@ private:
     void imu_callback(const sensor_msgs::msg::Imu::SharedPtr msg) {
         const double t = rclcpp::Time(msg->header.stamp).seconds();
         std::lock_guard<std::mutex> odom_lock(odom_mtx_);
-        latest_gyro_(0) = msg->angular_velocity.x;
-        latest_gyro_(1) = msg->angular_velocity.y;
-        latest_gyro_(2) = msg->angular_velocity.z;
+        const Eigen::Vector3d gyro(msg->angular_velocity.x, msg->angular_velocity.y,
+                                   msg->angular_velocity.z);
         const Eigen::Quaterniond q(msg->orientation.w, msg->orientation.x,
                                    msg->orientation.y, msg->orientation.z);
-        if (q.norm() > 1e-6) {
-            latest_R_b2n_ = q.normalized().toRotationMatrix();
+        if (!q.coeffs().allFinite() || q.norm() < 1e-6 || !gyro.allFinite()) {
+            RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 2000,
+                "Ignoring invalid IMU orientation or angular velocity");
+            return;
         }
+        if (last_imu_time_ > 0.0 && t <= last_imu_time_) {
+            RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 2000,
+                "Ignoring non-increasing IMU timestamp");
+            return;
+        }
+        if (gyro_attitude_during_mission_ && mission_state_.is_active()) {
+            if (!mission_gyro_initialized_) {
+                mission_gyro_attitude_ = q.normalized();
+                mission_gyro_initialized_ = true;
+            } else if (last_imu_time_ > 0.0) {
+                mission_gyro_attitude_ = integrate_body_gyro(mission_gyro_attitude_,
+                    0.5 * (latest_gyro_ + gyro), std::min(t - last_imu_time_, 0.05));
+            }
+            latest_R_b2n_ = mission_gyro_attitude_.toRotationMatrix();
+        } else {
+            latest_R_b2n_ = q.normalized().toRotationMatrix();
+            mission_gyro_initialized_ = false;
+        }
+        latest_gyro_ = gyro;
         if (last_imu_time_ > 0.0 && t > last_imu_time_) {
             const double dt = std::min(t - last_imu_time_, 0.05);   // guard against stamp gaps
             const Eigen::Vector3d f_body(msg->linear_acceleration.x - imu_bias_(0),
@@ -2947,6 +3044,11 @@ private:
             const Eigen::Quaterniond q_rdf = q_flu.normalized() *
                                              Eigen::Quaterniond(R_b2c_base_.transpose());
             std::lock_guard<std::mutex> odom_lock(odom_mtx_);
+            if (!gimbal_history_.add(rclcpp::Time(msg->header.stamp).seconds(), q_rdf)) {
+                RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 2000,
+                    "Ignoring invalid or non-increasing gimbal pose");
+                return;
+            }
             latest_gimbal_q_ = q_rdf.normalized();
             gimbal_received_ = true;
         }
@@ -3135,7 +3237,11 @@ private:
 
     std::mutex odom_mtx_;
     // ODOMETRY-FREE ego state: attitude + preintegrated velocity change from the IMU only.
-    Eigen::Matrix3d latest_R_b2n_ = Eigen::Matrix3d::Identity();   // from IMU orientation
+    Eigen::Matrix3d latest_R_b2n_ = Eigen::Matrix3d::Identity();   // body FLU -> world ENU
+    CameraPoseHistory gimbal_history_;
+    bool gyro_attitude_during_mission_ = false;
+    bool mission_gyro_initialized_ = false;
+    Eigen::Quaterniond mission_gyro_attitude_ = Eigen::Quaterniond::Identity();
     Eigen::Vector3d imu_bias_ = Eigen::Vector3d::Zero();           // accel bias (body frame)
     Eigen::Vector3d dv_own_accum_ = Eigen::Vector3d::Zero();       // ∫(R(f-b)-g)dt since last cam frame
     Eigen::Vector3d last_dv_own_ = Eigen::Vector3d::Zero();        // last drained camera window
@@ -3181,6 +3287,9 @@ private:
     // last commanded body rate signals physical contact -> intercept success -> COMPLETED. Gated on
     // !use_simulation_: the ROS2 Python sim has ground-truth range and judges intercept externally.
     bool collision_detected_ = false;
+    double collision_min_bbox_px_ = 0.0;
+    bool use_imu_axial_speed_ = false;
+    double capture_range_ = 2.0;
     bool use_simulation_ = false;
     Eigen::Vector3d latest_gyro_ = Eigen::Vector3d::Zero();   // body angular velocity from odom twist
     // Min estimated range seen this mission (reopen detection): once the range bottoms out and

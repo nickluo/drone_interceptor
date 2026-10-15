@@ -17,6 +17,11 @@ def generate_launch_description():
     
     # Path to the parameters file
     config_file = os.path.join(pkg_dir, 'config', 'relative_imm_ukf_params.yaml')
+    parameters_arg = DeclareLaunchArgument(
+        'parameters',
+        default_value=config_file,
+        description='Relative IMM-UKF parameters file (defaults to the packaged profile).'
+    )
 
     # Declare a launch argument to switch between simulation and real mode
     use_simulation_arg = DeclareLaunchArgument(
@@ -46,7 +51,7 @@ def generate_launch_description():
         name='interceptor_node_relative_imm_ukf',
         output='screen',
         parameters=[
-            config_file,
+            LaunchConfiguration('parameters'),
             {'use_simulation': LaunchConfiguration('use_simulation')},
             {'radar.enable': LaunchConfiguration('use_radar')},
             {'radar.reintercept_enable': LaunchConfiguration('radar_reintercept_enable')}
@@ -56,6 +61,7 @@ def generate_launch_description():
     )
 
     return LaunchDescription([
+        parameters_arg,
         use_simulation_arg,
         reintercept_arg,
         use_radar_arg,
