@@ -10,16 +10,17 @@ interceptor_node_relative_imm_ukf:
     # IMU, so zeros here; set calibrated values on real hardware.
     imu_bias: [0.0, 0.0, 0.0]
 
-    # Reference topic names; the current node hardcodes these instead of reading this block.
+    # Topic names are read at startup; restart the node after changing them.
     topics:
       imu: "/mavros/imu/data"
       bbox: "/fpv/target_bbox"
+      gimbal: "/fpv/gimbal"  # sensor_msgs/Imu, camera FLU -> world ENU orientation
       # ODOMETRY-FREE: the node no longer subscribes to any odometry. Ego-motion comes solely
       # from the IMU (orientation + preintegrated accel); the estimator state is fully relative.
       # Same launch trigger as InterceptorNodeBase: Header.frame_id is MISSION or OFF.
       mission_launch: "/fpv/tracker_trigger"
       mission_state: "/fpv/mission_state"
-      # Backward-compatible Bool trigger for the ROS2 simulation harness.
+      # Bool trigger for the ROS2 simulation harness; Header MISSION/OFF uses mission_launch above.
       mission: "/fpv/mission_start"
       control: "/fpv/control_command"
 

@@ -1448,19 +1448,23 @@ public:
         estimator_ = std::make_unique<RelativeIMMUKFEstimator>(dt_cam_, focal_length_, w_guess_, R_b2c_, g_drag_coeff_);
 
         mission_sub_ = this->create_subscription<std_msgs::msg::Bool>(
-            "/fpv/mission_launch", 10, std::bind(&InterceptorNodeRelativeIMMUKF::mission_callback, this, std::placeholders::_1));
+            this->get_parameter("topics.mission").as_string(), 10,
+            std::bind(&InterceptorNodeRelativeIMMUKF::mission_callback, this, std::placeholders::_1));
         tracker_trigger_sub_ = this->create_subscription<std_msgs::msg::Header>(
-            "/fpv/tracker_trigger", 10, std::bind(&InterceptorNodeRelativeIMMUKF::mission_launch_callback, this, std::placeholders::_1));
+            this->get_parameter("topics.mission_launch").as_string(), 10,
+            std::bind(&InterceptorNodeRelativeIMMUKF::mission_launch_callback, this, std::placeholders::_1));
 
         // odom_sub_ = nullptr;   // ODOMETRY-FREE: the relative-state estimator + IMU strapdown
         // IMU: SOLE ego-motion source. Orientation -> R_b2n (attitude for cam projection +
         // control); linear_acceleration -> preintegrated dv_own between camera frames (exogenous
         // a_own for the relativized process model); angular_velocity -> collision detection.
         imu_sub_ = this->create_subscription<sensor_msgs::msg::Imu>(
-            "/mavros/imu/data", rclcpp::SensorDataQoS(), std::bind(&InterceptorNodeRelativeIMMUKF::imu_callback, this, std::placeholders::_1), sub_options);
+            this->get_parameter("topics.imu").as_string(), rclcpp::SensorDataQoS(),
+            std::bind(&InterceptorNodeRelativeIMMUKF::imu_callback, this, std::placeholders::_1), sub_options);
 
         bbox_sub_ = this->create_subscription<vision_msgs::msg::Detection2D>(
-            "/fpv/target_bbox", 10, std::bind(&InterceptorNodeRelativeIMMUKF::bbox_callback, this, std::placeholders::_1), sub_options);
+            this->get_parameter("topics.bbox").as_string(), 10,
+            std::bind(&InterceptorNodeRelativeIMMUKF::bbox_callback, this, std::placeholders::_1), sub_options);
 
         // Gimbal orientation, IDENTICAL convention to InterceptorNodeBase / the hardware gimbal
         // driver / AirSim: a sensor_msgs/Imu whose orientation field is the camera-to-world
@@ -1468,11 +1472,13 @@ public:
         // are ignored by this node (it has its own IMM-UKF + body-IMU strapdown); they are populated
         // by the publisher for contract consistency. Only consumed when camera.use_gimbal is true.
         gimbal_sub_ = this->create_subscription<sensor_msgs::msg::Imu>(
-            "/fpv/gimbal", rclcpp::SensorDataQoS(),
+            this->get_parameter("topics.gimbal").as_string(), rclcpp::SensorDataQoS(),
             std::bind(&InterceptorNodeRelativeIMMUKF::gimbal_callback, this, std::placeholders::_1), sub_options);
 
-        control_pub_ = this->create_publisher<quadrotor_msgs::msg::ControlCommand>("/fpv/control_command", 10);
-        mission_state_pub_ = this->create_publisher<std_msgs::msg::Bool>("/fpv/mission_state", 10);
+        control_pub_ = this->create_publisher<quadrotor_msgs::msg::ControlCommand>(
+            this->get_parameter("topics.control").as_string(), 10);
+        mission_state_pub_ = this->create_publisher<std_msgs::msg::Bool>(
+            this->get_parameter("topics.mission_state").as_string(), 10);
 
         if (radar_enable_) {
             estimator_->max_range_ = radar_max_range_;
@@ -1491,11 +1497,23 @@ public:
         }
 
         mission_state_.set(MissionState::IDLE);
-        RCLCPP_INFO(this->get_logger(), "Relative IMM-UKF node ready (ODOMETRY-FREE, IMU strapdown). IMU=/mavros/imu/data BBox=/fpv/target_bbox Launch=/fpv/tracker_trigger Control=/fpv/control_command");
+        RCLCPP_INFO(this->get_logger(),
+            "Relative IMM-UKF node ready (ODOMETRY-FREE, IMU strapdown). "
+            "IMU=%s BBox=%s Gimbal=%s Launch=%s Mission=%s Control=%s State=%s",
+            imu_sub_->get_topic_name(), bbox_sub_->get_topic_name(), gimbal_sub_->get_topic_name(),
+            tracker_trigger_sub_->get_topic_name(), mission_sub_->get_topic_name(),
+            control_pub_->get_topic_name(), mission_state_pub_->get_topic_name());
     }
 
 private:
     void declare_parameters() {
+        this->declare_parameter<std::string>("topics.imu", "/mavros/imu/data");
+        this->declare_parameter<std::string>("topics.bbox", "/fpv/target_bbox");
+        this->declare_parameter<std::string>("topics.gimbal", "/fpv/gimbal");
+        this->declare_parameter<std::string>("topics.mission_launch", "/fpv/tracker_trigger");
+        this->declare_parameter<std::string>("topics.mission", "/fpv/mission_launch");
+        this->declare_parameter<std::string>("topics.control", "/fpv/control_command");
+        this->declare_parameter<std::string>("topics.mission_state", "/fpv/mission_state");
         this->declare_parameter<int>("camera.width_px", 640);
         this->declare_parameter<int>("camera.height_px", 480);
         this->declare_parameter<double>("camera.fov_deg", 60.0);
