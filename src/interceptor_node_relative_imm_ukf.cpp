@@ -1481,7 +1481,7 @@ public:
             this->get_parameter("topics.bbox").as_string(), 10,
             std::bind(&InterceptorNodeRelativeIMMUKF::bbox_callback, this, std::placeholders::_1), sub_options);
 
-        // Gimbal orientation, IDENTICAL convention to InterceptorNodeBase / the hardware gimbal
+        // Gimbal orientation, IDENTICAL convention to the hardware gimbal
         // driver / AirSim: a sensor_msgs/Imu whose orientation field is the camera-to-world
         // quaternion q_C_W (camera attitude in world/ENU). angular_velocity and orientation_covariance
         // are ignored by this node (it has its own IMM-UKF + body-IMU strapdown); they are populated
@@ -1670,7 +1670,7 @@ private:
         cam_height_ = this->get_parameter("camera.height_px").as_int();
         cam_fov_deg_ = this->get_parameter("camera.fov_deg").as_double();
         const bool use_simulation = this->get_parameter("use_simulation").as_bool();
-        use_simulation_ = use_simulation;   // mirrors InterceptorNodeBase; gates gyro collision detect
+        use_simulation_ = use_simulation;   // gates gyro collision detect
         collision_min_bbox_px_ = this->get_parameter("collision_min_bbox_px").as_double();
         use_imu_axial_speed_ = this->get_parameter("controller.use_imu_axial_speed").as_bool();
         target_axial_feedforward_limit_ = this->get_parameter(
@@ -1708,7 +1708,7 @@ private:
         control_rate_ = this->get_parameter("control.rate").as_double();
         const double rate_tc = this->get_parameter("control.rate_tc").as_double();
         const bool rate_attenuation = this->get_parameter("control.rate_control_attenuation").as_bool();
-        // First-order low-pass coefficient on body-rate output (mirrors InterceptorNodeBase).
+        // First-order low-pass coefficient on body-rate output.
         // EMA form: out_new = out_old + ctrl_coeff_ * (raw - out_old). Attenuates high-frequency
         // cmd jumps from estimator/guidance noise before they reach the attitude controller.
         if (!use_simulation && rate_attenuation && rate_tc > 1e-6 && control_rate_ > 1e-6) {
@@ -2677,7 +2677,7 @@ private:
         prev_attitude_t_ = t_now;
         has_prev_attitude_ = true;
 
-        // Collision detection (gyro spike) — AirSim / real HW only (mirror InterceptorNodeBase).
+        // Collision detection (gyro spike) — AirSim / real HW only.
         // The ROS2 Python sim (use_simulation_=true) has ground-truth range and judges the intercept
         // externally (ros2_sim_node.py), so the gyro check is skipped there. On contact the body rate
         // spikes well beyond what was commanded -> declare COMPLETED (intercept success) and stop.
@@ -2915,7 +2915,7 @@ private:
         cmd->collective_thrust = ctrl[0];
         // EMA low-pass on body rates: out_new = out_old + ctrl_coeff_*(raw - out_old).
         // Attenuates high-frequency cmd jumps (from estimator/guidance noise) before the attitude
-        // controller, suppressing pitch/roll/yaw oscillation. Mirrors InterceptorNodeBase logic.
+        // controller, suppressing pitch/roll/yaw oscillation.
         // Rate scaling: ctrl_coeff_ scales the raw body-rate command. This acts as a
         // fixed gain reduction (~0.39 with rate_tc=0.02) that damps the attitude loop.
         // Correct for AirSim/real hardware (inner attitude loop adds gain). For the Python
@@ -3100,8 +3100,8 @@ private:
     }
 
     // /fpv/gimbal (Imu): the orientation field is q_C_W in the FLU camera frame (x=fwd, y=left,
-    // z=up) — the SAME convention as InterceptorNodeBase/DroneEKF and airsim_tracker, so the
-    // base/quaternion/DQ nodes consume /fpv/gimbal unchanged. This node's estimator uses the RDF
+    // z=up) — the SAME convention as airsim_tracker and the hardware gimbal driver. This node's
+    // estimator uses the RDF
     // optical frame internally (x=right, y=down, z=fwd), so convert FLU->RDF at intake:
     //   q_C_W_rdf = q_C_W_flu * R(R_b2c_base_^T),  since (FLU->ENU)*(RDF->FLU) = RDF->ENU.
     // R_b2c_base_ is the FLU(body)->RDF(cam) extrinsic. angular_velocity / orientation_covariance
@@ -3352,7 +3352,7 @@ private:
     // vertical PD over-dived on below-FOV targets. Drifts long-term from accel bias, but the
     // high-frequency component (what damping needs) is accurate; reset on mission launch.
     Eigen::Vector3d own_vel_ = Eigen::Vector3d::Zero();
-    // Collision detection (AirSim/real HW only, mirror InterceptorNodeBase): a gyro spike vs the
+    // Collision detection (AirSim/real HW only): a gyro spike vs the
     // last commanded body rate signals physical contact -> intercept success -> COMPLETED. Gated on
     // !use_simulation_: the ROS2 Python sim has ground-truth range and judges intercept externally.
     bool collision_detected_ = false;

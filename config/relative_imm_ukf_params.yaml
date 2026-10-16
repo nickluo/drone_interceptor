@@ -17,7 +17,7 @@ interceptor_node_relative_imm_ukf:
       gimbal: "/fpv/gimbal"  # sensor_msgs/Imu, camera FLU -> world ENU orientation
       # ODOMETRY-FREE: the node no longer subscribes to any odometry. Ego-motion comes solely
       # from the IMU (orientation + preintegrated accel); the estimator state is fully relative.
-      # Same launch trigger as InterceptorNodeBase: Header.frame_id is MISSION or OFF.
+      # Launch trigger: Header.frame_id is MISSION or OFF.
       mission_launch: "/fpv/tracker_trigger"
       mission_state: "/fpv/mission_state"
       # Bool trigger for the ROS2 simulation harness; Header MISSION/OFF uses mission_launch above.
@@ -56,7 +56,7 @@ interceptor_node_relative_imm_ukf:
       # Semi-strapdown single-axis pitch gimbal: servo keeps the boresight near-horizontal in the
       # world frame regardless of body pitch (with servo lag). The ACTUAL camera-to-world orientation
       # q_C_W is published on /fpv/gimbal (sensor_msgs/Imu, orientation = camera->world quaternion) —
-      # the SAME convention as interceptor_node_base, the hardware gimbal driver, and AirSim. The node
+      # the SAME convention as the hardware gimbal driver and AirSim. The node
       # rebuilds R_b2c from q_C_W each frame. gimbal_bias_deg = fixed down-gaze bias: boresight world
       # elevation = -gimbal_bias_deg (keeps nonzero image-v for co-altitude targets); still consumed
       # by the controller FOV clamp and the pre-first-message R_b2c placeholder.

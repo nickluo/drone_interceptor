@@ -16,34 +16,30 @@ Boundaries: code/commits/PRs written normal.
 
 # drone_interceptor — Agent Instructions
 
-Vision-based drone interception. Three node variants: two NMPC (acados) sharing Template Method base class, one standalone IMM-UKF estimator + analytical controller.
+Vision-based drone interception. Single ROS2 node: relative IMM-UKF target estimator + analytical PN/IBVS controller. (The former acados NMPC variants — quaternion and dual-quaternion — were removed; history is in git.)
 
 ## Architecture
 
 ```
-InterceptorNodeBase (abstract)           — control loop, PN guidance, EKF, safety
-├── InterceptorNodeQuaternion            — 16D state [pos(3) vel_world(3) quat(4) omega(3) gimbal(3)]
-└── InterceptorNodeDQ                    — 17D state [dq(8) omega(3) v_body(3) gimbal(3)]
-InterceptorNodeRelativeIMMUKF (standalone) — 10D target state, IMM-UKF, PN+IBVS controller, NO acados
-utils.h                                  — DroneEKF(19D), MissionStateMachine, EMAFilter, CameraIntrinsics
+InterceptorNodeRelativeIMMUKF : public rclcpp::Node  — 10D target state, IMM-UKF, PN+IBVS controller, NO acados
+utils.h                       — MissionStateMachine + fixed-size Eigen aliases (header-only)
+guidance_limits.h             — bounded axial speed / terminal speed floor / vision-range helpers
+imu_strapdown.h               — gyro attitude integration
+camera_pose_history.h         — timestamped camera orientation ring buffer (delay compensation)
 ```
 
-### NMPC variants (base class)
+### Relative IMM-UKF node
 
-- **13 pure virtual methods** in base: state accessors, solver lifecycle, param packing, delay compensation, orientation validation
-- Two-phase init: base constructor declares params only; subclass calls `initialize()` after vtable ready
-- Thread safety: `std::shared_mutex` for drone_state/EKF/gimbal/control_history; `std::mutex` for bbox
-
-### Relative IMM-UKF variant (standalone)
-
-- `InterceptorNodeRelativeIMMUKF : public rclcpp::Node` — does NOT inherit `InterceptorNodeBase`
+- `InterceptorNodeRelativeIMMUKF : public rclcpp::Node` — fully standalone, no base class
 - **No acados solver** — links only `m`. No codegen step needed.
-- **10D target state** `[pos(3) vel(3) acc(3) width(1)]` in NAV/world frame (absolute target, not interceptor ego-state)
+- **10D target state** `[pos(3) vel(3) acc(3) width(1)]` — RELATIVE state (target − ownship) in a
+  gravity-aligned world frame G; ownship motion enters as an exogenous IMU-preintegrated input
 - **IMM with 3 motion models**: Singer (mode 0), Coordinated Turn/CT (mode 1), Rotor/drag (mode 2)
 - **UKF**: `UnscentedKalmanFilter10D`, 2N+1 sigma points, `robust_cholesky` (LLT fallback to eigendecomp)
 - **Measurement**: 3D pixel `[u, v, size]` from bbox → pinhole projection `h_meas_pixel`
 - **IMU strapdown**: preintegration (alpha/beta) for ego-motion; online accel bias calibration during idle
-- **Odometry aiding**: complementary fusion at camera rate; first fix hard-seeds ego frame; disables lateral dither
+- **Odometry-free**: ego-motion from IMU only; the controller's lateral observability dither provides the
+  parallax baseline that makes monocular depth/scale observable
 - **Controller**: PN (proportional navigation) + IBVS, FOV keep-in-frame guard, soft-start ramp, axial jerk limit
 - **Observability dither close-gates** (3 conditions, ALL must hold to dither): estimated range >
   `controller.dither_min_range`; bbox < `controller.dither_max_bbox` px (direct observable,
@@ -51,11 +47,13 @@ utils.h                                  — DroneEKF(19D), MissionStateMachine,
   close target where the dither only disturbs terminal precision; 0.5 s stale-hold across dropout
   frames); and no fresh radar track inside `controller.dither_radar_range` (works post-lock — the
   radar cache keeps updating even after fusion disengages). 0 disables either extra gate.
-- **Control output**: `quadrotor_msgs::ControlCommand` — `collective_thrust` + body rates `[omega_x, omega_y, omega_z]` (same topic/format as NMPC variants)
-- **Thread safety**: `std::mutex` (not shared_mutex)
-- **Topics**: imu=`/mavros/imu/data`, bbox=`/fpv/target_bbox`, odom=`/fpv/odom`, mission_launch=`/fpv/tracker_trigger`, mission=`/fpv/mission_start`, control=`/fpv/control_command`, mission_state=`/fpv/mission_state`
+- **Control output**: `quadrotor_msgs::ControlCommand` — `collective_thrust` + body rates `[omega_x, omega_y, omega_z]`
+- **Thread safety**: `std::mutex`
+- **Topics** (all names overridable via `topics.*` params): imu=`/mavros/imu/data`, bbox=`/fpv/target_bbox`,
+  gimbal=`/fpv/gimbal`, mission_launch=`/fpv/tracker_trigger`, mission=`/fpv/mission_start`,
+  control=`/fpv/control_command`, mission_state=`/fpv/mission_state`
 
-### Radar relay mid-course guidance (IMM-UKF variant only)
+### Radar relay mid-course guidance
 
 Optional second measurement source, off by default (`radar.enable`). Carries the interceptor to the
 target before the target is inside the camera FOV, then hands over to vision.
@@ -128,68 +126,48 @@ target before the target is inside the camera FOV, then hands over to vision.
 ## Build
 
 ```bash
-# 1. Generate acados C solver (must run BEFORE colcon build) — NMPC variants only
-cd prototype && python3 drone_model_quaternion.py   # or drone_model_dq.py
-# 2. Build all targets
 cd ~/workspace/fpv_ws && colcon build --packages-select drone_interceptor
 ```
 
 - C++17, Release mode, `ament_cmake`
-- NMPC targets link: `acados`, `blasfeo`, `hpipm`, `m`
-- `relative_imm_ukf` target links: `m` only
-- Generated C code in `prototype/c_generated_code/` compiled directly into NMPC executables
+- `interceptor_node_relative_imm_ukf` links: `m` only
+- No codegen / no external solver dependencies beyond `Eigen3` (system package)
 
-### Executable targets
+### Executable target
 
-| Target | Source | acados | Launch |
-|--------|--------|--------|--------|
-| `interceptor_node_quaternion` | `interceptor_node_base.cpp` + `interceptor_node_quaternion.cpp` | yes | `launch.py`, `airsim_launch.py` |
-| `interceptor_node_dq` | `interceptor_node_base.cpp` + `interceptor_node_dq.cpp` | yes | `launch_dq.py`, `airsim_launch_dq.py` |
-| `interceptor_node_relative_imm_ukf` | `interceptor_node_relative_imm_ukf.cpp` | no | `launch_relative_imm_ukf.py` |
+| Target | Source | Launch |
+|--------|--------|--------|
+| `interceptor_node_relative_imm_ukf` | `src/interceptor_node_relative_imm_ukf.cpp` | `launch_relative_imm_ukf.py` |
 
 ## Conventions
 
 - **Quaternion convention**: scalar-first `[w, x, y, z]` (differs from ROS `[x, y, z, w]`)
-- **DQ state**: velocity is **body frame**; quaternion state uses **world frame** velocity
 - **Control**: `[omega_x, omega_y, omega_z, thrust_accel]` as body rates + collective thrust (m/s²)
 - **Naming**: `snake_case` vars/methods, `PascalCase` classes, `UPPER_CASE` constants, trailing `_` for members
-- **Headers**: `#pragma once`, system → ROS → project → `extern "C"` for acados
-- **Eigen**: heavy use — fixed-size aliases (`VectorU`, `Vector6d`, `VectorWcostQuat`) and dynamic `VectorXd`
-- **Comments**: mixed English and Chinese (中文), especially in `utils.h` EKF code
-
-## Solver Design (NONLINEAR_LS) — NMPC variants only
-
-- Cost type must be **NONLINEAR_LS** (not EXTERNAL) — EXTERNAL has zero control gradient at hover, causing SQP_RTI MINSTEP failures
-- Residual vector includes `omega_dot` + `thrust_accel_error` to give Gauss-Newton direct u-gradient
-- `SQP_RTI`, `PARTIAL_CONDENSING_HPIPM`, `ERK` integrator (RK4, 2 steps), `PROJECT` regularization, LM=5.0
-- Baumgarte stabilization (K=10) for quaternion/DQ norm — ERK sufficient, no need for IRK
+- **Headers**: `#pragma once`, system → ROS → project
+- **Eigen**: heavy use — fixed-size aliases (`Vector6d`, `Matrix6d`) and dynamic `VectorXd`
+- **Comments**: mixed English and Chinese (中文)
 
 ## Key Files
 
 | Path | Purpose |
 |------|---------|
-| `src/interceptor_node_base.h/.cpp` | Abstract base — full NMPC algorithm skeleton |
-| `src/interceptor_node_quaternion.h/.cpp` | Quaternion variant (16D, 8D cost weights) |
-| `src/interceptor_node_dq.h/.cpp` | DQ variant (17D, 9D cost weights, inline DQ helpers) |
-| `src/interceptor_node_relative_imm_ukf.cpp` | Standalone IMM-UKF estimator + PN/IBVS controller (10D, no acados) |
-| `src/utils.h` | EKF, state machine, filters (header-only) |
-| `prototype/drone_model_dq.py` | DQ dynamics + cost + solver code generation |
-| `prototype/drone_model_quaternion.py` | Quaternion dynamics + cost + solver code generation |
-| `config/*_params.yaml` | Runtime parameters (real hardware vs AirSim vs IMM-UKF) |
+| `src/interceptor_node_relative_imm_ukf.cpp` | Standalone IMM-UKF estimator + PN/IBVS controller (10D) |
+| `src/utils.h` | MissionStateMachine, fixed-size Eigen aliases (header-only) |
+| `src/guidance_limits.h` | bounded axial speed / terminal speed floor / vision-range helpers (header-only) |
+| `src/imu_strapdown.h` | gyro attitude integration (header-only) |
+| `src/camera_pose_history.h` | timestamped camera orientation buffer (header-only) |
+| `config/relative_imm_ukf_params.yaml` | Runtime parameters (Camera8 SITL profile) |
 | `prototype/ros2_sim_node.py` | ROS2 harness driving the real C++ node (incl. simulated radar relay) |
+| `prototype/sim_test_relative_imm_ukf.py` | Pure-Python mirror of the C++ estimator + controller |
 | `prototype/run_scenario.sh` | One-shot scenario runner: launches the node, drives it, prints the summary |
 
 ## Pitfalls
 
-- Modifying NMPC cost function or dynamics requires **regenerating the C solver** from `prototype/` before rebuilding (does NOT affect `relative_imm_ukf` target)
-- FOV cost needs `forward_scale` (zero when target behind camera) to avoid Jacobian explosion
-- PN guidance diverges when EKF has >2x range error — disabled by default in NMPC variants
-- Always use solver output even with status≠0 (suboptimal solution > fallback)
-- `penalty_coeff` must be TTA-based with cap at 30 to prevent close-range solver explosion
-- `relative_imm_ukf` node: `use_simulation` defaults `False` in launch — verify before AirSim runs
+- `use_simulation` defaults `False` in the launch — verify before sim runs
 - Radar relay is OFF unless `radar.enable` / `launch_relative_imm_ukf.py use_radar:=True`
 - The width handover is only as good as `focal_length_`, which comes from `camera.width_px` and
   `camera.fov_deg`. `airsim_settings.json` (30° / 960x960) does NOT match the launch defaults
-  (72° / 1920x1200) — a 35% focal error that corrupts both the handover width and the terminal
+  (1536x960 / 72°) — a focal error corrupts both the handover width and the terminal
   monocular range. Align them before any AirSim run.
-- `acados`/`blasfeo`/`hpipm`/`Eigen` not declared in `package.xml` — `rosdep` won't install; manual system install required
+- `Eigen` is not declared in `package.xml` — rosdep won't install it; manual system install required

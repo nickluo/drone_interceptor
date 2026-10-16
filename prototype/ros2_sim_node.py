@@ -18,7 +18,7 @@ Subscribes:
 Internal quadrotor dynamics: first-order body-rate tracking + thrust along body z - gravity.
 Camera: pinhole projection on a semi-strapdown single-axis pitch gimbal (boresight servo-held
 near-horizontal, 5° down-gaze bias, servo lag 0.1 s) + Gaussian noise. The actual camera-to-world
-orientation q_C_W is published on /fpv/gimbal (sensor_msgs/Imu), matching InterceptorNodeBase.
+orientation q_C_W is published on /fpv/gimbal (sensor_msgs/Imu), matching the C++ interceptor node.
 
 Usage:
   ros2 launch drone_interceptor launch_relative_imm_ukf.py   # terminal 1
@@ -648,7 +648,7 @@ class SimNode(Node):
         # Semi-strapdown gimbal: servo the cam-x pitch every control step (before the camera
         # projection reads module R_B2C), then publish the ACTUAL camera-to-world orientation on
         # /fpv/gimbal (sensor_msgs/Imu) — q_C_W in the FLU camera frame (x=fwd, y=left, z=up), the
-        # SAME convention as InterceptorNodeBase/DroneEKF, the hardware gimbal driver, and AirSim.
+        # SAME convention as the C++ interceptor node, the hardware gimbal driver, and AirSim.
         # FLU = RDF right-multiplied by R_B2C_BASE (FLU->RDF): (FLU->ENU) = (RDF->ENU)·(FLU->RDF),
         # where RDF->ENU = R_b2n @ R_B2C.T (inverse of the sim projection's R_n2c = R_B2C @ R_b2n.T).
         gimbal_total = update_gimbal(self.uav, self.dt_ctrl)
@@ -663,9 +663,9 @@ class SimNode(Node):
         gmsg.orientation.y = float(y)
         gmsg.orientation.z = float(z)
         # angular_velocity / orientation_covariance are NOT consumed by the IMM-UKF node (it runs its
-        # own IMM-UKF + body-IMU strapdown). Populated best-effort for contract consistency with the
-        # base node / AirSim, which read them: body rate as the camera-rate approximation, and the
-        # camera world euler (r,p,y) packed into the covariance[0:3] slots (the base-node convention).
+        # own IMM-UKF + body-IMU strapdown). Populated best-effort for contract consistency with
+        # AirSim, which reads them: body rate as the camera-rate approximation, and the
+        # camera world euler (r,p,y) packed into the covariance[0:3] slots.
         gmsg.angular_velocity.x = float(self.uav.omega[0])
         gmsg.angular_velocity.y = float(self.uav.omega[1])
         gmsg.angular_velocity.z = float(self.uav.omega[2])

@@ -3,7 +3,7 @@
 <package format="3">
   <name>drone_interceptor</name>
   <version>0.1.0</version>
-  <description>A ROS2 package to control a drone to intercept a target using MPC.</description>
+  <description>A ROS2 package to control a drone to intercept a target using a relative IMM-UKF estimator with PN/IBVS guidance.</description>
   <maintainer email="user@todo.todo">user</maintainer>
   <license>Apache-2.0</license>
 
