@@ -1,12 +1,23 @@
 #pragma once
 
 #include <atomic>
+#include <algorithm>
+#include <cmath>
 #include <cstdint>
 #include <Eigen/Dense>
+
+#ifndef M_PI
+#define M_PI 3.14159265358979323846
+#endif
 
 // Define fixed-size vector/matrix types for performance
 using Vector6d = Eigen::Matrix<double, 6, 1>;
 using Matrix6d = Eigen::Matrix<double, 6, 6>;
+
+// Clamp `value` to [low, high]. Shared by the IMM-UKF estimator, the controller and the node.
+inline double clamp(double value, double low, double high) {
+    return std::max(low, std::min(high, value));
+}
 
 // ============================================================================
 // 任务状态枚举和线程安全状态机

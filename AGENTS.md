@@ -34,7 +34,7 @@ camera_pose_history.h         — timestamped camera orientation ring buffer (de
 - **No acados solver** — links only `m`. No codegen step needed.
 - **10D target state** `[pos(3) vel(3) acc(3) width(1)]` — RELATIVE state (target − ownship) in a
   gravity-aligned world frame G; ownship motion enters as an exogenous IMU-preintegrated input
-- **IMM with 3 motion models**: Singer (mode 0), Coordinated Turn/CT (mode 1), Rotor/drag (mode 2)
+- **IMM with 3 motion models**: Singer (mode 0), Coordinated Turn/CT (mode 1), Rotor — pure accel-relaxation, no drag term (mode 2)
 - **UKF**: `UnscentedKalmanFilter10D`, 2N+1 sigma points, `robust_cholesky` (LLT fallback to eigendecomp)
 - **Measurement**: 3D pixel `[u, v, size]` from bbox → pinhole projection `h_meas_pixel`
 - **IMU strapdown**: preintegration (alpha/beta) for ego-motion; online accel bias calibration during idle
@@ -103,9 +103,9 @@ target before the target is inside the camera FOV, then hands over to vision.
   runs the terminal range on the configured guess and nothing pins W afterwards — it drifts with
   every update (observed `w_est` 1.9 -> 2.3 in AirSim).
 - **Terminal vision guidance is exclusive.** Once vision is locked AND delivering, the radar stops
-  contributing entirely (`radar.disable_after_lock`): its metre-level noise can only degrade a
+  contributing entirely: its metre-level noise can only degrade a
   converged monocular solution, and its range knowledge is already baked into the locked width. It
-  re-engages as soon as vision stops delivering for `radar.vision_hold` — i.e. when the pass failed.
+  re-engages as soon as vision stops delivering for `radar.vision_lost_timeout` — i.e. when the pass failed.
 - **States**: `INITIALIZING -> BLIND_FLIGHT` on radar acquisition, `-> TRACKING` on visual lock.
   Vision gone > `radar.vision_lost_timeout` hands guidance ownership back to radar.
 - **Frame cross-check**: with the target in frame, the camera LOS azimuth and the radar LOS azimuth
@@ -152,8 +152,11 @@ cd ~/workspace/fpv_ws && colcon build --packages-select drone_interceptor
 
 | Path | Purpose |
 |------|---------|
-| `src/interceptor_node_relative_imm_ukf.cpp` | Standalone IMM-UKF estimator + PN/IBVS controller (10D) |
-| `src/utils.h` | MissionStateMachine, fixed-size Eigen aliases (header-only) |
+| `src/relative_imm_ukf.h` | IMM-UKF estimator stack: `UnscentedKalmanFilter10D`, `RobustIMMEstimator10D`, `RelativeIMMUKFEstimator` (header-only) |
+| `src/advanced_hybrid_controller.h` | `AdvancedHybridController` — PN/IBVS guidance + thrust allocation (header-only) |
+| `src/interceptor_node_relative_imm_ukf.h` | Node class declaration (members, nested cache/sample structs) |
+| `src/interceptor_node_relative_imm_ukf.cpp` | Node method definitions + `main()` |
+| `src/utils.h` | MissionStateMachine, fixed-size Eigen aliases, `clamp` (header-only) |
 | `src/guidance_limits.h` | bounded axial speed / terminal speed floor / vision-range helpers (header-only) |
 | `src/imu_strapdown.h` | gyro attitude integration (header-only) |
 | `src/camera_pose_history.h` | timestamped camera orientation buffer (header-only) |

@@ -26,7 +26,10 @@ int main()
     require(history.at(1.1)->angularDistance(second) < 1e-10);
     require(history.at(1.05)->angularDistance(first.slerp(.5, second)) < 1e-10);
     require(!history.at(.99));
-    require(!history.at(1.11));
+    // Zero-order hold for a detection a few ms NEWER than the newest sample (delivery race
+    // between the gimbal and detector streams): hold the newest pose instead of dropping the frame.
+    require(history.at(1.11)->angularDistance(second) < 1e-10);
+    require(!history.at(1.2));   // 100 ms ahead of the newest sample: outside the hold margin
     require(!history.at(std::numeric_limits<double>::quiet_NaN()));
 
     const Eigen::Vector3d fixed_target(100, 0, 20);

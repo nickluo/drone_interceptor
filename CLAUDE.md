@@ -47,14 +47,19 @@ The launch loads `config/relative_imm_ukf_params.yaml`. Note: `use_simulation` d
 ## Architecture (big picture)
 
 ```text
-InterceptorNodeRelativeIMMUKF : public rclcpp::Node  — 10D target state, IMM-UKF, PN+IBVS controller, NO acados
-utils.h                       — MissionStateMachine + fixed-size Eigen aliases (header-only)
-guidance_limits.h             — bounded axial speed / terminal speed floor / vision-range helpers
-imu_strapdown.h               — gyro attitude integration
-camera_pose_history.h         — timestamped camera orientation ring buffer (delay compensation)
+interceptor_node_relative_imm_ukf.h    — node class declaration (members, nested cache/sample structs)
+interceptor_node_relative_imm_ukf.cpp  — node method definitions + main()
+relative_imm_ukf.h                     — UnscentedKalmanFilter10D + RobustIMMEstimator10D + RelativeIMMUKFEstimator
+advanced_hybrid_controller.h           — AdvancedHybridController (PN/IBVS guidance + thrust allocation)
+utils.h                                — MissionStateMachine, Eigen aliases, clamp
+guidance_limits.h                      — bounded axial speed / terminal speed floor / vision-range helpers
+imu_strapdown.h                        — gyro attitude integration
+camera_pose_history.h                  — timestamped camera orientation ring buffer (delay compensation)
 ```
 
-- **Node** (`src/interceptor_node_relative_imm_ukf.cpp`, fully standalone): 10D relative state `[r(3) v_rel(3) a_t(3) W(1)]` in a gravity-aligned world frame; IMM over 3 motion models (Singer, coordinated turn, rotor/drag), each a UKF with robust Cholesky; monocular pinhole `[u, v, size]` measurements; ego-motion from IMU strapdown preintegration (odometry-free). Controller: PN + IBVS with FOV keep-in-frame guard, axial jerk limit, terminal speed floor, close-range lateral decay.
+- **Estimator stack** (`relative_imm_ukf.h`, header-only): 10D relative state `[r(3) v_rel(3) a_t(3) W(1)]` in a gravity-aligned world frame; IMM over 3 motion models (Singer, coordinated turn, rotor — accel-relaxation, no drag), each a UKF with robust Cholesky; monocular pinhole `[u, v, size]` measurements plus linear radar `[r, v_rel]` updates; ego-motion from IMU strapdown preintegration (odometry-free).
+- **Controller** (`advanced_hybrid_controller.h`, header-only): PN + IBVS with FOV keep-in-frame guard, axial jerk limit, terminal speed floor, close-range lateral decay.
+- **Node** (`interceptor_node_relative_imm_ukf.{h,cpp}`): ROS wiring, parameter load/validate, radar relay pairing/handover/re-anchor, mission state machine, capture/brake/coast logic, control timer.
 - **Radar relay** (optional, `radar.enable`, off by default): `/fpv/radar/target` + `/fpv/radar/interceptor` (`nav_msgs/Odometry`, world ENU, `header.stamp` = measurement epoch) are differenced into a relative `[r, v_rel]` linear UKF update, giving mid-course guidance while the target is still outside the camera FOV. On visual acquisition the target width is fixed from `bbox_size * r_radar / focal` and locked, anchoring the monocular terminal range. Producer is `airsim_tracker/radar_relay_node.py`. Full contract in `AGENTS.md`.
 - **Control flow**: vision bbox → relative-state IMM-UKF → guidance (PN mid-course, IBVS/FOV-guarded terminal) → `quadrotor_msgs::ControlCommand` = `collective_thrust` + body rates `[omega_x, omega_y, omega_z]`, published on `/fpv/control_command` at ~50 Hz.
 
