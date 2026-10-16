@@ -905,8 +905,13 @@ public:
     double vertical_brake_accel_ = 0.0;
     double vertical_brake_delay_ = 0.0;
     double visual_speed_gain_ = 0.0;
-    // Turn-radius cap scaling factor. The cap v ≤ factor·sqrt(g·tan(tilt)·r) is the single adaptive
-    // terminal-speed reducer (keeps min turn radius inside range). 1.0 = physics limit; <1 brakes sooner.
+    double visual_speed_floor_ = 0.0;
+    double terminal_speed_floor_ = 0.0;
+    double terminal_speed_bbox_threshold_ = 120.0;
+    double terminal_speed_los_rate_threshold_ = 0.05;
+    // Turn-radius cap scaling factor. The cap v ≤ factor·sqrt(g·tan(tilt)·r) is the adaptive
+    // mid-course speed reducer. The terminal floor is enabled only from current visual
+    // observability, so it does not depend on the target scenario.
     double turn_radius_cap_factor_ = 0.8;
     // Axial deadband: coast (a_fwd=0) within ±this of v_des_eff — kills radar-noise-driven pitch oscillation.
     double axial_deadband_ = 1.5;
@@ -1074,10 +1079,20 @@ public:
         vertical_brake_accel_ = deceleration;
         vertical_brake_delay_ = delay;
     }
-    void set_visual_speed_gain(double gain) {
-        if (!std::isfinite(gain) || gain < 0)
-            throw std::invalid_argument("controller.visual_speed_gain must be finite and nonnegative");
+    void set_visual_speed_gain(double gain, double floor) {
+        if (!std::isfinite(gain) || gain < 0 || !std::isfinite(floor) || floor < 0)
+            throw std::invalid_argument("visual speed gain and floor must be finite and nonnegative");
         visual_speed_gain_ = gain;
+        visual_speed_floor_ = floor;
+    }
+    void set_terminal_speed_floor(double floor, double bbox_threshold, double los_rate_threshold) {
+        if (!std::isfinite(floor) || floor < 0 ||
+            !std::isfinite(bbox_threshold) || bbox_threshold <= 0 ||
+            !std::isfinite(los_rate_threshold) || los_rate_threshold < 0)
+            throw std::invalid_argument("invalid terminal speed floor parameters");
+        terminal_speed_floor_ = floor;
+        terminal_speed_bbox_threshold_ = bbox_threshold;
+        terminal_speed_los_rate_threshold_ = los_rate_threshold;
     }
     // Turn-radius cap factor: clamped to [0.3, 1.0] (1.0 = physics limit; <1 brakes sooner). The cap is
     // the maneuverability-based speed reducer (see compute_control). Out-of-range is WARNed at the
@@ -1093,9 +1108,7 @@ public:
     //   v_fwd_body   : closing speed proxy = -v_rel·r̂ (positive = approaching); NOT odom
     //   bbox_size    : target bbox size in px (observable proximity cue)
     //   v_z          : ownship vertical speed proxy = -v_rel(2) (target-level approximation)
-    //   target_speed : transverse (escape) speed = |r_xy×v_xy|/|r_xy| — drives the speed-aware
-    //                  terminal-brake floor (must NOT brake below a crossing target's lateral speed).
-    //                  NOT the full |v_rel|: that is the closing speed and would defeat the brake.
+    //   target_speed : retained for call-site compatibility; terminal speed uses observed LOS instead.
     //   los_rate     : EMA-smoothed measured bearing rate (lambda_dot)
     //   a_own_world  : ownship world accel over the last camera window (IMU preintegration)
     //   t            : mission-relative time (s)
@@ -1110,6 +1123,7 @@ public:
                                         bool radar_owns_guidance = false,
                                         bool radar_close_range = false) {
         (void)v_est;
+        (void)target_speed;
         const double r_norm = r_est.norm();
         // Axial-only range EMA (radar smoothness): r_norm carries +-~4 m of 10 Hz radar noise; fed
         // 1:1 into the turn-radius cap (sqrt(g*tan*r)) it swings v_des_eff and brakes every cycle.
@@ -1219,12 +1233,6 @@ public:
 
         // ---- (A) Axial guidance: cruise ceiling with maneuverability and visual proximity caps ----
         double v_des_eff = v_des;
-        // Speed-aware floor: never below a maneuvering target's escape speed + margin (it must be chased).
-        // Static/slow target -> 3.0 m/s stall guard (the cap, not this floor, governs close-range speed).
-        {
-            const double moving_floor = (target_speed > 1.0) ? (target_speed + 1.5) : 3.0;
-            v_des_eff = std::max(v_des_eff, std::min(moving_floor, v_des));
-        }
         // Turn-radius maneuverability cap: v ≤ factor·sqrt(g·tan(tilt)·r). Uses the range-appropriate
         // bank (terminal tilt inside terminal_tilt_range) so the raised terminal bank translates into
         // sustained close-range speed AND tighter turns.
@@ -1232,7 +1240,14 @@ public:
         v_des_eff = std::min(v_des_eff, turn_radius_cap_factor_ * std::sqrt(g * std::tan(tilt_for_cap) * r_norm_axial));
         // The raw image cue can brake before an overestimated monocular range catches up.
         if (visual_speed_gain_ > 0 && bbox_size > 0)
-            v_des_eff = std::min(v_des_eff, visual_speed_gain_ / bbox_size);
+            v_des_eff = std::min(v_des_eff,
+                std::max(visual_speed_floor_, visual_speed_gain_ / bbox_size));
+        // Once the target is large and the measured LOS is stable, preserve a useful terminal
+        // closing speed. This is driven by current observations and is therefore shared by
+        // stationary and moving-target missions. A large LOS rate keeps the maneuverability cap.
+        v_des_eff = terminal_speed_floor_cap(v_des, v_des_eff, terminal_speed_floor_,
+                                             bbox_size, terminal_speed_bbox_threshold_,
+                                             los_rate, terminal_speed_los_rate_threshold_);
         // v_fwd_body (= v_closing from v_rel) is under-observable along-LOS until scale converges;
         // a low v_closing inflates a_fwd -> ownship over-accelerates ON-AXIS, starving lateral PN
         // lead. Scene-adaptive 3-level floor: turning target (|atp_ema| large) -> 0.88 (don't blast
@@ -1575,11 +1590,16 @@ private:
         this->declare_parameter<bool>("use_simulation", false);
         this->declare_parameter<double>("collision_min_bbox_px", 0.0);
         this->declare_parameter<bool>("controller.use_imu_axial_speed", false);
+        this->declare_parameter<double>("controller.target_axial_feedforward_limit", 0.0);
         this->declare_parameter<double>("controller.K_apn", 0.8);
         this->declare_parameter<double>("controller.vertical_brake_accel", 0.0);
         this->declare_parameter<double>("controller.vertical_brake_delay", 0.0);
         this->declare_parameter<double>("controller.capture_range", 2.0);
         this->declare_parameter<double>("controller.visual_speed_gain", 0.0);
+        this->declare_parameter<double>("controller.visual_speed_floor", 0.0);
+        this->declare_parameter<double>("controller.terminal_speed_floor", 0.0);
+        this->declare_parameter<double>("controller.terminal_speed_bbox_threshold", 120.0);
+        this->declare_parameter<double>("controller.terminal_speed_los_rate_threshold", 0.05);
         // ---- Radar relay (mid-course guidance before the target enters the camera FOV) --------
         // An external radar tracks BOTH the target and the interceptor and reports each as a
         // world-ENU nav_msgs/Odometry at ~10 Hz with metre-level noise and 50-100 ms latency. The
@@ -1653,6 +1673,11 @@ private:
         use_simulation_ = use_simulation;   // mirrors InterceptorNodeBase; gates gyro collision detect
         collision_min_bbox_px_ = this->get_parameter("collision_min_bbox_px").as_double();
         use_imu_axial_speed_ = this->get_parameter("controller.use_imu_axial_speed").as_bool();
+        target_axial_feedforward_limit_ = this->get_parameter(
+            "controller.target_axial_feedforward_limit").as_double();
+        if (!std::isfinite(target_axial_feedforward_limit_) || target_axial_feedforward_limit_ < 0 ||
+            (target_axial_feedforward_limit_ > 0 && !use_imu_axial_speed_))
+            throw std::invalid_argument("target axial feedforward requires IMU axial speed and a nonnegative finite limit");
         capture_range_ = this->get_parameter("controller.capture_range").as_double();
         if (!std::isfinite(capture_range_) || capture_range_ <= 0)
             throw std::invalid_argument("controller.capture_range must be finite and positive");
@@ -1738,7 +1763,13 @@ private:
         controller_->set_vertical_braking(
             this->get_parameter("controller.vertical_brake_accel").as_double(),
             this->get_parameter("controller.vertical_brake_delay").as_double());
-        controller_->set_visual_speed_gain(this->get_parameter("controller.visual_speed_gain").as_double());
+        controller_->set_visual_speed_gain(
+            this->get_parameter("controller.visual_speed_gain").as_double(),
+            this->get_parameter("controller.visual_speed_floor").as_double());
+        controller_->set_terminal_speed_floor(
+            this->get_parameter("controller.terminal_speed_floor").as_double(),
+            this->get_parameter("controller.terminal_speed_bbox_threshold").as_double(),
+            this->get_parameter("controller.terminal_speed_los_rate_threshold").as_double());
         {
             const double trcf = this->get_parameter("controller.turn_radius_cap_factor").as_double();
             if (trcf < 0.3 - 1e-9 || trcf > 1.0 + 1e-9) {
@@ -2605,9 +2636,24 @@ private:
         const double v_closing = cache.valid
             ? -cache.v_est.dot(cache.r_est) / std::max(cache.r_est.norm(), 1e-3)
             : 0.0;
-        const double axial_speed = use_imu_axial_speed_
+        const double measured_axial_speed = use_imu_axial_speed_
             ? own_vel_now.x() * std::cos(yaw) + own_vel_now.y() * std::sin(yaw)
             : v_closing;
+        if (target_axial_feedforward_limit_ > 0 && cache.has_bbox && cache.bbox_size >= 80) {
+            // IMU own velocity + UKF relative velocity estimates target motion.
+            // Keep image braking a closing-speed reference, not an own-speed cap
+            // below a moving target's speed. Bound/filter uncertain monocular scale.
+            const double relative_axial = cache.v_est.x() * std::cos(yaw)
+                + cache.v_est.y() * std::sin(yaw);
+            const double estimate = bounded_target_axial_speed(
+                measured_axial_speed, relative_axial, target_axial_feedforward_limit_);
+            if (last_target_axial_time_ > 0 && t_now > last_target_axial_time_) {
+                const double alpha = -std::expm1(-std::min(t_now - last_target_axial_time_, .1) / .5);
+                target_axial_feedforward_ += alpha * (estimate - target_axial_feedforward_);
+            }
+            last_target_axial_time_ = t_now;
+        }
+        const double axial_speed = measured_axial_speed - target_axial_feedforward_;
         double los_az = cache.los_az_world - yaw;
         los_az = std::atan2(std::sin(los_az), std::cos(los_az));
         const double t_rel = (sim_start_time >= 0.0) ? t_now - sim_start_time : 0.0;
@@ -2714,7 +2760,10 @@ private:
             // vision handsover. min_vision_range_ advances only on real vision frames, so a reopen
             // requires a genuine vision close approach first.
             if (cache.has_bbox) {
-                min_vision_range_ = std::min(min_vision_range_, cache.r_est.norm());
+                // Startup monocular scale can dip below 15 m at an 80 m standoff.
+                // A sufficiently large image must anchor a terminal pass first.
+                min_vision_range_ = terminal_vision_range_minimum(
+                    min_vision_range_, cache.r_est.norm(), cache.bbox_size);
             }
         }
         // Reopen: range bottomed out and has since grown past it — the UAV flew through the target.
@@ -2891,10 +2940,10 @@ private:
         control_pub_->publish(std::move(cmd));
 
         RCLCPP_INFO_THROTTLE(this->get_logger(), *this->get_clock(), THROTTLE_INTERVAL_MS,
-            "ctrl rel=[%.2f %.2f %.2f] vel=[%.2f %.2f %.2f] cmd=[%.2f %.2f %.2f %.2f] pitch=%.2f los_el=%.2f own_axial=%.2f own_vz=%.2f bbox=%.1f",
+            "ctrl rel=[%.2f %.2f %.2f] vel=[%.2f %.2f %.2f] cmd=[%.2f %.2f %.2f %.2f] pitch=%.2f los_el=%.2f own_axial=%.2f own_vz=%.2f bbox=%.1f target_axial_ff=%.2f",
             cache.r_est(0), cache.r_est(1), cache.r_est(2), cache.v_est(0), cache.v_est(1), cache.v_est(2),
             ctrl[0], ctrl[1], ctrl[2], ctrl[3], pitch, cache.los_el,
-            axial_speed, v_z, cache.bbox_size);
+            measured_axial_speed, v_z, cache.bbox_size, target_axial_feedforward_);
 
         // Attitude-loop diagnostic: actual Euler angles + measured body rates (finite-differenced)
         // vs commanded body rates. Reveals whether oscillation is from cmd jumps (estimator/guidance)
@@ -2961,6 +3010,8 @@ private:
             los_rate_ema_ = 0.0;
             prev_los_t_ = -1.0;
             has_frozen_cmd_ = false;
+            target_axial_feedforward_ = 0.0;
+            last_target_axial_time_ = -1.0;
             last_good_range_ = 1e9;
             last_bbox_time_ = 0.0;
             captured_ = false;
@@ -3307,6 +3358,9 @@ private:
     bool collision_detected_ = false;
     double collision_min_bbox_px_ = 0.0;
     bool use_imu_axial_speed_ = false;
+    double target_axial_feedforward_limit_ = 0.0;
+    double target_axial_feedforward_ = 0.0;
+    double last_target_axial_time_ = -1.0;
     double capture_range_ = 2.0;
     bool use_simulation_ = false;
     Eigen::Vector3d latest_gyro_ = Eigen::Vector3d::Zero();   // body angular velocity from odom twist
