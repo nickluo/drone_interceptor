@@ -55,19 +55,21 @@ private:
     }
     static Eigen::Vector3d h_meas_pixel(const Eigen::VectorXd& x,
                                  const Eigen::Matrix3d& R_n2c,
-                                 double focal_length) {
+                                 double fx, double fy) {
         // Relative-state form: x[0:3] IS the relative position (target - ownship) in world frame G.
         // No uav_pos needed — the measurement is purely relative; R_n2c = R_b2c @ R_b2n^T carries the
         // ownship ATTITUDE (from IMU orientation), which is all the projection requires.
+        // z = [u, v, s] is in pixels and principal-point-relative (the caller subtracts cx/cy):
+        // u/v project through fx/fy, the bbox WIDTH s shares the fx channel.
         const Eigen::Vector3d rel_p = x.segment<3>(0);
         Eigen::Vector3d p_cam = R_n2c * rel_p;
         p_cam(2) = std::max(p_cam(2), 0.5);
-        const double u = focal_length * p_cam(0) / p_cam(2);
-        const double v = focal_length * p_cam(1) / p_cam(2);
+        const double u = fx * p_cam(0) / p_cam(2);
+        const double v = fy * p_cam(1) / p_cam(2);
         // Clamp w_est to physical range to prevent negative-width sigma points from
         // creating asymmetric measurement predictions that bias the UKF update.
         const double w_est = clamp(x(9), 0.3, 5.0);
-        const double s = focal_length * w_est / p_cam(2);
+        const double s = fx * w_est / p_cam(2);
         return Eigen::Vector3d(u, v, s);
     }
     // Relative-state motion models. State x = [r(3), v_rel(3), a_t(3), W(1)] in a gravity-aligned
@@ -194,7 +196,7 @@ public:
         predicted = true;
     }
 
-    double update(const Eigen::Vector3d& z_pixel, const Eigen::Matrix3d& R_n2c, double focal_length) {
+    double update(const Eigen::Vector3d& z_pixel, const Eigen::Matrix3d& R_n2c, double fx, double fy) {
         const int n = kStateDim;
         const double Wi = 0.5 / n;
 
@@ -211,7 +213,7 @@ public:
 
         std::vector<Eigen::Vector3d> sigmas_h(2 * n + 1, Eigen::Vector3d::Zero());
         for (int i = 0; i <= 2 * n; ++i) {
-            sigmas_h[i] = h_meas_pixel(sigmas_f[i], R_n2c, focal_length);
+            sigmas_h[i] = h_meas_pixel(sigmas_f[i], R_n2c, fx, fy);
         }
 
         Eigen::Vector3d z_pred = Eigen::Vector3d::Zero();
@@ -399,10 +401,10 @@ public:
         compute_state_estimate();
     }
 
-    void update(const Eigen::Vector3d& z_pixel, const Eigen::Matrix3d& R_n2c, double focal_length) {
+    void update(const Eigen::Vector3d& z_pixel, const Eigen::Matrix3d& R_n2c, double fx, double fy) {
         Eigen::Vector3d likelihoods;
         for (int j = 0; j < kModeCount; ++j) {
-            likelihoods(j) = filters[j].update(z_pixel, R_n2c, focal_length);
+            likelihoods(j) = filters[j].update(z_pixel, R_n2c, fx, fy);
         }
         mix_likelihoods(likelihoods);
     }
@@ -458,7 +460,11 @@ public:
 class RelativeIMMUKFEstimator {
 public:
     double dt_cam;
-    double focal_length;
+    // Pinhole focal lengths in pixels: fx serves the u and bbox-width channels, fy the v channel.
+    // Pixels reaching the estimator are already principal-point-relative (the node subtracts
+    // cx/cy at intake), so no principal point is needed here.
+    double cam_fx;
+    double cam_fy;
     double w_guess;
     Eigen::Matrix3d R_b2c;
     // Range below which the monocular width/scale is frozen. Mid-course W is well observable
@@ -498,19 +504,20 @@ public:
     Eigen::Vector3d last_los_nav = Eigen::Vector3d(1.0, 0.0, 0.0);
     bool has_last_los_nav = false;
 
-    RelativeIMMUKFEstimator(double dt_cam_val, double focal_length_val, double W_guess_val,
+    RelativeIMMUKFEstimator(double dt_cam_val, double fx_val, double fy_val, double W_guess_val,
                             const Eigen::Matrix3d& R_b2c_val)
-        : dt_cam(dt_cam_val), focal_length(focal_length_val), w_guess(W_guess_val), R_b2c(R_b2c_val)
+        : dt_cam(dt_cam_val), cam_fx(fx_val), cam_fy(fy_val), w_guess(W_guess_val), R_b2c(R_b2c_val)
     {
         imm_ukf = std::make_unique<RobustIMMEstimator10D>();
     }
 
     // Pixel measurement -> unit LOS ray in the world (nav) frame. Pinhole back-projection through
     // the camera extrinsic R_b2c, then rotated into the world frame by the ownship attitude R_b2n.
-    static Eigen::Vector3d pixel_to_los_nav(double u, double v, double focal_length,
+    // u/v are principal-point-relative pixels, unprojected through fx/fy.
+    static Eigen::Vector3d pixel_to_los_nav(double u, double v, double fx, double fy,
                                             const Eigen::Matrix3d& R_b2n,
                                             const Eigen::Matrix3d& R_b2c) {
-        Eigen::Vector3d ray_cam(u / focal_length, v / focal_length, 1.0);
+        Eigen::Vector3d ray_cam(u / fx, v / fy, 1.0);
         ray_cam.normalize();
         const Eigen::Vector3d ray_body = R_b2c.transpose() * ray_cam;
         return (R_b2n * ray_body).normalized();
@@ -768,7 +775,7 @@ public:
             return {true, imm_ukf->x};
         }
 
-        const Eigen::Vector3d los_nav = pixel_to_los_nav(bbox_u, bbox_v, focal_length, R_b2n_cur, R_b2c);
+        const Eigen::Vector3d los_nav = pixel_to_los_nav(bbox_u, bbox_v, cam_fx, cam_fy, R_b2n_cur, R_b2c);
         last_los_nav = los_nav;
         has_last_los_nav = true;
         const Eigen::Vector3d z_pixel(bbox_u, bbox_v, bbox_s);
@@ -794,7 +801,7 @@ public:
             // whose bbox size is wildly inconsistent with predicted range/width -> predict-only,
             // mark soft-recovery. Stops a garbage close-range size from corrupting scale/position.
             const double r_pred = imm_ukf->x.segment<3>(0).norm();
-            const double s_pred = focal_length * std::max(0.1, imm_ukf->x(9)) / std::max(0.5, r_pred);
+            const double s_pred = cam_fx * std::max(0.1, imm_ukf->x(9)) / std::max(0.5, r_pred);
             const double size_ratio = bbox_s / std::max(1.0, s_pred);
             if (r_pred < size_gate_range_ &&
                 (size_ratio < size_gate_lo_ || size_ratio > size_gate_hi_)) {
@@ -807,7 +814,7 @@ public:
 
             for (auto& filter : imm_ukf->filters) filter.R = R_k;
             const double w_before = imm_ukf->x(9);
-            imm_ukf->update(z_pixel, R_n2c, focal_length);
+            imm_ukf->update(z_pixel, R_n2c, cam_fx, cam_fy);
             // W_est rate limiter: cap |ΔW| per update to prevent the positive-feedback cascade
             // where one noisy bbox (at a dither extreme) crashes W, which shifts range/dz, which
             // reinforces the wrong W on the next update. ±0.05/frame ≈ ±1.5/s at 30Hz — still
@@ -832,7 +839,7 @@ public:
             return {true, imm_ukf->x};
         } else {
             const double W_init = clamp(w_guess, 0.3, 5.0);
-            const double r0 = clamp(focal_length * W_init / std::max(1.0, bbox_s), 10.0, 300.0);
+            const double r0 = clamp(cam_fx * W_init / std::max(1.0, bbox_s), 10.0, 300.0);
             Eigen::VectorXd x0 = Eigen::VectorXd::Zero(kStateDim);
             x0.segment<3>(0) = r0 * los_nav;            // relative pos = range * LOS (no uav_pos)
             x0(9) = W_init;

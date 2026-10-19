@@ -54,7 +54,14 @@ interceptor_node_relative_imm_ukf:
     camera:
       width_px: 1536
       height_px: 960
-      fov_deg: 72.0          # horizontal FOV; vertical FOV derived from aspect ratio (~48.8°)
+      # Intrinsics source — exactly one must be valid or the node refuses to start:
+      #   fov_deg:    horizontal FOV in (0,180); vertical FOV derived from the aspect ratio
+      #               (~48.8° here). 0.0 = unset.
+      #   intrinsics: 9-element row-major K matrix [fx 0 cx; 0 fy cy; 0 0 1] used DIRECTLY
+      #               (takes precedence over fov_deg when both are set; skew/last-row entries
+      #               are validated, lens distortion is NOT modeled).
+      fov_deg: 72.0
+      # intrinsics: [1057.3, 0.0, 768.0, 0.0, 1057.3, 480.0, 0.0, 0.0, 1.0]
       # Semi-strapdown single-axis pitch gimbal: servo keeps the boresight near-horizontal in the
       # world frame regardless of body pitch (with servo lag). The ACTUAL camera-to-world orientation
       # q_C_W is published on /fpv/gimbal (sensor_msgs/Imu, orientation = camera->world quaternion) —

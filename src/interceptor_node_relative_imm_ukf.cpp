@@ -26,9 +26,7 @@ InterceptorNodeRelativeIMMUKF::InterceptorNodeRelativeIMMUKF() : Node("intercept
 
     load_parameters();
 
-    focal_length_ = (cam_width_ / 2.0) / std::tan((cam_fov_deg_ * M_PI / 180.0) / 2.0);
-
-    estimator_ = std::make_unique<RelativeIMMUKFEstimator>(dt_cam_, focal_length_, w_guess_, R_b2c_);
+    estimator_ = std::make_unique<RelativeIMMUKFEstimator>(dt_cam_, cam_fx_, cam_fy_, w_guess_, R_b2c_);
 
     mission_sub_ = this->create_subscription<std_msgs::msg::Bool>(
         this->get_parameter("topics.mission").as_string(), 10,
@@ -98,7 +96,13 @@ void InterceptorNodeRelativeIMMUKF::declare_parameters() {
     this->declare_parameter<std::string>("topics.mission_state", "/fpv/mission_state");
     this->declare_parameter<int>("camera.width_px", 640);
     this->declare_parameter<int>("camera.height_px", 480);
-    this->declare_parameter<double>("camera.fov_deg", 60.0);
+    // Intrinsics source — exactly one must be valid (see resolve_camera_intrinsics):
+    //   fov_deg:    horizontal FOV in (0,180) -> fx = fy = (W/2)/tan(fov/2), principal point
+    //               at the image center (0.0 = unset).
+    //   intrinsics: 9-element row-major K matrix [fx 0 cx; 0 fy cy; 0 0 1], used directly.
+    //               Takes precedence when both are set. No lens-distortion model.
+    this->declare_parameter<double>("camera.fov_deg", 0.0);
+    this->declare_parameter<std::vector<double>>("camera.intrinsics", std::vector<double>{});
     // Semi-strapdown single-axis pitch gimbal: gimbal_bias_deg is the UNIFIED camera down-gaze
     // angle (positive = down). Used for both the gimbal (world-stabilized boresight) and the
     // fixed mount (body-relative). The gimbal rebuilds R_b2c from q_C_W each frame; the fixed
@@ -231,6 +235,8 @@ void InterceptorNodeRelativeIMMUKF::load_parameters() {
     cam_width_ = this->get_parameter("camera.width_px").as_int();
     cam_height_ = this->get_parameter("camera.height_px").as_int();
     cam_fov_deg_ = this->get_parameter("camera.fov_deg").as_double();
+    // Must resolve before the controller FOV halves and the estimator are built below/after.
+    resolve_camera_intrinsics();
     const bool use_simulation = this->get_parameter("use_simulation").as_bool();
     use_simulation_ = use_simulation;   // gates gyro collision detect
     collision_min_bbox_px_ = this->get_parameter("collision_min_bbox_px").as_double();
@@ -283,8 +289,12 @@ void InterceptorNodeRelativeIMMUKF::load_parameters() {
     double att_ref_tc = this->get_parameter("controller.att_ref_tc").as_double();
     double max_tilt_terminal_deg = this->get_parameter("physics.max_tilt_terminal_deg").as_double();
     double terminal_tilt_range = this->get_parameter("controller.terminal_tilt_range").as_double();
-    double fov_half_v = (cam_height_ / 2.0) / std::max(1.0, focal_length_);
-    double fov_half_h = (cam_width_ / 2.0) / std::max(1.0, focal_length_);
+    // tan(half-FOV) for the controller's keep-in-view clamp, from the RESOLVED intrinsics.
+    // With an off-center principal point the FOV is asymmetric; the nearer edge binds first
+    // when keeping the target inside the image, so use the smaller extent per axis. (Equals
+    // the centered (W/2)/fx in the fov_deg-derived case.)
+    double fov_half_v = std::min(cam_cy_, cam_height_ - cam_cy_) / std::max(1.0, cam_fy_);
+    double fov_half_h = std::min(cam_cx_, cam_width_ - cam_cx_) / std::max(1.0, cam_fx_);
 
     const bool enable_fov_clamp = this->get_parameter("controller.enable_fov_clamp").as_bool();
     controller_ = std::make_unique<AdvancedHybridController>(
@@ -384,8 +394,66 @@ void InterceptorNodeRelativeIMMUKF::load_parameters() {
     vision_locked_ = !radar_enable_;
 }
 
+// Resolve the pinhole intrinsics (no distortion model). camera.intrinsics — the 9-element
+// row-major K matrix [fx 0 cx; 0 fy cy; 0 0 1] — is used directly and takes precedence; a
+// nonzero skew entry is ignored with a warning. Otherwise a valid camera.fov_deg (horizontal,
+// in (0,180)) keeps the legacy derivation fx = fy = (W/2)/tan(fov/2) with the principal point
+// at the image center. Neither source valid is a hard error: every pixel<->metric conversion
+// downstream (LOS bearings, monocular range r = f*W/s) rides on the focal, so a silently
+// guessed intrinsics would corrupt guidance instead of failing fast.
+void InterceptorNodeRelativeIMMUKF::resolve_camera_intrinsics() {
+    if (cam_width_ <= 0 || cam_height_ <= 0) {
+        throw std::invalid_argument("camera.width_px and camera.height_px must be positive");
+    }
+
+    const std::vector<double> K = this->get_parameter("camera.intrinsics").as_double_array();
+    const char* source = "fov_deg";
+    if (!K.empty()) {
+        if (K.size() != 9) {
+            throw std::invalid_argument(
+                "camera.intrinsics must be the 9-element row-major K matrix [fx 0 cx; 0 fy cy; 0 0 1]");
+        }
+        if (std::abs(K[1]) > 1e-9) {
+            RCLCPP_WARN(this->get_logger(),
+                "camera.intrinsics skew K(0,1)=%.3f ignored (skew-free pinhole assumed)", K[1]);
+        }
+        if (std::abs(K[6]) > 1e-9 || std::abs(K[7]) > 1e-9 || std::abs(K[8] - 1.0) > 1e-9) {
+            RCLCPP_WARN(this->get_logger(),
+                "camera.intrinsics last row must be [0 0 1]; got [%.3f %.3f %.3f] (ignored)",
+                K[6], K[7], K[8]);
+        }
+        cam_fx_ = K[0];
+        cam_fy_ = K[4];
+        cam_cx_ = K[2];
+        cam_cy_ = K[5];
+        if (!std::isfinite(cam_fx_) || !std::isfinite(cam_fy_) || cam_fx_ <= 0.0 || cam_fy_ <= 0.0) {
+            throw std::invalid_argument("camera.intrinsics fx/fy must be finite and positive");
+        }
+        if (!std::isfinite(cam_cx_) || !std::isfinite(cam_cy_) ||
+            cam_cx_ <= 0.0 || cam_cx_ >= cam_width_ || cam_cy_ <= 0.0 || cam_cy_ >= cam_height_) {
+            throw std::invalid_argument("camera.intrinsics cx/cy must be finite and inside the image");
+        }
+        source = "intrinsics matrix";
+        if (cam_fov_deg_ > 0.0 && cam_fov_deg_ < 180.0) {
+            RCLCPP_INFO(this->get_logger(),
+                "camera.intrinsics set -> overriding camera.fov_deg=%.1f", cam_fov_deg_);
+        }
+    } else if (std::isfinite(cam_fov_deg_) && cam_fov_deg_ > 0.0 && cam_fov_deg_ < 180.0) {
+        cam_fx_ = cam_fy_ = (cam_width_ / 2.0) / std::tan(cam_fov_deg_ * M_PI / 360.0);
+        cam_cx_ = cam_width_ / 2.0;
+        cam_cy_ = cam_height_ / 2.0;
+    } else {
+        throw std::invalid_argument(
+            "camera intrinsics unresolved: set camera.fov_deg to a horizontal FOV in (0,180) or "
+            "camera.intrinsics to the 9-element row-major K matrix [fx 0 cx; 0 fy cy; 0 0 1]");
+    }
+    RCLCPP_INFO(this->get_logger(),
+        "Camera intrinsics (%s): fx=%.1f fy=%.1f cx=%.1f cy=%.1f (%dx%d)",
+        source, cam_fx_, cam_fy_, cam_cx_, cam_cy_, cam_width_, cam_height_);
+}
+
 void InterceptorNodeRelativeIMMUKF::reset_estimator() {
-    estimator_ = std::make_unique<RelativeIMMUKFEstimator>(dt_cam_, focal_length_, w_guess_, R_b2c_);
+    estimator_ = std::make_unique<RelativeIMMUKFEstimator>(dt_cam_, cam_fx_, cam_fy_, w_guess_, R_b2c_);
     if (radar_enable_) estimator_->max_range_ = radar_max_range_;
 }
 
@@ -648,7 +716,7 @@ bool InterceptorNodeRelativeIMMUKF::bbox_matches_radar(const Eigen::Vector3d& lo
         return false;
     }
     if (width_locked_ && bbox_s > 1.0) {
-        const double r_vis = focal_length_ * estimator_->imm_ukf->x(9) / bbox_s;
+        const double r_vis = cam_fx_ * estimator_->imm_ukf->x(9) / bbox_s;
         const double ratio = r_vis / r_radar;
         if (ratio > radar_bbox_range_ratio_ || ratio < 1.0 / radar_bbox_range_ratio_) {
             RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 500,
@@ -712,7 +780,7 @@ void InterceptorNodeRelativeIMMUKF::update_vision_handover(bool bbox_ok, double 
         // by the median/MAD window below, which is exactly what it is for.
         const double r_anchor = radar_rel_pos_.norm();
         if (r_anchor > 1.0 && r_anchor < handover_max_range_) {
-            const double w_meas = clamp(bbox_s * r_anchor / focal_length_, width_min_, width_max_);
+            const double w_meas = clamp(bbox_s * r_anchor / cam_fx_, width_min_, width_max_);
             width_samples_.push_back({w_meas, t_now});
             // Rolling window: age out stale samples so a transient missed frame (which no longer
             // wipes the buffer) does not leave stale data, and the median tracks a moving range.
@@ -748,8 +816,8 @@ void InterceptorNodeRelativeIMMUKF::update_vision_handover(bool bbox_ok, double 
                 width_locked_ = true;
                 RCLCPP_INFO(this->get_logger(),
                     "[HANDOVER] Target width fixed from radar range: W=%.2fm "
-                    "(median %.2f, scale %.3f, kept %zu/%zu, r_radar=%.1fm bbox=%.1fpx focal=%.0f)",
-                    w_fused, w_med, width_scale_, kept.size(), ws.size(), r_anchor, bbox_s, focal_length_);
+                    "(median %.2f, scale %.3f, kept %zu/%zu, r_radar=%.1fm bbox=%.1fpx fx=%.0f)",
+                    w_fused, w_med, width_scale_, kept.size(), ws.size(), r_anchor, bbox_s, cam_fx_);
             }
         } else {
             RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 2000,
@@ -802,7 +870,7 @@ void InterceptorNodeRelativeIMMUKF::update_width_reanchor(bool bbox_ok, double b
     }
     const double w_locked = estimator_ ? estimator_->imm_ukf->x(9) : 0.0;
     if (w_locked < 0.05 || bbox_s <= 1.0) return;
-    const double r_vis = focal_length_ * w_locked / bbox_s;   // vision-implied range
+    const double r_vis = cam_fx_ * w_locked / bbox_s;   // vision-implied range
     const double ratio = r_vis / r_radar;                     // >1: W inflated (range over-estimated)
     // Radar glitch / bbox outlier: DROP the sample but keep the window (a single wild ratio
     // must neither trigger nor starve the detector).
@@ -873,8 +941,9 @@ void InterceptorNodeRelativeIMMUKF::bbox_callback(const vision_msgs::msg::Detect
     const double t_now = rclcpp::Time(msg->header.stamp).seconds();
 
     const bool has_bbox = !msg->header.frame_id.empty();
-    const double u = msg->bbox.center.position.x - cam_width_ / 2.0;
-    const double v = msg->bbox.center.position.y - cam_height_ / 2.0;
+    // Principal-point-relative pixel coordinates (the estimator's measurement frame).
+    const double u = msg->bbox.center.position.x - cam_cx_;
+    const double v = msg->bbox.center.position.y - cam_cy_;
     // Use the bbox WIDTH only. The pinhole size model s = focal*W/depth treats s as the
     // projection of a FIXED physical width W; the target's image height varies with viewing
     // angle and attitude (a banked/tilted drone), so max(size_x,size_y) can latch onto the
@@ -949,7 +1018,7 @@ void InterceptorNodeRelativeIMMUKF::bbox_callback(const vision_msgs::msg::Detect
         // vision unconditionally once locked; the estimator's close-range size gate backstops FPs.
         if (has_bbox && !vision_locked_) {
             const Eigen::Vector3d los_nav_meas =
-                RelativeIMMUKFEstimator::pixel_to_los_nav(u, v, focal_length_, R_b2n, R_b2c_);
+                RelativeIMMUKFEstimator::pixel_to_los_nav(u, v, cam_fx_, cam_fy_, R_b2n, R_b2c_);
             bbox_ok = bbox_matches_radar(los_nav_meas, s, &d_az);
         }
         update_vision_handover(bbox_ok, s, t_now, d_az);
@@ -987,7 +1056,7 @@ void InterceptorNodeRelativeIMMUKF::bbox_callback(const vision_msgs::msg::Detect
 
     if (bbox_ok) {
         // Use the same timestamp-matched camera pose as the UKF measurement.
-        const Eigen::Vector3d los_nav = RelativeIMMUKFEstimator::pixel_to_los_nav(u, v, focal_length_, R_b2n, R_b2c_);
+        const Eigen::Vector3d los_nav = RelativeIMMUKFEstimator::pixel_to_los_nav(u, v, cam_fx_, cam_fy_, R_b2n, R_b2c_);
         los_az_world = std::atan2(los_nav(1), los_nav(0));
         los_el = std::asin(clamp(los_nav(2), -1.0, 1.0));
     }
@@ -1050,7 +1119,7 @@ void InterceptorNodeRelativeIMMUKF::bbox_callback(const vision_msgs::msg::Detect
         "rel=[%.2f %.2f %.2f] vel=[%.2f %.2f %.2f] w_est=%.2f r_meas=%.1f r_est=%.1f",
         r_est(0), r_est(1), r_est(2), v_est(0), v_est(1), v_est(2),
         estimator_->imm_ukf->x(9),
-        (has_bbox && s > 0.1) ? (focal_length_ * estimator_->w_guess / s) : 0.0,
+        (has_bbox && s > 0.1) ? (cam_fx_ * estimator_->w_guess / s) : 0.0,
         r_est.norm());
 
     // IMM diagnostic: mode probabilities, per-filter vel, and key P diagonals. Helps locate

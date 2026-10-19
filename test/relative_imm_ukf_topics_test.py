@@ -36,6 +36,9 @@ PUBLICATIONS = {
     "control": "quadrotor_msgs/msg/ControlCommand",
     "mission_state": "std_msgs/msg/Bool",
 }
+# The node refuses to start without valid camera intrinsics (fov_deg or K matrix); topic-wiring
+# runs that don't exercise vision still need a minimal valid camera block.
+MINIMAL_CAMERA = {"camera": {"fov_deg": 60.0}}
 
 
 class RelativeImmUkfTopicsTest(unittest.TestCase):
@@ -114,7 +117,7 @@ class RelativeImmUkfTopicsTest(unittest.TestCase):
         self.fail(f"expected {expected}; subscriptions={subscriptions}; publications={publications}")
 
     def test_defaults_preserve_existing_endpoint_names(self):
-        with self.running_node():
+        with self.running_node(parameters=MINIMAL_CAMERA):
             self.assert_topics(DEFAULT_TOPICS)
 
     def test_packaged_yaml_controls_endpoint_names(self):
@@ -127,7 +130,7 @@ class RelativeImmUkfTopicsTest(unittest.TestCase):
 
     def test_custom_topic_parameters_bind_all_endpoints(self):
         topics = {key: f"/configured/{key}" for key in DEFAULT_TOPICS}
-        with self.running_node(parameters={"topics": topics}):
+        with self.running_node(parameters={"topics": topics, **MINIMAL_CAMERA}):
             self.assert_topics(topics)
 
     def test_relative_names_and_gimbal_remapping_follow_ros_rules(self):
@@ -136,7 +139,7 @@ class RelativeImmUkfTopicsTest(unittest.TestCase):
         expected["gimbal"] = "/remapped/gimbal"
         with self.running_node(
                 extra=("-r", "__ns:=/topic_test", "-r", "configured/gimbal:=/remapped/gimbal"),
-                parameters={"topics": topics}):
+                parameters={"topics": topics, **MINIMAL_CAMERA}):
             self.assert_topics(expected, "/topic_test")
 
 

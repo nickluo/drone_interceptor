@@ -43,6 +43,10 @@ public:
 private:
     void declare_parameters();
     void load_parameters();
+    // Resolve cam_fx_/fy_/cx_/cy_ from camera.intrinsics or camera.fov_deg (no distortion model;
+    // exactly one valid source is required or the node refuses to start). Must run before
+    // anything consumes the intrinsics (estimator, controller FOV clamp, pixel intake).
+    void resolve_camera_intrinsics();
     void reset_estimator();
     void reset_control_cache();
     void start_control_timer();
@@ -138,8 +142,16 @@ private:
     // ---- Camera / estimator configuration ---------------------------------------------------
     int cam_width_ = 640;
     int cam_height_ = 480;
-    double cam_fov_deg_ = 60.0;
-    double focal_length_ = 554.256;
+    // Horizontal FOV in degrees; 0.0 = unset (resolved from camera.intrinsics instead).
+    double cam_fov_deg_ = 0.0;
+    // Resolved pinhole intrinsics (pixels). Set by resolve_camera_intrinsics() from either
+    // camera.intrinsics (row-major K matrix, takes precedence) or a valid camera.fov_deg
+    // (fx = fy = (W/2)/tan(fov/2), principal point at the image center). Pixel measurements
+    // are made principal-point-relative (cx/cy subtracted) before they reach the estimator.
+    double cam_fx_ = 0.0;
+    double cam_fy_ = 0.0;
+    double cam_cx_ = 0.0;
+    double cam_cy_ = 0.0;
     Eigen::Matrix3d R_b2c_ = Eigen::Matrix3d::Identity();
     Eigen::Matrix3d R_b2c_base_ = Eigen::Matrix3d::Identity();
     // Semi-strapdown gimbal state (see parameter declaration for the convention).
