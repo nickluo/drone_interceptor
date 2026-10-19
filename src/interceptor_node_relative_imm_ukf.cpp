@@ -1461,8 +1461,12 @@ void InterceptorNodeRelativeIMMUKF::control_timer_callback() {
 }
 
 void InterceptorNodeRelativeIMMUKF::mission_launch_callback(const std_msgs::msg::Header::SharedPtr msg) {
-    if (msg->frame_id == "OFF" && mission_state_.is_active()) {
-        RCLCPP_INFO(this->get_logger(), "Mission abort received! Stopping control...");
+    // OFF stops everything (disarm edge, RTH); DISMISS only cancels interception
+    // control while the tracker keeps running (pilot stop pulse). Both end the
+    // mission here.
+    if ((msg->frame_id == "OFF" || msg->frame_id == "DISMISS") && mission_state_.is_active()) {
+        RCLCPP_INFO(this->get_logger(), "Mission %s received! Stopping control...",
+                    msg->frame_id == "DISMISS" ? "dismiss" : "abort");
         transition_to_state(MissionState::ABORTED, "User abort command");
         stop();
         return;
