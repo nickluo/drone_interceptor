@@ -1,7 +1,5 @@
 interceptor_node_relative_imm_ukf:
   ros__parameters:
-    # Validated Camera8 Betaflight SITL profile: 20 m/s guidance and climb/descent ceilings.
-    # Uses a 1536x960, 72-degree camera with capture-time bbox/LOS. Not hardware-certified tuning.
     use_simulation: false
     collision_min_bbox_px: 120.0
 
@@ -171,7 +169,7 @@ interceptor_node_relative_imm_ukf:
       gyro_attitude_during_mission: true  # Short-horizon gyro propagation seeded from prelaunch FC attitude;
                                           # avoids acceleration-induced tilt bias during the engagement.
                                           # Direct-attitude SITL mission overlay sets false to use FC attitude.
-      w_guess: 1.5
+      w_guess: 1.0  # Initial guess for width of the target in meters
 
     # ------------------------------------------------------------------------------------------
     # Radar relay (mid-course guidance)
