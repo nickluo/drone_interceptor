@@ -131,6 +131,12 @@ public:
     // 2*lambda_dot*v_range + a_own_perp, where ydot = d(lambda_dot)/dt. Leads a turning target.
     double K_apn_ = 0.8;
     double K_apn_min_at_ = 0.5;        // m/s^2, gate on |a_t_perp_geom|
+    // APN range gate: a_t_perp = r*ydot + ... scales the LOS-acceleration NOISE by r, so at
+    // long range (80-90 m standoff) a converging monocular estimate injects spurious lateral
+    // accel and banks the vehicle early (observed: camera boresight error to 80 deg within
+    // 3 s of launch, mission camera-guard abort). APN is a TERMINAL lead term — apply it only
+    // inside this radius where the lead matters and the noise is bounded. 0 disables the gate.
+    double K_apn_max_range_ = 40.0;    // m
     double ydot_tc_ = 0.8;             // s, EMA time constant on d(lambda_dot)/dt
     double atp_tc_ = 0.6;              // s, EMA time constant on a_t_perp_geom
     double prev_los_rate_ = 0.0;
@@ -227,10 +233,11 @@ public:
     }
     // Axial-only range EMA time constant (radar smoothness). <=0 disables (passthrough r_norm).
     void set_range_smooth_tc(double tc) { r_norm_smooth_tc_ = std::max(0.0, tc); }
-    void set_apn_gain(double gain) {
-        if (!std::isfinite(gain) || gain < 0)
+    void set_apn_gain(double gain, double max_range) {
+        if (!std::isfinite(gain) || gain < 0 || !std::isfinite(max_range) || max_range < 0)
             throw std::invalid_argument("controller.K_apn must be finite and nonnegative");
         K_apn_ = gain;
+        K_apn_max_range_ = max_range;
     }
     void set_vertical_braking(double deceleration, double delay) {
         if (!std::isfinite(deceleration) || deceleration < 0 ||
@@ -387,8 +394,10 @@ public:
             const double a_atp = clamp(last_los_dt_ / atp_tc_, 0.0, 1.0);
             atp_ema_ += a_atp * (a_t_perp_geom - atp_ema_);
         }
-        if (std::abs(a_t_perp_geom) > K_apn_min_at_) {
-            a_lat_world += K_apn_ * a_t_perp_geom * e_perp_xy;
+        if (K_apn_max_range_ <= 0.0 || r_norm < K_apn_max_range_) {
+            if (std::abs(a_t_perp_geom) > K_apn_min_at_) {
+                a_lat_world += K_apn_ * a_t_perp_geom * e_perp_xy;
+            }
         }
 
         // ---- (A) Axial guidance: cruise ceiling with maneuverability and visual proximity caps ----

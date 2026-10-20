@@ -162,6 +162,7 @@ void InterceptorNodeRelativeIMMUKF::declare_parameters() {
     this->declare_parameter<bool>("controller.use_imu_axial_speed", false);
     this->declare_parameter<double>("controller.target_axial_feedforward_limit", 0.0);
     this->declare_parameter<double>("controller.K_apn", 0.8);
+    this->declare_parameter<double>("controller.K_apn_max_range", 40.0);
     this->declare_parameter<double>("controller.vertical_brake_accel", 0.0);
     this->declare_parameter<double>("controller.vertical_brake_delay", 0.0);
     this->declare_parameter<double>("controller.terminal_arrival_margin", 0.0);
@@ -324,7 +325,9 @@ void InterceptorNodeRelativeIMMUKF::load_parameters() {
         this->get_parameter("controller.dither_min_range").as_double(),
         this->get_parameter("controller.dither_max_bbox").as_double());
     controller_->set_range_smooth_tc(this->get_parameter("controller.range_smooth_tc").as_double());
-    controller_->set_apn_gain(this->get_parameter("controller.K_apn").as_double());
+    controller_->set_apn_gain(
+        this->get_parameter("controller.K_apn").as_double(),
+        this->get_parameter("controller.K_apn_max_range").as_double());
     controller_->set_vertical_braking(
         this->get_parameter("controller.vertical_brake_accel").as_double(),
         this->get_parameter("controller.vertical_brake_delay").as_double());

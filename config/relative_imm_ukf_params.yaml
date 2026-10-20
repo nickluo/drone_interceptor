@@ -31,10 +31,10 @@ interceptor_node_relative_imm_ukf:
       # accel-relaxation (see f_rotor in src/relative_imm_ukf.h).
       drag_coeff: 0.1125
       # Airframe limits (calibrate to the real platform / AirSim)
-      max_tilt_deg: 55.0          # deg, mid-course tilt limit
-      max_tilt_terminal_deg: 65.0 # deg, terminal roll limit and tilt used by the turn-radius speed cap
-      max_body_rate: 2.0          # rad/s, hard cap on |omega_x/y/z| (attitude-loop / detector limit)
-      a_z_limit: 10.0             # m/s^2, vertical accel clamp (thrust limit)
+      max_tilt_deg: 65.0          # deg, mid-course tilt limit
+      max_tilt_terminal_deg: 68.0 # deg, terminal roll limit and tilt used by the turn-radius speed cap; keep ~17deg margin under the 85deg mission abort (75 left too little overshoot room)
+      max_body_rate: 3.0          # rad/s, hard cap on |omega_x/y/z| (attitude-loop / detector limit)
+      a_z_limit: 12.0             # m/s^2, vertical accel clamp (thrust limit); 30 (fast-target tuning) over-thrusts ~4g: the terminal arrival law then accelerates the vehicle THROUGH the pass horizontally (vh 14->18.7 while braking) and the near-side miss returns
       v_climb: 20.0               # m/s, max commanded climb rate
       v_descent: 20.0             # m/s, max commanded sink rate
 
@@ -91,7 +91,8 @@ interceptor_node_relative_imm_ukf:
       target_axial_feedforward_limit: 3.0  # m/s, optional IMU+UKF target-speed compensation;
                                            # reject estimates outside +/-limit instead of clipping.
                                            # 0 disables; common hover/orbit profile uses 3.
-      K_apn: 0.0                 # Disable noisy augmented-PN acceleration feedforward in SITL
+      K_apn: 0.6                 # augmented-PN target-accel feedforward; 0.6 for fast orbiting targets (was 0: noisy in SITL, needed here to lead 5 m/s orbits)
+      K_apn_max_range: 40.0       # m, APN range gate: a_t_perp ~ r*ydot amplifies monocular noise by r; long-range APN banked early and tripped the camera guard. 0 disables the gate.
       axial_deadband: 0.05       # m/s, retain slow terminal closure instead of stalling
       # FOV keep-in-frame guard
       enable_fov_clamp: true   # hard-clamp pitch to keep target in FOV
