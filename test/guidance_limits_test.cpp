@@ -178,4 +178,94 @@ int main()
         rejected = true;
     }
     require(rejected);
+    // Terminal arrival vertical law: geometric dz/t_go requirement scaled by the margin.
+    require(terminal_arrival_vertical_speed(2, 4, 12, 1.0) == 6.0);
+    require(terminal_arrival_vertical_speed(2, 4, 12, 1.3) == 1.3 * 2 * 12 / 4);
+    require(terminal_arrival_vertical_speed(-3, 6, 6, 1.0) == -3.0);
+    require(terminal_arrival_vertical_speed(0, 6, 6, 1.3) == 0);
+    require(terminal_arrival_vertical_speed(2, 12, 6, 1.0) ==
+            terminal_arrival_vertical_speed(4, 24, 6, 1.0));
+    require(terminal_arrival_vertical_speed(2, 4, 24, 1.0) ==
+            2 * terminal_arrival_vertical_speed(2, 4, 12, 1.0));
+    // height_error admits any finite value (negative = target below); only range/speed/margin
+    // reject negatives, covered by the zero/negative loops below.
+    for (double invalid : {std::numeric_limits<double>::infinity(),
+                           std::numeric_limits<double>::quiet_NaN()}) {
+        for (int argument = 0; argument < 4; ++argument) {
+            bool arrival_rejected = false;
+            try {
+                terminal_arrival_vertical_speed(argument == 0 ? invalid : 2,
+                                                 argument == 1 ? invalid : 4,
+                                                 argument == 2 ? invalid : 12,
+                                                 argument == 3 ? invalid : 1.0);
+            } catch (const std::invalid_argument&) {
+                arrival_rejected = true;
+            }
+            require(arrival_rejected);
+        }
+    }
+    for (double zero_range : {0.0, -1.0}) {
+        bool arrival_rejected = false;
+        try {
+            terminal_arrival_vertical_speed(2, zero_range, 12, 1.0);
+        } catch (const std::invalid_argument&) {
+            arrival_rejected = true;
+        }
+        require(arrival_rejected);
+    }
+    for (double zero_speed : {0.0, -1.0}) {
+        bool arrival_rejected = false;
+        try {
+            terminal_arrival_vertical_speed(2, 4, zero_speed, 1.0);
+        } catch (const std::invalid_argument&) {
+            arrival_rejected = true;
+        }
+        require(arrival_rejected);
+    }
+    // Arrival axial cap: inverse of the simultaneous-arrival profile w.r.t. closing speed.
+    require(axial_speed_for_arrival(8, 16, 12.5, 1.0) == 8 * 16 / 12.5);
+    require(axial_speed_for_arrival(8, 16, -12.5, 1.15) == 1.15 * 8 * 16 / 12.5);
+    require(std::isinf(axial_speed_for_arrival(8, 0, 12.5, 1.15)));
+    require(std::isinf(axial_speed_for_arrival(8, 16, 0, 1.15)));
+    require(axial_speed_for_arrival(8, 16, 4, 1.0) == 2 * axial_speed_for_arrival(8, 8, 4, 1.0));
+    for (double invalid : {std::numeric_limits<double>::infinity(),
+                           std::numeric_limits<double>::quiet_NaN()}) {
+        for (int argument = 0; argument < 4; ++argument) {
+            bool axial_rejected = false;
+            try {
+                axial_speed_for_arrival(argument == 0 ? invalid : 8,
+                                         argument == 1 ? invalid : 16,
+                                         argument == 2 ? invalid : 12.5,
+                                         argument == 3 ? invalid : 1.15);
+            } catch (const std::invalid_argument&) {
+                axial_rejected = true;
+            }
+            require(axial_rejected);
+        }
+    }
+    for (double bad : {-1.0, -1e-3}) {
+        for (int argument : {0, 1, 3}) {
+            bool axial_rejected = false;
+            try {
+                axial_speed_for_arrival(argument == 0 ? bad : 8,
+                                         argument == 1 ? bad : 16,
+                                         12.5,
+                                         argument == 3 ? bad : 1.15);
+            } catch (const std::invalid_argument&) {
+                axial_rejected = true;
+            }
+            require(axial_rejected);
+        }
+    }
+    for (int argument : {0, 3}) {  // zero climb / zero margin reject; zero distance returns inf
+        bool axial_rejected = false;
+        try {
+            axial_speed_for_arrival(argument == 0 ? 0.0 : 8, 16, 12.5,
+                                     argument == 3 ? 0.0 : 1.15);
+        } catch (const std::invalid_argument&) {
+            axial_rejected = true;
+        }
+        require(axial_rejected);
+    }
+    require(std::isfinite(axial_speed_for_arrival(8, 16, -1e-9, 1.15)) == false);
 }

@@ -60,3 +60,34 @@ inline double vertical_closure_speed_limit(double horizontal_speed, double horiz
         return std::numeric_limits<double>::infinity();
     return horizontal_speed * std::abs(height_error) / horizontal_distance;
 }
+
+// Terminal arrival vertical speed: the geometric rate that nulls the remaining height error
+// exactly by arrival (t_go = range / closing_speed), scaled by `margin` (>1 leaves headroom for
+// the vertical tracking lag of the K_az/a_z_limit loop). Sign matches height_error: positive
+// height error (target above) demands a climb.
+inline double terminal_arrival_vertical_speed(double height_error, double range,
+                                              double closing_speed, double margin)
+{
+    if (!std::isfinite(height_error) || !std::isfinite(range) || range <= 0 ||
+        !std::isfinite(closing_speed) || closing_speed <= 0 ||
+        !std::isfinite(margin) || margin < 0)
+        throw std::invalid_argument("invalid terminal arrival geometry");
+    return margin * height_error * closing_speed / range;
+}
+
+// Terminal arrival axial speed: the dual of the law above. Given the vertical rate the airframe
+// is ACTUALLY delivering, the horizontal closure that lets that climb null the height error by
+// arrival is margin * climb_rate * horizontal_distance / |height_error| (the inverse of
+// vertical_closure_speed_limit). Returns infinity when the geometry cannot bind (no horizontal
+// distance, no height error), so the caller can apply it as a plain cap.
+inline double axial_speed_for_arrival(double climb_rate, double horizontal_distance,
+                                      double height_error, double margin)
+{
+    if (!std::isfinite(climb_rate) || climb_rate <= 0 ||
+        !std::isfinite(horizontal_distance) || horizontal_distance < 0 ||
+        !std::isfinite(height_error) || !std::isfinite(margin) || margin <= 0)
+        throw std::invalid_argument("invalid arrival axial geometry");
+    if (horizontal_distance < 1e-3 || std::abs(height_error) < 1e-6)
+        return std::numeric_limits<double>::infinity();
+    return margin * climb_rate * horizontal_distance / std::abs(height_error);
+}

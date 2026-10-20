@@ -76,6 +76,11 @@ public:
     double v_descent_ = 8.0;
     double K_dz_up_   = 2.0;
     double K_dz_dn_   = 1.0;
+    // Terminal arrival-margin law (see compute_control section B): inside terminal_arrival_range_,
+    // demand |v_z| >= terminal_arrival_margin_ * |dz| / t_go so the residual vertical error is
+    // removed BY arrival. margin <= 0 (default) disables — pure profile tracking as before.
+    double terminal_arrival_margin_ = 0.0;
+    double terminal_arrival_range_  = 0.0;
     // Speed-scheduled PN + attitude reference slew governor (v_des=20 oscillation fixes).
     double v_pn_ref_ = 1e9;       // cap on v_fwd in PN lateral accel -> bounds effective N*v at high speed
     double max_att_rate_ = 1e9;   // max |d(phi_cmd)/dt|, |d(theta_cmd)/dt| [rad/s] (slew governor)
@@ -197,6 +202,15 @@ public:
         v_descent_ = std::max(0.5, v_descent);
         K_dz_up_   = std::max(0.1, K_dz_up);
         K_dz_dn_   = std::max(0.1, K_dz_dn);
+    }
+    // Terminal arrival-margin law: inside `range`, demand |v_z| >= margin * |dz| / t_go
+    // (t_go = range / closing speed) so the vertical error is removed by arrival instead of
+    // asymptotically at K_dz. margin <= 0 disables.
+    void set_terminal_arrival(double margin, double range) {
+        if (!std::isfinite(margin) || margin < 0 || !std::isfinite(range) || range < 0)
+            throw std::invalid_argument("invalid terminal arrival parameters");
+        terminal_arrival_margin_ = margin;
+        terminal_arrival_range_  = range;
     }
     // Guidance tuning (operator-facing): axial gain, vertical tracking gain + accel limit, and the
     // lateral observability dither. All independent config params.
@@ -394,6 +408,29 @@ public:
         v_des_eff = terminal_speed_floor_cap(v_des, v_des_eff, terminal_speed_floor_,
                                              bbox_size, terminal_speed_bbox_threshold_,
                                              los_rate, terminal_speed_los_rate_threshold_);
+        // Vertical-reachability axial cap — the dual of the terminal arrival law in section (B).
+        // The arrival law DEMANDS the climb that nulls dz by arrival, but when the realized
+        // vertical rate cannot follow (thrust shared with 14-17 m/s of axial drag leaves
+        // ~1.5-3 m/s of vertical-rate tracking lag), the demand alone still passes ~1-2 m low.
+        // Inside the arrival envelope, ALSO slow the axial closure to what the REALIZED
+        // vertical rate can match, so both channels converge dz/r_xy onto the arrival
+        // geometry instead of the axial channel outrunning the vertical one. Floored at a
+        // maneuvering closure (target lateral motion), dies out as dz -> 0, and never engages
+        // outside the envelope (launch dash, mid-course) or when the height error is small.
+        if (terminal_arrival_margin_ > 0.0 && terminal_arrival_range_ > 0.0 &&
+            r_norm < terminal_arrival_range_ && std::abs(r_est(2)) > 0.5) {
+            const double r_xy_arr = r_est.head<2>().norm();
+            if (r_xy_arr > 0.5) {
+                // margin 1.15 with the envelope at 35 m: the early engagement manages the
+                // closure down to ~10 m/s before the terminal, so 1.15 no longer lets a
+                // 15-17 m/s far-side dash outrun the climb (that failure was with the
+                // envelope at 20 m); 1.0 starved the endgame closure and left ~0.85 m of
+                // horizontal shortfall at the pass.
+                const double v_axial_cap = axial_speed_for_arrival(
+                    std::max(std::abs(v_z), 2.0), r_xy_arr, r_est(2), 1.15);
+                v_des_eff = std::max(std::min(v_des_eff, v_axial_cap), 4.0);
+            }
+        }
         // v_fwd_body (= v_closing from v_rel) is under-observable along-LOS until scale converges;
         // a low v_closing inflates a_fwd -> ownship over-accelerates ON-AXIS, starving lateral PN
         // lead. Scene-adaptive 3-level floor: turning target (|atp_ema| large) -> 0.88 (don't blast
@@ -450,6 +487,25 @@ public:
             const double closure_limit = vertical_closure_speed_limit(
                 v_des_eff, r_est.head<2>().norm(), dz_target);
             v_z_desired = clamp(v_z_desired, -closure_limit, closure_limit);
+        }
+        // Terminal arrival margin: the two laws above converge the climb gently ONTO the
+        // simultaneous-arrival profile — the proportional term shrinks with the residual error
+        // and the profile cap carries no margin for the vertical tracking lag (K_az, a_z_limit,
+        // thrust shared with the axial channel). A target engaged from below is therefore
+        // arrived at with roughly the vertical error it had a couple of loop time-constants out
+        // (observed in AirSim: a systematic ~1 m low pass at 12 m/s closure). Inside the
+        // terminal envelope DEMAND at least margin x dz/t_go so the residual is removed by
+        // arrival; margin > 1 leaves headroom for the tracking lag. Bounded by v_climb/v_descent
+        // here and by a_z_limit downstream. Gated on measured closure, and on the range window
+        // where the monocular estimate is reliable.
+        if (terminal_arrival_margin_ > 0.0 && terminal_arrival_range_ > 0.0 &&
+            r_norm < terminal_arrival_range_ && v_fwd_body > 1.0) {
+            const double v_z_arrival = terminal_arrival_vertical_speed(
+                dz_target, r_norm, v_fwd_body, terminal_arrival_margin_);
+            if (dz_target > 0.0)
+                v_z_desired = clamp(std::max(v_z_desired, v_z_arrival), 0.0, v_climb_);
+            else if (dz_target < 0.0)
+                v_z_desired = clamp(std::min(v_z_desired, v_z_arrival), -v_descent_, 0.0);
         }
         if (vertical_brake_accel_ > 0) {
             const double speed_limit = braking_speed_limit(std::abs(dz_target),

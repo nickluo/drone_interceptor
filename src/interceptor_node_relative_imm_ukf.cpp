@@ -164,6 +164,8 @@ void InterceptorNodeRelativeIMMUKF::declare_parameters() {
     this->declare_parameter<double>("controller.K_apn", 0.8);
     this->declare_parameter<double>("controller.vertical_brake_accel", 0.0);
     this->declare_parameter<double>("controller.vertical_brake_delay", 0.0);
+    this->declare_parameter<double>("controller.terminal_arrival_margin", 0.0);
+    this->declare_parameter<double>("controller.terminal_arrival_range", 0.0);
     this->declare_parameter<double>("controller.capture_range", 2.0);
     this->declare_parameter<double>("controller.visual_speed_gain", 0.0);
     this->declare_parameter<double>("controller.visual_speed_floor", 0.0);
@@ -326,6 +328,9 @@ void InterceptorNodeRelativeIMMUKF::load_parameters() {
     controller_->set_vertical_braking(
         this->get_parameter("controller.vertical_brake_accel").as_double(),
         this->get_parameter("controller.vertical_brake_delay").as_double());
+    controller_->set_terminal_arrival(
+        this->get_parameter("controller.terminal_arrival_margin").as_double(),
+        this->get_parameter("controller.terminal_arrival_range").as_double());
     controller_->set_visual_speed_gain(
         this->get_parameter("controller.visual_speed_gain").as_double(),
         this->get_parameter("controller.visual_speed_floor").as_double());
