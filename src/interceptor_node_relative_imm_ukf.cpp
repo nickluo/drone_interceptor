@@ -158,7 +158,8 @@ void InterceptorNodeRelativeIMMUKF::declare_parameters() {
     this->declare_parameter<double>("control.rate_tc", 0.02);
     this->declare_parameter<bool>("control.rate_control_attenuation", true);
     this->declare_parameter<bool>("use_simulation", false);
-    this->declare_parameter<double>("collision_min_bbox_px", 0.0);
+    this->declare_parameter<bool>("collision_detection_enable", false);
+    this->declare_parameter<double>("collision_min_ratio", 0.0);
     this->declare_parameter<bool>("controller.use_imu_axial_speed", false);
     this->declare_parameter<double>("controller.target_axial_feedforward_limit", 0.0);
     this->declare_parameter<double>("controller.K_apn", 0.8);
@@ -240,9 +241,9 @@ void InterceptorNodeRelativeIMMUKF::load_parameters() {
     cam_fov_deg_ = this->get_parameter("camera.fov_deg").as_double();
     // Must resolve before the controller FOV halves and the estimator are built below/after.
     resolve_camera_intrinsics();
-    const bool use_simulation = this->get_parameter("use_simulation").as_bool();
-    use_simulation_ = use_simulation;   // gates gyro collision detect
-    collision_min_bbox_px_ = this->get_parameter("collision_min_bbox_px").as_double();
+    use_simulation_ = this->get_parameter("use_simulation").as_bool();   // gates gyro collision detect
+    collision_detection_enable_ = this->get_parameter("collision_detection_enable").as_bool();
+    collision_min_bbox_px_ = (cam_width_ + cam_height_) * 0.5 * this->get_parameter("collision_min_ratio").as_double();
     use_imu_axial_speed_ = this->get_parameter("controller.use_imu_axial_speed").as_bool();
     target_axial_feedforward_limit_ = this->get_parameter(
         "controller.target_axial_feedforward_limit").as_double();
@@ -268,12 +269,13 @@ void InterceptorNodeRelativeIMMUKF::load_parameters() {
 
     w_guess_ = this->get_parameter("estimation.w_guess").as_double();
     control_rate_ = this->get_parameter("control.rate").as_double();
+    
     const double rate_tc = this->get_parameter("control.rate_tc").as_double();
     const bool rate_attenuation = this->get_parameter("control.rate_control_attenuation").as_bool();
     // First-order low-pass coefficient on body-rate output.
     // EMA form: out_new = out_old + ctrl_coeff_ * (raw - out_old). Attenuates high-frequency
     // cmd jumps from estimator/guidance noise before they reach the attitude controller.
-    if (!use_simulation && rate_attenuation && rate_tc > 1e-6 && control_rate_ > 1e-6) {
+    if (!use_simulation_ && rate_attenuation && rate_tc > 1e-6 && control_rate_ > 1e-6) {
         ctrl_coeff_ = 1.0 - std::exp(-1.0 / (control_rate_ * rate_tc));
     } else {
         ctrl_coeff_ = 1.0;
@@ -1265,7 +1267,7 @@ void InterceptorNodeRelativeIMMUKF::control_timer_callback() {
     // The ROS2 Python sim (use_simulation_=true) has ground-truth range and judges the intercept
     // externally (ros2_sim_node.py), so the gyro check is skipped there. On contact the body rate
     // spikes well beyond what was commanded -> declare COMPLETED (intercept success) and stop.
-    if (!use_simulation_ && !collision_detected_ &&
+    if (!use_simulation_ && !collision_detected_ && collision_detection_enable_ &&
         (collision_min_bbox_px_ == 0.0 ||
          (cache.has_bbox && cache.bbox_size >= collision_min_bbox_px_))) {
         const Eigen::Vector3d rate_error = gyro - last_cmd_;

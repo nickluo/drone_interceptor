@@ -334,6 +334,7 @@ private:
     // last commanded body rate signals physical contact -> intercept success -> COMPLETED. Gated on
     // !use_simulation_: the ROS2 Python sim has ground-truth range and judges intercept externally.
     bool collision_detected_ = false;
+    bool collision_detection_enable_ = false;
     double collision_min_bbox_px_ = 0.0;
     bool use_imu_axial_speed_ = false;
     double target_axial_feedforward_limit_ = 0.0;

@@ -1,7 +1,8 @@
 interceptor_node_relative_imm_ukf:
   ros__parameters:
     use_simulation: false
-    collision_min_bbox_px: 120.0
+    collision_detection_enable: false
+    collision_min_ratio: 0.2
 
     # Accelerometer bias in body frame, subtracted before the strapdown preintegration
     # (dv_own = ∫(R·(f_imu − bias) − g)dt). The ROS2 Python sim harness publishes a bias-free
