@@ -165,7 +165,7 @@ interceptor_node_relative_imm_ukf:
       #      horizontal channel cannot outrun the climb the airframe is actually delivering
       #      (deep far-side launches at 14-17 m/s still passed 2 m low with (1) alone);
       #      floored at 4 m/s, dies out as dz -> 0. margin = 0 disables both.
-      terminal_arrival_margin: 1.4   # x, arrival vertical-speed margin over dz/t_go
+      terminal_arrival_margin: 1.8   # was 1.4;  x, arrival vertical-speed margin over dz/t_go
       terminal_arrival_range: 35.0   # m, engagement radius of the arrival laws
       visual_speed_gain: 600.0    # px*m/s; 0 disables, otherwise image cap = max(floor, gain/bbox_size).
                                   # Calibrated at 1536x960, horizontal FOV 72 deg.
