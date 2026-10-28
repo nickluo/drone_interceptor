@@ -163,6 +163,7 @@ private:
 
     double dt_cam_ = 0.033;          // s, camera-frame dt (adaptive; updated from bbox timestamps)
     double last_bbox_cam_t_ = -1.0;  // last bbox timestamp (for dt_cam_ measurement)
+    bool freeze_width_ = false;
     double w_guess_ = 1.5;
     double control_rate_ = 100.0;
 

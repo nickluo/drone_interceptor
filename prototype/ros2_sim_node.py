@@ -231,6 +231,32 @@ class QuadState:
     gimbal_pitch: float = GIMBAL_BIAS   # semi-strapdown cam-x pitch servo state (actual angle)
 
 
+def step_rig(state, omega_cmd, dt, r_imu, rate_tau=0.05):
+    """3-axis free-attitude test bench: translation LOCKED, rotation free (first-order rate
+    tracking like step_quadrotor). Returns the accelerometer artifact the IMU strapdown sees at
+    an IMU offset r_imu (body frame) from the rig rotation center:
+        a_meas_world = R * (alpha x r + omega x (omega x r)).
+    Thrust is absorbed by the rig structure (a proper accelerometer never sees constraint
+    forces — at the rotation center it reads pure gravity, indistinguishable from a hover), and
+    gravity is removed by the strapdown, so the TRUE ownship linear accel is 0 and these
+    artifacts are the entire strapdown input: the own_vel drift they cause is what the bench
+    measures."""
+    omega_prev = state.omega.copy()
+    state.omega = state.omega + (np.asarray(omega_cmd, dtype=float) - state.omega) * (dt / rate_tau)
+    w = state.omega * dt
+    angle = np.linalg.norm(w)
+    if angle > 1e-9:
+        axis = w / angle
+        dR = np.eye(3) + np.sin(angle) * skew(axis) + (1.0 - np.cos(angle)) * skew(axis) @ skew(axis)
+        state.R_b2n = state.R_b2n @ dR
+        U, _, Vt = np.linalg.svd(state.R_b2n)
+        state.R_b2n = U @ Vt
+    alpha = (state.omega - omega_prev) / dt
+    r = np.asarray(r_imu, dtype=float)
+    a_body = np.cross(alpha, r) + np.cross(state.omega, np.cross(state.omega, r))
+    return state.R_b2n @ a_body
+
+
 def update_gimbal(state, dt, tau=GIMBAL_TAU):
     """Semi-strapdown single-axis (cam-x pitch) gimbal servo. The gimbal drives the camera
     boresight to near-horizontal in the world frame, compensating ownship pitch. Boresight world
@@ -441,6 +467,43 @@ SCENARIOS = {
         uav_init=[0.0, 0.0, 10.0], uav_yaw=0.0,
         sim_time=15.0, noise_pos=1.5, noise_size=2.0,
         target_width=1.5, dropout=None, detect_min_size=15.0, radar=True),
+
+    # ---- High-pitch / bench-rig scenarios (quaternion attitude layer) ----
+    # Missile-mode steep dive: target below-and-ahead inside the initial FOV. The axial channel
+    # rails and the thrust vector pitches past the old 65/68 deg Euler envelope (the node must
+    # run with max_tilt 95 + a_z_limit 12 via run_scenario.sh dive). Pass = intercept with the
+    # two-channel attitude layer holding the camera on target through the dive.
+    'dive': dict(
+        target_init=[30.0, 0.0, -6.0], vel_fn=lambda t: [0.0, 0.0, 0.0],
+        uav_init=[0.0, 0.0, 8.0], uav_yaw=0.0,
+        sim_time=12.0, noise_pos=1.5, noise_size=2.0,
+        target_width=1.5, dropout=None, detect_min_size=15.0),
+
+    # Bench rig, pitch sweep: translation LOCKED, rotation free; target descends slowly so the
+    # commanded pitch sweeps from ~30 deg through the 90 deg operating point. Validates the
+    # attitude layer's continuity and pointing across the old Euler singularity (run with
+    # max_tilt 95 via run_scenario.sh rig_pitch_sweep). Success: boresight error stays ~0 deg.
+    'rig_pitch_sweep': dict(
+        target_init=[10.0, 0.0, 0.0], vel_fn=lambda t: [0.0, 0.0, -0.3],
+        uav_init=[0.0, 0.0, 0.0], uav_yaw=0.0, uav_pitch_deg=30.0,
+        sim_time=16.0, noise_pos=1.5, noise_size=2.0,
+        target_width=1.5, dropout=None, detect_min_size=15.0,
+        rig=True, rig_vib=0.0),
+
+    # Bench rig at the 90 deg operating point: rig pre-positioned at 60 deg, target 10 m ahead
+    # and 4 m BELOW the rotation center (the descent channel drives the thrust tilt past 90
+    # deg) sweeping laterally — pointing must stay authoritative where the old Euler interface
+    # was singular and its lateral PN destabilized the boresight.
+    'rig_90_sweep': dict(
+        target_init=[10.0, 0.0, -7.0],
+        # Static for the first 6 s (let the attitude settle at the operating point — the realistic
+        # bench procedure), then a gentle lateral sweep for the tracking metrics.
+        vel_fn=lambda t: [0.0, 0.0, 0.0] if t < 6.0
+            else [0.0, 2.5 * math.sin(2.0 * math.pi * 0.07 * (t - 6.0)), 0.0],
+        uav_init=[0.0, 0.0, 0.0], uav_yaw=0.0, uav_pitch_deg=80.0,
+        sim_time=24.0, noise_pos=1.5, noise_size=2.0,
+        target_width=1.5, dropout=None, detect_min_size=15.0,
+        rig=True, rig_vib=0.0),
 }
 
 
@@ -502,6 +565,10 @@ class SimNode(Node):
         self.trigger_pub = self.create_publisher(Header, '/fpv/tracker_trigger', 10)
         self.gimbal_pub = self.create_publisher(Imu, '/fpv/gimbal', sensor_qos)
         self.radar_enabled = bool(scenario.get('radar', False))
+        # Bench-scale radar noise override: the module defaults are tuned for 50-100 m intercept
+        # standoffs (3 m position noise); at a 10 m rig distance that injects +-17 deg of
+        # bearing wobble into the fused estimate. Bench scenarios set a mocap-class 0.3 m.
+        self.radar_pos_std = float(scenario.get('radar_pos_std', RADAR_POS_NOISE))
         if self.radar_enabled:
             self.radar_target_pub = self.create_publisher(Odometry, '/fpv/radar/target', reliable_qos)
             self.radar_own_pub = self.create_publisher(Odometry, '/fpv/radar/interceptor', reliable_qos)
@@ -516,8 +583,13 @@ class SimNode(Node):
         # State
         self.uav = QuadState()
         self.uav.pos = np.array(scenario['uav_init'], dtype=float)
-        self.uav.R_b2n = euler_to_R(0.0, 0.0, scenario['uav_yaw'])
+        # uav_pitch_deg: bench-rig pre-positioning (nose-down positive), e.g. the 60 deg rig
+        # start point; 0 for normal flight scenarios.
+        self.uav.R_b2n = euler_to_R(0.0, np.deg2rad(scenario.get('uav_pitch_deg', 0.0)), scenario['uav_yaw'])
         self.uav.vel = np.array(scenario.get('uav_vel_init', np.zeros(3)), dtype=float)
+        self.rig_mode = bool(scenario.get('rig', False))
+        self.r_imu = np.array(scenario.get('r_imu', [0.08, 0.0, -0.06]), dtype=float)
+        self.own_vel_int = np.zeros(3)      # strapdown own_vel mirror (bench drift metric)
         self.target_pos = np.array(scenario['target_init'], dtype=float)
         self.target_vel = np.zeros(3)
         self.latest_cmd = None  # (throttle, [wx,wy,wz], stamp)
@@ -526,7 +598,8 @@ class SimNode(Node):
 
         # Logging
         self.log = {'t': [], 'range': [], 'los_rate': [], 'uav_pos': [], 'tgt_pos': [],
-                    'cmd_throttle': [], 'cmd_rate': [], 'nan_count': 0}
+                    'cmd_throttle': [], 'cmd_rate': [], 'nan_count': 0,
+                    'pitch': [], 'roll': [], 'az_err': [], 'own_vel': []}
         self.start_time = None
         self.intercepted = False
         self.intercept_t = -1.0
@@ -567,7 +640,7 @@ class SimNode(Node):
         if self.start_time is None:
             return
         rng = float(np.linalg.norm(self.target_pos - self.uav.pos))
-        pos_std = min(RADAR_POS_NOISE + RADAR_RANGE_NOISE_FRAC * rng, RADAR_POS_NOISE_MAX)
+        pos_std = min(self.radar_pos_std + RADAR_RANGE_NOISE_FRAC * rng, RADAR_POS_NOISE_MAX)
         stamp = self.get_clock().now()
         tgt_msg = self.build_radar_msg(stamp, self.target_pos, self.target_vel, pos_std)
         own_msg = self.build_radar_msg(stamp, self.uav.pos, self.uav.vel, pos_std)
@@ -643,7 +716,16 @@ class SimNode(Node):
         a_world = np.zeros(3)
         if self.latest_cmd is not None:
             throttle, rates = self.latest_cmd
-            a_world = step_quadrotor(self.uav, throttle, rates, self.dt_ctrl)
+            if self.rig_mode:
+                # Bench rig: translation locked — only attitude integrates, and the IMU sees the
+                # rig rotation artifacts (the strapdown's only input; true own accel is 0).
+                a_world = step_rig(self.uav, rates, self.dt_ctrl, self.r_imu)
+                _vib = float(self.scenario.get('rig_vib', 0.0))
+                if _vib > 0.0:
+                    a_world = a_world + np.random.normal(0.0, _vib, 3)
+            else:
+                a_world = step_quadrotor(self.uav, throttle, rates, self.dt_ctrl)
+            self.own_vel_int += a_world * self.dt_ctrl
 
         # Semi-strapdown gimbal: servo the cam-x pitch every control step (before the camera
         # projection reads module R_B2C), then publish the ACTUAL camera-to-world orientation on
@@ -677,7 +759,7 @@ class SimNode(Node):
         rel = self.target_pos - self.uav.pos
         rng = float(np.linalg.norm(rel))
         self.min_range = min(self.min_range, rng)
-        if rng < INTERCEPT_RANGE and not self.intercepted:
+        if rng < INTERCEPT_RANGE and not self.intercepted and not self.rig_mode:
             self.intercepted = True
             self.intercept_t = t
             self.get_logger().info(f"*** INTERCEPT at t={t:.2f}s range={rng:.2f}m ***")
@@ -690,6 +772,18 @@ class SimNode(Node):
         self.log['t'].append(t)
         self.log['range'].append(rng)
         self.log['los_rate'].append(los_rate)
+        _roll, _pitch, _ = R_to_euler(self.uav.R_b2n)
+        self.log['pitch'].append(math.degrees(_pitch))
+        self.log['roll'].append(math.degrees(_roll))
+        _b = R_c2n[:, 2]                      # camera +Z (boresight) in world
+        if np.linalg.norm(_b[0:2]) > 0.1 and np.linalg.norm(rel[0:2]) > 1e-6:
+            _az_b = math.atan2(_b[1], _b[0])
+            _az_t = math.atan2(rel[1], rel[0])
+            self.log['az_err'].append(math.degrees(math.atan2(
+                math.sin(_az_t - _az_b), math.cos(_az_t - _az_b))))
+        else:
+            self.log['az_err'].append(float('nan'))
+        self.log['own_vel'].append(float(np.linalg.norm(self.own_vel_int)))
         self.log['uav_pos'].append(self.uav.pos.copy())
         self.log['tgt_pos'].append(self.target_pos.copy())
         if self.latest_cmd is not None:
@@ -704,9 +798,11 @@ class SimNode(Node):
         self.publish_imu(a_world)
 
         if t % 2.0 < self.dt_ctrl:
+            _az = self.log['az_err'][-1] if self.log['az_err'] else float('nan')
             self.get_logger().info(
                 f"t={t:.1f} range={rng:.2f} min={self.min_range:.2f} "
-                f"uav_pos={self.uav.pos} vel={self.uav.vel}")
+                f"pitch={self.log['pitch'][-1]:.1f} roll={self.log['roll'][-1]:.1f} "
+                f"az_err={_az:.1f} vel={self.uav.vel}")
 
     def publish_odom(self, t):
         msg = Odometry()
@@ -916,6 +1012,19 @@ class SimNode(Node):
                         f"{self.min_range_before_vision:.1f}m\n")
                 f.write(f"Vision frames: {self.vision_frames}\n")
                 f.write(f"False positives emitted: {self.false_pos_emitted}\n")
+            if self.rig_mode:
+                t_arr = np.asarray(self.log['t'])
+                settled = t_arr > 3.0
+                az_abs = np.abs(np.asarray(self.log['az_err'])[settled])
+                az_abs = az_abs[np.isfinite(az_abs)]
+                f.write("Bench (rig) metrics:\n")
+                f.write(f"  pitch min/max: {min(self.log['pitch']):.1f}/{max(self.log['pitch']):.1f} deg\n")
+                f.write(f"  |roll| max: {max(abs(r) for r in self.log['roll']):.1f} deg\n")
+                if az_abs.size:
+                    f.write(f"  az_err mean/p95/max (after 3s): "
+                            f"{az_abs.mean():.2f}/{np.percentile(az_abs, 95):.2f}/{az_abs.max():.2f} deg\n")
+                f.write(f"  strapdown own_vel drift (rig artifacts): "
+                        f"{self.log['own_vel'][-1]:.3f} m/s\n")
             f.write(f"Sim time: {self.log['t'][-1]:.2f}s\n" if self.log['t'] else "Sim time: 0\n")
         self.get_logger().info(
             f"Results: {base}.csv + {base}_summary.txt | "

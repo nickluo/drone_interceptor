@@ -18,6 +18,60 @@
 #include "guidance_limits.h"
 #include "utils.h"
 
+// ============================================================================
+// Attitude-geometry helpers (shared by the controller and the node fallbacks).
+// Quaternion/two-channel attitude interface: valid through +-90 deg of body pitch,
+// where the former Euler (theta, phi, yaw) interface was singular and its no-wrap
+// P-laws produced full-authority transients on representation flips.
+// ============================================================================
+
+// Wrap an angle to (-pi, pi].
+inline double wrapAngle(double a)
+{
+    return std::atan2(std::sin(a), std::cos(a));
+}
+
+// Two-channel TILT rates: rotate the thrust axis z_meas onto z_cmd about the axis perpendicular
+// to both, carrying no heading (rotated-camera-plane) component. At low pitch this is the former
+// Euler roll/pitch P-law pair; at high pitch it stays decoupled from the heading channel.
+// Non-singular at any attitude.
+inline Eigen::Vector3d tiltChannelRates(const Eigen::Matrix3d& R_b2n, const Eigen::Vector3d& z_cmd,
+                                        double k_tilt, double max_rate)
+{
+    const Eigen::Vector3d z_meas = R_b2n.col(2);
+    const Eigen::Vector3d cr = z_meas.cross(z_cmd);
+    const double crn = cr.norm();
+    Eigen::Vector3d omega_world = Eigen::Vector3d::Zero();
+    if (crn > 1e-9) {
+        omega_world = (k_tilt * std::atan2(crn, z_meas.dot(z_cmd))) * (cr / crn);
+    }
+    const Eigen::Vector3d omega_body = R_b2n.transpose() * omega_world;
+    return Eigen::Vector3d(clamp(omega_body.x(), -max_rate, max_rate),
+                           clamp(omega_body.y(), -max_rate, max_rate),
+                           clamp(omega_body.z(), -max_rate, max_rate));
+}
+
+// Camera boresight azimuth in the world frame. Prefers the actual gimbal pose (R_c2n:
+// camera->world rotation; boresight = camera +Z) — non-singular at any body pitch, since the
+// semi-strapdown pitch gimbal keeps the boresight near horizontal. Without a gimbal, falls back
+// to the body forward axis, then to the thrust axis as the forward axis goes vertical (the
+// pitch-90 degeneracy of the Euler heading).
+inline double boresightAzimuth(const Eigen::Matrix3d& R_b2n, const Eigen::Matrix3d* R_c2n)
+{
+    if (R_c2n != nullptr) {
+        const Eigen::Vector3d b = R_c2n->col(2);
+        if (Eigen::Vector2d(b.x(), b.y()).norm() > 0.1) {
+            return std::atan2(b.y(), b.x());
+        }
+    }
+    const Eigen::Vector3d bx = R_b2n.col(0);
+    if (Eigen::Vector2d(bx.x(), bx.y()).norm() > 0.2) {
+        return std::atan2(bx.y(), bx.x());
+    }
+    const Eigen::Vector3d bz = R_b2n.col(2);
+    return std::atan2(bz.y(), bz.x());
+}
+
 class AdvancedHybridController {
 public:
     double N;
@@ -83,15 +137,26 @@ public:
     double terminal_arrival_range_  = 0.0;
     // Speed-scheduled PN + attitude reference slew governor (v_des=20 oscillation fixes).
     double v_pn_ref_ = 1e9;       // cap on v_fwd in PN lateral accel -> bounds effective N*v at high speed
-    double max_att_rate_ = 1e9;   // max |d(phi_cmd)/dt|, |d(theta_cmd)/dt| [rad/s] (slew governor)
-    double last_phi_cmd_ = 0.0;   // governor state (dedicated; axial block reuses last_t_/has_last_)
-    double last_theta_cmd_ = 0.0;
+    double max_att_rate_ = 1e9;   // max |d(tilt_mag)/dt|, |d(tilt_az)/dt| [rad/s] (slew governor)
+    double last_tilt_mag_ = 0.0;  // governor state (dedicated; axial block reuses last_t_/has_last_)
+    Eigen::Vector2d last_az_ = Eigen::Vector2d(1.0, 0.0);
     double last_att_t_ = -1.0;
     bool   has_last_att_ = false;
     // Attitude-reference EMA low-pass (suppresses camera-rate content / roll limit-cycle).
-    double att_ref_tc_ = 0.15;    // EMA time constant on phi_cmd/theta_cmd [s]
-    double last_phi_cmd_f_ = 0.0;   // EMA-filtered reference state
-    double last_theta_cmd_f_ = 0.0;
+    double att_ref_tc_ = 0.15;    // EMA time constant on (tilt_mag, tilt_az) [s]
+    double last_tilt_mag_f_ = 0.0;  // EMA-filtered reference state
+    Eigen::Vector2d last_az_f_ = Eigen::Vector2d(1.0, 0.0);
+    // sin(pitch)-keyed lateral-authority attenuation (a_lat -> 0 over the window): the single-axis
+    // pitch gimbal cannot compensate roll, so banking swings the boresight azimuth by ~sin(pitch)
+    // per radian of roll — lateral PN increasingly costs pointing as the nose-down pitch deepens.
+    // Dormant in the validated <=68 deg flight envelope; authoritative pointing at the bench/missile
+    // 90 deg regime, where the bearing rate cannot self-extinguish without ownship translation.
+    double a_lat_tilt_start_ = 65.0 * M_PI / 180.0;   // window start, in sin(pitch) units
+    double a_lat_tilt_end_ = 85.0 * M_PI / 180.0;     // ... end (a_lat -> 0)
+    // Max body NOSE-UP pitch the semi-strapdown gimbal can compensate (its up-travel minus the
+    // down-gaze bias): braking harder nose-up than this saturates the servo and drops the
+    // boresight below the target. 0 = unlimited.
+    double gimbal_nose_up_max_ = 35.0 * M_PI / 180.0;
     // Terminal authority (maneuvering-target tracking): relax the roll clamp inside terminal_tilt_range_.
     // max_tilt_terminal_rad_ is ALSO the bank used by the turn-radius speed cap in that band, so raising
     // it both permits tighter turns AND raises the close-range speed cap (win-win for terminal maneuverability).
@@ -169,12 +234,12 @@ public:
         last_axial_accel_ = 0.0;
         last_t_ = -1.0;
         has_last_ = false;
-        last_phi_cmd_ = 0.0;
-        last_theta_cmd_ = 0.0;
+        last_tilt_mag_ = 0.0;
+        last_az_ = Eigen::Vector2d(1.0, 0.0);
         last_att_t_ = -1.0;
         has_last_att_ = false;
-        last_phi_cmd_f_ = 0.0;
-        last_theta_cmd_f_ = 0.0;
+        last_tilt_mag_f_ = 0.0;
+        last_az_f_ = Eigen::Vector2d(1.0, 0.0);
         last_a_z_ = 0.0;
         last_az_t_ = -1.0;
         has_last_az_ = false;
@@ -267,10 +332,21 @@ public:
     void set_turn_radius_cap_factor(double v) { turn_radius_cap_factor_ = clamp(v, 0.3, 1.0); }
     void set_axial_deadband(double v) { axial_deadband_ = std::max(0.0, v); }
     void set_motion_gate_factor(double v) { motion_gate_factor_ = std::max(0.0, v); }
+    void set_lateral_tilt_attenuation(double start_deg, double end_deg) {
+        a_lat_tilt_start_ = std::max(0.0, start_deg) * M_PI / 180.0;
+        a_lat_tilt_end_ = std::max(a_lat_tilt_start_ + 1e-3, end_deg) * M_PI / 180.0;
+    }
+    void set_gimbal_nose_up_max(double deg) { gimbal_nose_up_max_ = std::max(0.0, deg) * M_PI / 180.0; }
 
     // Odometry-free control with optional coordinated terminal speed limits. Inputs:
+    //   R_b2n        : measured body->world attitude (rotation matrix). The attitude interface is
+    //                  quaternion/two-channel — no Euler extraction, valid through +-90 deg of
+    //                  body pitch (bench rig operating point / missile-mode dives), where the
+    //                  former (roll, pitch, yaw) Euler interface was singular.
+    //   az_bore      : measured camera boresight azimuth in the world frame (rad; from the gimbal
+    //                  pose when available — non-singular heading reference at any body pitch).
+    //   los_az_err   : bearing error relative to the boresight, wrap(az_los - az_bore) (rad).
     //   r_est, v_est : RELATIVE target pos/vel in world frame G (estimator state directly)
-    //   los_az       : target azimuth in body heading frame (rad, 0 = dead ahead)
     //   los_el       : target elevation in world frame (rad, 0 = level, negative = below)
     //   v_fwd_body   : closing speed proxy = -v_rel·r̂ (positive = approaching); NOT odom
     //   bbox_size    : target bbox size in px (observable proximity cue)
@@ -279,9 +355,9 @@ public:
     //   los_rate     : EMA-smoothed measured bearing rate (lambda_dot)
     //   a_own_world  : ownship world accel over the last camera window (IMU preintegration)
     //   t            : mission-relative time (s)
-    std::vector<double> compute_control(double roll, double pitch, double yaw,
+    std::vector<double> compute_control(const Eigen::Matrix3d& R_b2n, double az_bore, double los_az_err,
                                         const Eigen::Vector3d& r_est, const Eigen::Vector3d& v_est,
-                                        double los_az, double los_el, double t,
+                                        double los_el, double t,
                                         double v_fwd_body = 0.0, double bbox_size = 0.0,
                                         double v_z = 0.0, double target_speed = 0.0,
                                         double los_rate = 0.0,
@@ -291,6 +367,21 @@ public:
                                         bool radar_close_range = false) {
         (void)v_est;
         (void)target_speed;
+        const double az_los = wrapAngle(az_bore + los_az_err);
+        // sin(pitch) is the roll->boresight-azimuth coupling factor (a roll of phi at nose-down
+        // pitch theta swings the boresight azimuth by ~sin(theta)*phi): 0 at level (roll is pure
+        // image roll), ~1 at the 90 deg dive. Used by the lateral attenuation and the
+        // thrust-azimuth budget below. R(2,0) is the world-z component of the body forward axis
+        // (negative when nose-down), so sin(pitch) = -R(2,0) with nose-down positive.
+        const double sin_pitch = clamp(-R_b2n(2, 0), -1.0, 1.0);
+        // Lateral-authority tilt attenuation: banking costs pointing increasingly with nose-down
+        // pitch (the single-axis pitch gimbal cannot compensate roll). In free flight PN
+        // self-extinguishes (ownship translation converges the bearing) before deep pitch, so
+        // this is dormant in the validated <=68 deg envelope; on a translation-locked bench the
+        // bearing rate NEVER decays and full lateral authority destabilizes pointing.
+        const double att_lat = clamp((std::sin(a_lat_tilt_end_) - sin_pitch) /
+                                      std::max(std::sin(a_lat_tilt_end_) - std::sin(a_lat_tilt_start_), 1e-6),
+                                      0.0, 1.0);
         const double r_norm = r_est.norm();
         // Axial-only range EMA (radar smoothness): r_norm carries +-~4 m of 10 Hz radar noise; fed
         // 1:1 into the turn-radius cap (sqrt(g*tan*r)) it swings v_des_eff and brakes every cycle.
@@ -334,6 +425,7 @@ public:
         const double lat_f = clamp((r_norm - terminal_brake_range_) /
                                    std::max(lat_decay_start_ - terminal_brake_range_, 1.0), 0.0, 1.0);
         a_lat_mag *= lateral_decay_floor_ + (1.0 - lateral_decay_floor_) * lat_f;
+        a_lat_mag *= att_lat;
         // Lateral direction in world horizontal plane: perpendicular to LOS projected to xy.
         Eigen::Vector2d e_los_xy(r_est(0), r_est(1));
         if (e_los_xy.norm() < 1e-3) e_los_xy << 1.0, 0.0;
@@ -396,7 +488,7 @@ public:
         }
         if (K_apn_max_range_ <= 0.0 || r_norm < K_apn_max_range_) {
             if (std::abs(a_t_perp_geom) > K_apn_min_at_) {
-                a_lat_world += K_apn_ * a_t_perp_geom * e_perp_xy;
+                a_lat_world += K_apn_ * att_lat * a_t_perp_geom * e_perp_xy;
             }
         }
 
@@ -406,7 +498,11 @@ public:
         // bank (terminal tilt inside terminal_tilt_range) so the raised terminal bank translates into
         // sustained close-range speed AND tighter turns.
         const double tilt_for_cap = (r_norm_axial < terminal_tilt_range_) ? max_tilt_terminal_rad_ : max_tilt_rad;
-        v_des_eff = std::min(v_des_eff, turn_radius_cap_factor_ * std::sqrt(g * std::tan(tilt_for_cap) * r_norm_axial));
+        // tan() is negative past 90 deg of tilt (sqrt of a negative): clamp the cap tilt into the
+        // valid turn-radius domain — past 90 deg of bank the "turn radius" concept has already
+        // conceded all maneuverability anyway.
+        const double tilt_for_cap_valid = std::min(tilt_for_cap, 89.0 * M_PI / 180.0);
+        v_des_eff = std::min(v_des_eff, turn_radius_cap_factor_ * std::sqrt(g * std::tan(tilt_for_cap_valid) * r_norm_axial));
         // The raw image cue can brake before an overestimated monocular range catches up.
         if (visual_speed_gain_ > 0 && bbox_size > 0)
             v_des_eff = std::min(v_des_eff,
@@ -537,38 +633,96 @@ public:
 
         // ---- (B) Total horizontal acceleration (lateral + forward) ----------------------
         Eigen::Vector2d a_h_world = a_lat_world + a_fwd_world;
-        // Rotate world-horizontal accel into body heading frame for thrust allocation.
-        const double cy = std::cos(yaw);
-        const double sy = std::sin(yaw);
-        const double fx_h = cy * a_h_world(0) + sy * a_h_world(1);
-        const double fy_h = -sy * a_h_world(0) + cy * a_h_world(1);
 
-        // ---- (C) Thrust-vector cascade ---------------------------------------------------
-        // Standard quadrotor control: the desired body-frame acceleration vector
-        //   t_body = [fx_h (fwd), fy_h (right), a_z + g (up)]
-        // is realized by tilting the thrust axis toward it. Pitch/roll commands come
-        // directly from the horizontal/vertical force ratio, so forward accel (fx_h > 0)
-        // commands nose-down (positive theta in this frame's convention, where pitch>0
-        // tilts body-z toward +x = forward) and produces real forward thrust.
-        // This fixes the original bug where theta_cmd only tracked los_el, leaving a_fwd
-        // with no path to the pitch axis (UAV could not self-propel forward).
-        // Body frame is FLU: X=fwd, Y=left, Z=up. fy_h>0 = need rightward accel => roll
-        // right (negative phi). fx_h>0 = need forward accel => nose down (positive theta).
-        double theta_cmd = clamp( std::atan2(fx_h, a_z + g), -max_tilt_rad, max_tilt_rad);
-        // Roll clamp is relaxed inside the terminal phase: a maneuvering target needs more bank
-        // authority at close range (where the bbox is large and coast handles brief dropout) than
-        // the conservative mid-course max_tilt permits. Pitch/FOV keep the conservative limit.
-        const double max_tilt_roll = (r_norm < terminal_tilt_range_) ? max_tilt_terminal_rad_ : max_tilt_rad;
-        double phi_cmd   = clamp(-std::atan2(fy_h, a_z + g), -max_tilt_roll, max_tilt_roll);
+        // ---- (C) Thrust-vector construction (quaternion / two-channel) -------------------
+        // The desired attitude is built from the world-frame specific-force direction
+        // d = [a_h, a_z+g] directly: body Z aligns with d, and the tilt is expressed in the
+        // BORESIGHT-azimuth frame (tilt_fwd, tilt_left) — the exact former theta_cmd / -phi_cmd
+        // at low tilt, still well-defined to +-180 deg. This replaces the Euler theta/phi
+        // clamps + Euler P-laws, whose representation singularity at pitch +-90 deg and no-wrap
+        // P-laws made the >65 deg regime (bench rig operating point, missile-mode dives)
+        // unusable.
+        const bool target_behind = std::abs(los_az_err) > (M_PI / 2.0);
+        Eigen::Vector3d d(a_h_world(0), a_h_world(1), a_z + g);
+        // Tilt cap (flight envelope): cap the tilt of d from vertical, preserving the tilt
+        // azimuth; valid beyond 90 deg (cap > 90 lets the thrust axis pass horizontal for
+        // missile-mode dives). Terminal range relaxes the cap (the old max_tilt_terminal roll
+        // relaxation).
+        const double tilt_cap = (r_norm < terminal_tilt_range_) ? max_tilt_terminal_rad_ : max_tilt_rad;
+        const double a_h_mag = a_h_world.norm();
+        if (a_h_mag > 1e-9) {
+            const double tilt_raw = std::atan2(a_h_mag, d(2));
+            // Thrust-azimuth pointing budget: a thrust-azimuth deviation delta from the LOS
+            // swings the boresight azimuth by ~sin(pitch)*delta (the roll coupling above), so
+            // the affordable deviation is the remaining keep-in-frame margin over that coupling.
+            // At level pitch sin->0 and the budget is unbounded (flight banking untouched); at
+            // the 90 deg dive the boresight ~ the thrust axis and the budget collapses onto the
+            // LOS — exactly where pointing must be authoritative (bench: the bearing rate never
+            // self-extinguishes, and a wandering thrust azimuth walks the target out of frame).
+            const double az_ah = std::atan2(a_h_world(1), a_h_world(0));
+            const double d_az = wrapAngle(az_ah - az_los);
+            // Engage only in the deep-pitch regime (sin_pitch > 0.75, ~49 deg nose-down): with
+            // the two-channel decomposition a STEADY bank does not rotate the camera plane (the
+            // tilt channel's rotation is in-plane below the degeneracy), so the boresight cost of
+            // a bank is transient only — clamping at moderate pitch just starves terminal lateral
+            // authority. In the deep-pitch regime the tilt channel's axis rotates toward the
+            // vertical and the boresight ~ the thrust axis, where the budget keeps pointing
+            // authoritative (bench rig, missile-mode dives).
+            const double fov_az_budget = fov_half_h_ * fov_keep_margin_ - std::abs(los_az_err);
+            // clamp to [0, pi]: a NEGATIVE budget (error already past the keep-in-frame margin)
+            // must PIN the thrust azimuth onto the LOS (d_az_max -> 0), not unbind it — at deep
+            // pitch the boresight ~ the thrust axis, and an unbound PN azimuth makes the tilt
+            // and heading channels fight over the same DOF (observed: a stuck compromise with
+            // ~60 deg pointing error and ~100 deg residual roll on the rig).
+            const double d_az_max = (sin_pitch > 0.75)
+                ? clamp(fov_az_budget / std::max(sin_pitch, 0.75), 0.0, M_PI) : M_PI;
+            Eigen::Vector2d a_h_eff = a_h_world;
+            if (std::abs(d_az) > d_az_max) {
+                const double d_az_c = clamp(d_az, -d_az_max, d_az_max);
+                a_h_eff = a_h_mag * Eigen::Vector2d(std::cos(az_los + d_az_c), std::sin(az_los + d_az_c));
+                d(0) = a_h_eff(0);
+                d(1) = a_h_eff(1);
+            }
+            if (tilt_raw > tilt_cap) {
+                const Eigen::Vector2d s_xy = a_h_eff / a_h_mag;
+                d = Eigen::Vector3d(std::sin(tilt_cap) * s_xy(0), std::sin(tilt_cap) * s_xy(1),
+                                    std::cos(tilt_cap));
+            }
+        }
+        // Spherical tilt parametrization of the desired thrust direction, in the
+        // boresight-azimuth frame: (tilt_mag in [0, pi], tilt_az). Valid over the WHOLE sphere —
+        // a (tilt_fwd, tilt_left) tangent parametrization z = z_hat + fwd*tan(tf) + left*tan(tl)
+        // silently INVERTS the direction past 90 deg of tilt (tan flips sign), which a >90 deg
+        // missile-dive command turned into a full-backward attitude flip.
+        const Eigen::Vector2d fwd_h(std::cos(az_bore), std::sin(az_bore));
+        const Eigen::Vector2d left_h(-std::sin(az_bore), std::cos(az_bore));
+        const Eigen::Vector3d left_h3(-std::sin(az_bore), std::cos(az_bore), 0.0);
+        // Rotate d about the horizontal left axis (exact at any tilt) — the pitch-plane clamp
+        // operator for the nose-up cap and the fixed-mount FOV window.
+        auto rotate_about_left = [&left_h3](const Eigen::Vector3d& v, double angle) {
+            return v * std::cos(angle) + left_h3.cross(v) * std::sin(angle)
+                 + left_h3 * left_h3.dot(v) * (1.0 - std::cos(angle));
+        };
+        // fwd-plane tilt (the former theta_cmd).
+        double tf = std::atan2(d.head<2>().dot(fwd_h), d(2));
+        // Nose-up cap from the gimbal's up-travel: the semi-strapdown servo (cmd = -pitch + bias)
+        // saturates at its mechanical max; braking harder nose-up than that drops the boresight
+        // below the target.
+        if (has_gimbal_ && gimbal_nose_up_max_ > 0.0) {
+            const double tf_min = -(gimbal_nose_up_max_ - gimbal_bias_);
+            if (tf < tf_min) {
+                d = rotate_about_left(d, tf_min - tf);
+                tf = tf_min;
+            }
+        }
 
-        const bool target_behind = std::abs(los_az) > (M_PI / 2.0);
         if (enable_fov_clamp_ && has_gimbal_ && !target_behind) {
             // Semi-strapdown gimbal: the boresight is decoupled from body pitch (gimbal cancels
-            // it; elev ~= -gimbal_bias_), so a theta clamp cannot keep the target in the vertical
+            // it; elev ~= -gimbal_bias_), so a tilt clamp cannot keep the target in the vertical
             // FOV — ALTITUDE can. If the target approaches the bottom edge (los_el well below the
             // boresight), command a descent so the frame re-centers; symmetric for the top edge.
-            // Overrides the PD a_z only near the edge (outer 30% of the half-FOV). Mirrors the
-            // verified Python implementation (sim_test_relative_imm_ukf->py).
+            // Overrides the PD a_z only near the edge (outer 30% of the half-FOV). Affects only
+            // the throttle below (the tilt was built from the pre-override a_z, as before).
             const double fov_keep = fov_half_v_ * fov_keep_margin_;
             // Boresight world elevation: prefer the ACTUAL camera orientation measured by the gimbal
             // (q_C_W) — this tracks the true boresight INCLUDING servo lag, so the vertical-FOV clamp
@@ -587,72 +741,112 @@ public:
             }
         } else if (enable_fov_clamp_ && !target_behind && r_norm < 15.0) {
             const double fov_hard = fov_half_v_;
-            // theta_hi (nose-down): kept conservative (fov_hard - los_el - mount_pitch). The
+            // tf_hi (nose-down): kept conservative (fov_hard - los_el - mount_pitch). The
             // geometrically correct form (mount_pitch + fov_hard - los_el) allows large nose-down
             // and was tested -> aggressive dive on low targets -> image smear -> overshoot.
             const double theta_hi = std::min(max_tilt_rad, fov_hard - los_el - mount_pitch_);
-            // theta_lo (nose-up): CORRECT form to keep the target inside the vertical FOV. boresight
-            // elev = mount_pitch - theta, so boresight <= los_el + fov_keep  =>  theta >= mount_pitch
-            // - fov_keep - los_el. The old (-fov_hard - los_el - mount_pitch) sign-flipped mount_pitch
-            // and allowed ~25 deg nose-up; with the 15 deg up-mount the boresight rose to ~40 deg and
-            // dropped a near-level target past the bottom edge at 8.7 m (3 s terminal dropout, 1.93 m
-            // miss). Under rate attenuation (AirSim/HW mode) this ran away completely (UAV pitched up
-            // and climbed to z=318). fov_keep (margin) leaves headroom so attitude errors don't re-lose it.
+            // tf_lo (nose-up): CORRECT form to keep the target inside the vertical FOV.
+            // boresight elev = mount_pitch - theta, so boresight <= los_el + fov_keep =>
+            // theta >= mount_pitch - fov_keep - los_el. fov_keep leaves headroom so attitude
+            // errors don't re-lose it.
             const double fov_keep_v = fov_half_v_ * fov_keep_margin_;
             const double theta_lo = std::max(-max_tilt_rad, mount_pitch_ - fov_keep_v - los_el);
-            theta_cmd = clamp(theta_cmd, std::min(theta_lo, theta_hi), std::max(theta_lo, theta_hi));
+            const double tf_lo = std::min(theta_lo, theta_hi);
+            const double tf_hi2 = std::max(theta_lo, theta_hi);
+            if (tf < tf_lo) {
+                d = rotate_about_left(d, tf_lo - tf);
+                tf = tf_lo;
+            } else if (tf > tf_hi2) {
+                d = rotate_about_left(d, tf_hi2 - tf);
+                tf = tf_hi2;
+            }
         }
 
+        // Recompute the spherical parametrization after the clamps.
+        const double d_h_mag = d.head<2>().norm();
+        double tilt_mag = std::atan2(d_h_mag, d(2));      // 0..pi (past 90 deg = dive)
+        Eigen::Vector2d s_az = (d_h_mag > 1e-9) ? (d.head<2>() / d_h_mag) : fwd_h;
+
         // ---- Attitude reference EMA low-pass ------------------------------------------------
-        // Suppress camera-rate content / roll limit-cycle before the P-law. An EMA (vs the slew
-        // governor below) is the right tool for a steady oscillation: it attenuates high-freq phi_cmd
-        // swings while preserving the slow PN turn bias. Distinct from the body-rate decay coeff
-        // ctrl_coeff_; this filters the attitude REFERENCE, not the rate output.
+        // Suppress camera-rate content / roll limit-cycle before the rate law. An EMA (vs the slew
+        // governor below) is the right tool for a steady oscillation: it attenuates high-freq tilt
+        // swings while preserving the slow PN turn bias. Applied to the tilt magnitude and the
+        // tilt azimuth (ANGULAR EMA — a vector lerp passes through zero on a bank reversal and
+        // snaps the direction). Distinct from the body-rate decay coeff ctrl_coeff_; this filters
+        // the attitude REFERENCE, not the rate output.
         if (has_last_att_ && att_ref_tc_ > 1e-6) {
             const double dt = t - last_att_t_;
             if (dt > 0.0 && dt < 1.0) {
                 const double a_ref = clamp(dt / att_ref_tc_, 0.0, 1.0);
-                phi_cmd   = last_phi_cmd_f_   + a_ref * (phi_cmd   - last_phi_cmd_f_);
-                theta_cmd = last_theta_cmd_f_ + a_ref * (theta_cmd - last_theta_cmd_f_);
+                tilt_mag = last_tilt_mag_f_ + a_ref * (tilt_mag - last_tilt_mag_f_);
+                const double az_now = std::atan2(s_az(1), s_az(0));
+                const double az_last = std::atan2(last_az_f_(1), last_az_f_(0));
+                const double az_f = az_last + a_ref * wrapAngle(az_now - az_last);
+                s_az = Eigen::Vector2d(std::cos(az_f), std::sin(az_f));
             }
         }
-        last_phi_cmd_f_   = phi_cmd;
-        last_theta_cmd_f_ = theta_cmd;
+        last_tilt_mag_f_ = tilt_mag;
+        last_az_f_ = s_az;
 
         // ---- Attitude reference slew governor ----------------------------------------------
-        // Bound |d(phi_cmd)/dt| and |d(theta_cmd)/dt| so the desired attitude cannot flip +-max_tilt
-        // in a single cycle. That flip is what bang-bangs omega_x/omega_y into +-max_body_rate
-        // saturation (via the P-law below) and drives the roll limit-cycle at high v_des. Mirrors the
+        // Bound |d(tilt_mag)/dt| and |d(az)/dt| so the desired thrust direction cannot flip
+        // +-max_tilt in a single cycle. That flip is what bang-bangs the tilt channel into
+        // +-max_body_rate saturation and drives the roll limit-cycle at high v_des. Mirrors the
         // axial_jerk_max_ slew limit above; uses dedicated state because the axial block already
-        // overwrote last_t_/has_last_ for this cycle. Does NOT change steady-state lateral authority.
+        // overwrote last_t_/has_last_ for this cycle. Does NOT change steady-state authority.
         if (has_last_att_) {
             const double dt = t - last_att_t_;
             if (dt > 0.0 && dt < 1.0) {
-                const double max_dphi = max_att_rate_ * dt;
-                phi_cmd   = clamp(phi_cmd,   last_phi_cmd_   - max_dphi, last_phi_cmd_   + max_dphi);
-                theta_cmd = clamp(theta_cmd, last_theta_cmd_ - max_dphi, last_theta_cmd_ + max_dphi);
+                const double max_dtilt = max_att_rate_ * dt;
+                tilt_mag = clamp(tilt_mag, last_tilt_mag_ - max_dtilt, last_tilt_mag_ + max_dtilt);
+                const double az_now = std::atan2(s_az(1), s_az(0));
+                const double az_last = std::atan2(last_az_(1), last_az_(0));
+                const double d_az_s = clamp(wrapAngle(az_now - az_last), -max_dtilt, max_dtilt);
+                const double az_new = az_last + d_az_s;
+                s_az = Eigen::Vector2d(std::cos(az_new), std::sin(az_new));
             }
         }
-        last_phi_cmd_   = phi_cmd;
-        last_theta_cmd_ = theta_cmd;
+        last_tilt_mag_ = tilt_mag;
+        last_az_ = s_az;
         last_att_t_     = t;
         has_last_att_   = true;
 
+        // ---- (C) Rate commands: TWO-CHANNEL decomposition ---------------------------------
+        //   heading channel: rotation about the world vertical — moves the camera plane (and so
+        //     the gimbal-compensated boresight) onto the LOS azimuth; never disturbs the thrust
+        //     axis' tilt geometry. Gain K_yaw on the boresight-relative bearing error.
+        //   tilt channel: rotation about the axis perpendicular to the boresight plane taking
+        //     z_meas onto z_cmd (gain K_att) — tilts the thrust WITHIN the plane; never rotates
+        //     the plane, so it never moves the boresight (below the 90 deg degeneracy where the
+        //     two merge). At low pitch this reproduces the former Euler P-laws term by term
+        //     (omega_x ~ K_att*roll err, omega_y ~ K_att*pitch err, omega_z ~ K_yaw*los_az).
+        Eigen::Vector3d z_cmd(std::sin(tilt_mag) * s_az(0), std::sin(tilt_mag) * s_az(1),
+                              std::cos(tilt_mag));
+        const Eigen::Vector3d z_meas = R_b2n.col(2);
+        const Eigen::Vector3d cr = z_meas.cross(z_cmd);
+        const double crn = cr.norm();
+        Eigen::Vector3d omega_world = Eigen::Vector3d::Zero();
+        if (crn > 1e-9) {
+            omega_world = (K_att * std::atan2(crn, z_meas.dot(z_cmd))) * (cr / crn);
+        }
+        omega_world(2) += K_yaw * los_az_err;
+        const Eigen::Vector3d omega_body = R_b2n.transpose() * omega_world;
+
         // ---- (B) Thrust: magnitude to realize the vertical component + tilt overhead --------
         // Throttle from the ACTUAL attitude, not the commanded tilt: during a hard brake the
-        // attitude lags theta_cmd, and (a_z+g)/cos(commanded tilt) then over-thrusts vertically ->
-        // brake-climb -> target exits the bottom of the (gimbal-horizontal) frame at 5-7 m.
-        // T*cos(actual tilt) = a_z + g  =>  vertical accel tracks a_z regardless of the attitude
-        // lag. Floor the divisor slightly beyond max_tilt so a transient over-bank cannot blow
-        // the throttle up. Mirrors the verified Python implementation.
-        const double cos_tilt_actual = std::max(std::cos(roll) * std::cos(pitch),
-                                                std::cos(max_tilt_rad + 0.2));
+        // attitude lags the command, and (a_z+g)/cos(commanded tilt) then over-thrusts
+        // vertically -> brake-climb -> target exits the bottom of the (gimbal-horizontal) frame
+        // at 5-7 m. T*cos(actual tilt) = a_z + g  =>  vertical accel tracks a_z regardless of
+        // the attitude lag. R(2,2) = cos(actual tilt) with no Euler extraction; the floor
+        // follows the tilt cap (cos(cap+0.2)) so an over-tilted body cannot blow the throttle
+        // up, floored at 0.25 for caps beyond 90 deg.
+        const double cos_tilt_actual = std::max(R_b2n(2, 2),
+                                                std::max(std::cos(max_tilt_rad + 0.2), 0.25));
         const double throttle = clamp((a_z + g) / cos_tilt_actual, 2.0, 25.0);
 
-        // ---- Attitude rate commands (P on attitude error) -------------------------------
-        double omega_x = clamp(K_att * (phi_cmd - roll), -max_body_rate_, max_body_rate_);
-        double omega_y = clamp(K_att * (theta_cmd - pitch), -max_body_rate_, max_body_rate_);
-        double omega_z = clamp(K_yaw * los_az, -max_body_rate_, max_body_rate_);
-        return {throttle, omega_x, omega_y, omega_z};
+        return {throttle,
+                clamp(omega_body(0), -max_body_rate_, max_body_rate_),
+                clamp(omega_body(1), -max_body_rate_, max_body_rate_),
+                clamp(omega_body(2), -max_body_rate_, max_body_rate_)};
     }
 };

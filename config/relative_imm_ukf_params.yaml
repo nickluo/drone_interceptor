@@ -95,6 +95,17 @@ interceptor_node_relative_imm_ukf:
       K_apn: 0.6                 # augmented-PN target-accel feedforward; 0.6 for fast orbiting targets (was 0: noisy in SITL, needed here to lead 5 m/s orbits)
       K_apn_max_range: 40.0       # m, APN range gate: a_t_perp ~ r*ydot amplifies monocular noise by r; long-range APN banked early and tripped the camera guard. 0 disables the gate.
       axial_deadband: 0.05       # m/s, retain slow terminal closure instead of stalling
+      # sin(pitch)-keyed lateral-authority attenuation (quaternion attitude layer): banking
+      # swings the boresight by ~sin(pitch) per radian of roll (single-axis pitch gimbal
+      # cannot compensate roll). Dormant below 65 deg nose-down; a_lat -> 0 by 85 — keeps
+      # pointing authoritative at the bench/missile 90 deg regime where the bearing rate
+      # cannot self-extinguish without ownship translation.
+      a_lat_tilt_start_deg: 65.0
+      a_lat_tilt_end_deg: 85.0
+      # Max body NOSE-UP pitch the C20S gimbal can compensate (up-travel +40 deg minus the
+      # 5 deg down-gaze bias): braking harder nose-up saturates the servo and drops the
+      # boresight below the target. 0 = unlimited.
+      gimbal_nose_up_max_deg: 35.0
       # FOV keep-in-frame guard
       enable_fov_clamp: true   # hard-clamp pitch to keep target in FOV
       fov_keep_margin: 0.65    # fraction of the FOV half-angle to keep the target within

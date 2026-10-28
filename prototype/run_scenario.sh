@@ -23,6 +23,15 @@ source "$WS/install/setup.bash"
 # a track, so the node stays pure-vision for them (exercises the no-radar path).
 case "$SCEN" in
     radar*) LPARAMS="$LPARAMS use_radar:=true" ;;
+    # High-pitch scenarios of the quaternion attitude layer: raise the thrust tilt cap past the
+    # flight 65/68 deg envelope to the missile-mode/bench 95 deg (the yaml keeps the flight
+    # profile; the real rig/bench brings its own profile). The bench (rig) scenarios additionally
+    # FREEZE the monocular width at the w_guess initial value: on the translation-locked bench
+    # there is no ownship parallax, so the (W, range) scale is unobservable and would drift —
+    # with a known-size bench target the frozen W pins r = focal*W/bbox deterministically.
+    # No radar in the bench scenarios (keep the bench chain minimal — pure vision).
+    rig_*) LPARAMS="$LPARAMS extra_params:=physics.max_tilt_deg=95.0,physics.max_tilt_terminal_deg=95.0,estimation.freeze_width=true,estimation.w_guess=1.5,controller.visual_speed_gain=0.0,controller.a_lat_tilt_start_deg=50.0" ;;
+    dive) LPARAMS="$LPARAMS extra_params:=physics.max_tilt_deg=95.0,physics.max_tilt_terminal_deg=95.0" ;;
 esac
 NODE_LOG="${TMPDIR:-/tmp}/imm_ukf_${SCEN}.node.log"
 SIM_LOG="${TMPDIR:-/tmp}/imm_ukf_${SCEN}.sim.log"

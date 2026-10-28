@@ -27,6 +27,7 @@ InterceptorNodeRelativeIMMUKF::InterceptorNodeRelativeIMMUKF() : Node("intercept
     load_parameters();
 
     estimator_ = std::make_unique<RelativeIMMUKFEstimator>(dt_cam_, cam_fx_, cam_fy_, w_guess_, R_b2c_);
+    if (freeze_width_) estimator_->lock_width(w_guess_);
 
     mission_sub_ = this->create_subscription<std_msgs::msg::Bool>(
         this->get_parameter("topics.mission").as_string(), 10,
@@ -138,6 +139,9 @@ void InterceptorNodeRelativeIMMUKF::declare_parameters() {
     this->declare_parameter<double>("controller.range_smooth_tc", 0.3); // s, EMA on the range feeding the turn-radius cap (0=off; radar smoothness)
     this->declare_parameter<double>("controller.turn_radius_cap_factor", 0.8); // turn-radius maneuverability cap factor (clamped [0.3,1.0]; 1.0=physics limit). The binding terminal-speed reducer — see compute_control.
     this->declare_parameter<double>("controller.axial_deadband", 1.5); // m/s, coast within ±this of v_des — kills radar-noise-driven pitch oscillation during blind flight
+    this->declare_parameter<double>("controller.a_lat_tilt_start_deg", 65.0); // sin(pitch)-keyed lateral-authority attenuation window start (see advanced_hybrid_controller.h)
+    this->declare_parameter<double>("controller.a_lat_tilt_end_deg", 85.0);   // ... end (a_lat -> 0); the <=68 deg flight envelope is untouched
+    this->declare_parameter<double>("controller.gimbal_nose_up_max_deg", 35.0); // max body nose-up the gimbal can compensate (C20S +40 deg up-travel minus the 5 deg down-gaze bias); 0 = unlimited
     this->declare_parameter<double>("radar.motion_gate_factor", 3.0); // widens the bbox-radar LOS gate for moving targets: bearing_tol += this * v_perp * delay / r
     this->declare_parameter<double>("controller.lateral_decay_floor", 0.4);  // Fix D: close-range a_lat floor
     this->declare_parameter<double>("controller.lateral_decay_start", 25.0); // Fix F: range lateral attenuation begins (m)
@@ -149,6 +153,13 @@ void InterceptorNodeRelativeIMMUKF::declare_parameters() {
     this->declare_parameter<double>("controller.K_dz_up", 2.0);     // 1/s, climb responsiveness (upper target)
     this->declare_parameter<double>("controller.K_dz_dn", 1.0);     // 1/s, descent responsiveness (lower target; < K_up to avoid over-dive)
     this->declare_parameter<double>("estimation.w_guess", 1.5);
+    // Bench (3-axis rig) switch: freeze the monocular width/scale state at the w_guess initial
+    // value. On the translation-locked bench there is no ownship parallax, so the (W, range)
+    // scale is unobservable and the W state drifts (observed collapsing 1.5 -> ~0.5 in the rig
+    // harness, dragging r_est from 12 m to 3.7 m and corrupting every range-keyed gate). With a
+    // bench target of KNOWN size, set estimation.w_guess to that size and freeze — the range
+    // estimate then rides the size channel deterministically (r = focal*W/bbox).
+    this->declare_parameter<bool>("estimation.freeze_width", false);
     this->declare_parameter<double>("estimation.vel_smooth_tc", 0.25);  // Fix B: target-vel EMA (s, 0=off)
     this->declare_parameter<bool>("estimation.gyro_attitude_during_mission", false);
     // Accelerometer bias in body frame, subtracted before the strapdown preintegration.
@@ -268,6 +279,7 @@ void InterceptorNodeRelativeIMMUKF::load_parameters() {
     R_b2c_ = gimbal_R_b2c(gimbal_bias_rad_);
 
     w_guess_ = this->get_parameter("estimation.w_guess").as_double();
+    freeze_width_ = this->get_parameter("estimation.freeze_width").as_bool();
     control_rate_ = this->get_parameter("control.rate").as_double();
     
     const double rate_tc = this->get_parameter("control.rate_tc").as_double();
@@ -354,6 +366,10 @@ void InterceptorNodeRelativeIMMUKF::load_parameters() {
     }
     controller_->set_axial_deadband(this->get_parameter("controller.axial_deadband").as_double());
     controller_->set_motion_gate_factor(this->get_parameter("radar.motion_gate_factor").as_double());
+    controller_->set_lateral_tilt_attenuation(
+        this->get_parameter("controller.a_lat_tilt_start_deg").as_double(),
+        this->get_parameter("controller.a_lat_tilt_end_deg").as_double());
+    controller_->set_gimbal_nose_up_max(this->get_parameter("controller.gimbal_nose_up_max_deg").as_double());
     dither_radar_range_ = std::max(0.0, this->get_parameter("controller.dither_radar_range").as_double());
     vel_smooth_tc_ = this->get_parameter("estimation.vel_smooth_tc").as_double();
     gyro_attitude_during_mission_ = this->get_parameter("estimation.gyro_attitude_during_mission").as_bool();
@@ -464,6 +480,7 @@ void InterceptorNodeRelativeIMMUKF::resolve_camera_intrinsics() {
 
 void InterceptorNodeRelativeIMMUKF::reset_estimator() {
     estimator_ = std::make_unique<RelativeIMMUKFEstimator>(dt_cam_, cam_fx_, cam_fy_, w_guess_, R_b2c_);
+    if (freeze_width_) estimator_->lock_width(w_guess_);
     if (radar_enable_) estimator_->max_range_ = radar_max_range_;
 }
 
@@ -1203,17 +1220,23 @@ void InterceptorNodeRelativeIMMUKF::control_timer_callback() {
         }
         sim_start_time = sim_start_time_;
     }
-    // Actual camera boresight world elevation from the measured q_C_W (camera->world): the
-    // camera forward axis is +Z (RDF), so its world z-component is sin(boresight_elev). Fed to
-    // the controller's vertical-FOV clamp so it tracks the TRUE boresight (incl. servo lag).
-    // NaN when the gimbal is disabled or no /fpv/gimbal msg has arrived yet (clamp then falls
-    // back to the -gimbal_bias_ assumption).
+    // Camera boresight from the measured q_C_W (camera->world): the camera forward axis is +Z
+    // (RDF). The boresight AZIMUTH is the quaternion attitude interface's heading reference —
+    // non-singular at any body pitch (the semi-strapdown gimbal keeps the boresight near
+    // horizontal), replacing the Euler yaw that degenerated at pitch +-90 deg. The ELEVATION
+    // feeds the controller's vertical-FOV clamp so it tracks the TRUE boresight (incl. servo
+    // lag). Elevation is NaN when the gimbal is disabled or no /fpv/gimbal msg has arrived yet
+    // (the clamp then falls back to the -gimbal_bias_ assumption).
     double boresight_el_meas = std::numeric_limits<double>::quiet_NaN();
-    if (use_gimbal_ && gimbal_rcvd) {
-        const Eigen::Matrix3d R_c2n = gimbal_q_now.normalized().toRotationMatrix();
-        boresight_el_meas = std::asin(clamp(R_c2n(2, 2), -1.0, 1.0));
+    Eigen::Matrix3d R_c2n_gimbal;
+    const bool have_gimbal_pose = use_gimbal_ && gimbal_rcvd;
+    if (have_gimbal_pose) {
+        R_c2n_gimbal = gimbal_q_now.normalized().toRotationMatrix();
+        boresight_el_meas = std::asin(clamp(R_c2n_gimbal(2, 2), -1.0, 1.0));
     }
+    const double az_bore = boresightAzimuth(R_b2n, have_gimbal_pose ? &R_c2n_gimbal : nullptr);
 
+    // Euler attitude for the diagnostic log ONLY — the control path is quaternion/two-channel.
     const double roll = std::atan2(R_b2n(2, 1), R_b2n(2, 2));
     const double pitch = std::atan2(-R_b2n(2, 0), std::sqrt(R_b2n(2, 1) * R_b2n(2, 1) + R_b2n(2, 2) * R_b2n(2, 2)));
     const double yaw = std::atan2(R_b2n(1, 0), R_b2n(0, 0));
@@ -1222,15 +1245,17 @@ void InterceptorNodeRelativeIMMUKF::control_timer_callback() {
     const double v_closing = cache.valid
         ? -cache.v_est.dot(cache.r_est) / std::max(cache.r_est.norm(), 1e-3)
         : 0.0;
+    // Heading-frame projections use the boresight azimuth (the measured camera heading), not
+    // the Euler yaw: identical at low pitch, valid at any pitch.
     const double measured_axial_speed = use_imu_axial_speed_
-        ? own_vel_now.x() * std::cos(yaw) + own_vel_now.y() * std::sin(yaw)
+        ? own_vel_now.x() * std::cos(az_bore) + own_vel_now.y() * std::sin(az_bore)
         : v_closing;
     if (target_axial_feedforward_limit_ > 0 && cache.has_bbox && cache.bbox_size >= 80) {
         // IMU own velocity + UKF relative velocity estimates target motion.
         // Keep image braking a closing-speed reference, not an own-speed cap
         // below a moving target's speed. Bound/filter uncertain monocular scale.
-        const double relative_axial = cache.v_est.x() * std::cos(yaw)
-            + cache.v_est.y() * std::sin(yaw);
+        const double relative_axial = cache.v_est.x() * std::cos(az_bore)
+            + cache.v_est.y() * std::sin(az_bore);
         const double estimate = bounded_target_axial_speed(
             measured_axial_speed, relative_axial, target_axial_feedforward_limit_);
         if (last_target_axial_time_ > 0 && t_now > last_target_axial_time_) {
@@ -1240,25 +1265,14 @@ void InterceptorNodeRelativeIMMUKF::control_timer_callback() {
         last_target_axial_time_ = t_now;
     }
     const double axial_speed = measured_axial_speed - target_axial_feedforward_;
-    double los_az = cache.los_az_world - yaw;
-    los_az = std::atan2(std::sin(los_az), std::cos(los_az));
+    // Bearing error relative to the boresight (was los_az_world - euler_yaw, degenerate at
+    // pitch +-90): the quaternion attitude interface's heading-channel input.
+    const double los_az = wrapAngle(cache.los_az_world - az_bore);
     const double t_rel = (sim_start_time >= 0.0) ? t_now - sim_start_time : 0.0;
 
-    // Body-rate feedback via finite difference of R_b2n (for attitude-loop diagnostics).
-    // omega_body ≈ R_b2n^T * dR/dt  →  extract roll/pitch/yaw rates from Euler angle diffs.
-    double rate_roll = 0.0, rate_pitch = 0.0, rate_yaw = 0.0;
-    if (has_prev_attitude_ && t_now > prev_attitude_t_ && (t_now - prev_attitude_t_) < 0.2) {
-        const double dt = t_now - prev_attitude_t_;
-        const double prev_roll = std::atan2(prev_R_b2n_(2, 1), prev_R_b2n_(2, 2));
-        const double prev_pitch = std::atan2(-prev_R_b2n_(2, 0), std::sqrt(prev_R_b2n_(2, 1) * prev_R_b2n_(2, 1) + prev_R_b2n_(2, 2) * prev_R_b2n_(2, 2)));
-        const double prev_yaw = std::atan2(prev_R_b2n_(1, 0), prev_R_b2n_(0, 0));
-        rate_roll = (roll - prev_roll) / dt;
-        rate_pitch = (pitch - prev_pitch) / dt;
-        double dyaw = yaw - prev_yaw;
-        while (dyaw > M_PI) dyaw -= 2.0 * M_PI;
-        while (dyaw < -M_PI) dyaw += 2.0 * M_PI;
-        rate_yaw = dyaw / dt;
-    }
+    // Measured body rates for the attitude-loop diagnostic log: the gyro directly (the former
+    // Euler finite-difference wrapped at the representation singularity).
+    const double rate_roll = gyro.x(), rate_pitch = gyro.y(), rate_yaw = gyro.z();
     prev_R_b2n_ = R_b2n;
     prev_attitude_t_ = t_now;
     has_prev_attitude_ = true;
@@ -1377,7 +1391,7 @@ void InterceptorNodeRelativeIMMUKF::control_timer_callback() {
         {
             std::lock_guard<std::mutex> ol(odom_mtx_);
             const double v_seed = std::max(v_closing, 0.0);
-            v_own_brake_ = Eigen::Vector3d(v_seed * std::cos(yaw), v_seed * std::sin(yaw), 0.0);
+            v_own_brake_ = Eigen::Vector3d(v_seed * std::cos(az_bore), v_seed * std::sin(az_bore), 0.0);
             brake_vel_seeded_ = true;
         }
         RCLCPP_INFO(this->get_logger(),
@@ -1386,9 +1400,11 @@ void InterceptorNodeRelativeIMMUKF::control_timer_callback() {
     }
     if (captured_) {
         // Brake-to-hold on the strapdown brake velocity (NOT the estimator v_closing — its
-        // sign is unreliable once the target is behind): nose-up pitch cancels the forward
-        // component, roll cancels the lateral component, tilt-compensated hover thrust holds
-        // altitude. Both angles -> 0 as the velocity -> 0, settling into a level hover.
+        // sign is unreliable once the target is behind): tilt opposite to the residual velocity
+        // in the boresight frame via the two-channel tilt law (the former Euler P-laws
+        // 5*(phi_brake-roll) / 5*(theta_brake-pitch) are its low-pitch limit), heading channel
+        // idle, tilt-compensated hover thrust holds altitude. Both tilts -> 0 as the velocity
+        // -> 0, settling into a level hover. Valid at any attitude (high-pitch captures).
         const double g_hover = g_;
         constexpr double max_brake_tilt = 0.436;   // 25 deg
         Eigen::Vector3d v_brake;
@@ -1396,19 +1412,23 @@ void InterceptorNodeRelativeIMMUKF::control_timer_callback() {
             std::lock_guard<std::mutex> ol(odom_mtx_);
             v_brake = v_own_brake_;
         }
-        const double v_fwd_brake = std::cos(yaw) * v_brake(0) + std::sin(yaw) * v_brake(1);
-        const double v_lat_brake = -std::sin(yaw) * v_brake(0) + std::cos(yaw) * v_brake(1);
-        const double theta_brake = clamp(-0.12 * v_fwd_brake, -max_brake_tilt, max_brake_tilt);
-        const double phi_brake = clamp(0.12 * v_lat_brake, -max_brake_tilt, max_brake_tilt);
-        const double tilt = std::sqrt(roll * roll + pitch * pitch);
+        const double v_fwd_brake = std::cos(az_bore) * v_brake(0) + std::sin(az_bore) * v_brake(1);
+        const double v_lat_brake = -std::sin(az_bore) * v_brake(0) + std::cos(az_bore) * v_brake(1);
+        const double tilt_fwd = clamp(-0.12 * v_fwd_brake, -max_brake_tilt, max_brake_tilt);
+        const double tilt_left = clamp(-0.12 * v_lat_brake, -max_brake_tilt, max_brake_tilt);
+        Eigen::Vector3d z_cmd(std::cos(az_bore) * std::tan(tilt_fwd) - std::sin(az_bore) * std::tan(tilt_left),
+                              std::sin(az_bore) * std::tan(tilt_fwd) + std::cos(az_bore) * std::tan(tilt_left),
+                              1.0);
+        z_cmd.normalize();
+        const Eigen::Vector3d omega = tiltChannelRates(R_b2n, z_cmd, 5.0, 3.0);
         auto cmd = std::make_unique<quadrotor_msgs::msg::ControlCommand>();
         cmd->header.stamp = now;
         cmd->armed = true;
         cmd->control_mode = quadrotor_msgs::msg::ControlCommand::BODY_RATES;
-        cmd->collective_thrust = g_hover / std::max(std::cos(tilt), 0.3);
-        cmd->bodyrates.x = clamp(5.0 * (phi_brake - roll), -3.0, 3.0) * ctrl_coeff_;
-        cmd->bodyrates.y = clamp(5.0 * (theta_brake - pitch), -3.0, 3.0) * ctrl_coeff_;
-        cmd->bodyrates.z = 0.0;
+        cmd->collective_thrust = g_hover / std::max(R_b2n(2, 2), 0.3);
+        cmd->bodyrates.x = omega.x() * ctrl_coeff_;
+        cmd->bodyrates.y = omega.y() * ctrl_coeff_;
+        cmd->bodyrates.z = omega.z() * ctrl_coeff_;
         last_cmd_ = Eigen::Vector3d(cmd->bodyrates.x, cmd->bodyrates.y, cmd->bodyrates.z);
         control_pub_->publish(std::move(cmd));
         return;
@@ -1443,13 +1463,15 @@ void InterceptorNodeRelativeIMMUKF::control_timer_callback() {
             cmd->bodyrates.y = frozen_rate_y_;
             cmd->bodyrates.z = frozen_rate_z_;
         } else {
-            // LEVEL-AND-HOLD: leveling rates + tilt-compensated hover thrust.
+            // LEVEL-AND-HOLD: tilt channel drives the thrust axis to vertical (the former
+            // Euler -3*roll / -3*pitch P-laws, valid at any attitude), heading channel idle,
+            // tilt-compensated hover thrust.
             const double g_hover = g_;
-            const double tilt = std::sqrt(roll * roll + pitch * pitch);
-            cmd->collective_thrust = g_hover / std::max(std::cos(tilt), 0.3);
-            cmd->bodyrates.x = clamp(-3.0 * roll, -3.0, 3.0) * ctrl_coeff_;
-            cmd->bodyrates.y = clamp(-3.0 * pitch, -3.0, 3.0) * ctrl_coeff_;
-            cmd->bodyrates.z = 0.0;
+            const Eigen::Vector3d omega = tiltChannelRates(R_b2n, Eigen::Vector3d::UnitZ(), 3.0, 3.0);
+            cmd->collective_thrust = g_hover / std::max(R_b2n(2, 2), 0.3);
+            cmd->bodyrates.x = omega.x() * ctrl_coeff_;
+            cmd->bodyrates.y = omega.y() * ctrl_coeff_;
+            cmd->bodyrates.z = omega.z() * ctrl_coeff_;
         }
         last_cmd_ = Eigen::Vector3d(cmd->bodyrates.x, cmd->bodyrates.y, cmd->bodyrates.z);
         control_pub_->publish(std::move(cmd));
@@ -1482,12 +1504,25 @@ void InterceptorNodeRelativeIMMUKF::control_timer_callback() {
             (now.seconds() - t_radar) < radar_timeout_ &&
             r_radar.norm() < dither_radar_range_;
     }
-    const auto ctrl = controller_->compute_control(roll, pitch, yaw, cache.r_est, cache.v_est,
-                                                   los_az, cache.los_el, t_rel, axial_speed,
+    const auto ctrl = controller_->compute_control(R_b2n, az_bore, los_az, cache.r_est, cache.v_est,
+                                                   cache.los_el, t_rel, axial_speed,
                                                    cache.bbox_size, v_z, cache.target_speed,
                                                    cache.los_rate, cache.a_own, boresight_el_meas,
                                                    (radar_enable_ && radar_has_rel_ && !vision_delivering(now.seconds())),
                                                    dither_radar_close);
+    {   // TEMP bench-debug (remove): dump guidance drivers during the rig sweep
+        static double last_dbg = -1.0;
+        if (t_rel - last_dbg > 0.5 || last_dbg < 0.0) {
+            last_dbg = t_rel;
+            RCLCPP_INFO(this->get_logger(),
+                "[DBG] t=%.1f ax=%.2f ff=%.2f los_el=%.1f r_est=[%.1f %.1f %.1f] v_est=[%.1f %.1f %.1f] W=%.2f cap=%d",
+                t_rel, axial_speed, target_axial_feedforward_,
+                cache.los_el * 180.0 / M_PI,
+                cache.r_est(0), cache.r_est(1), cache.r_est(2),
+                cache.v_est(0), cache.v_est(1), cache.v_est(2),
+                cache.valid ? estimator_->imm_ukf->x(9) : -1.0, (int)captured_);
+        }
+    }
     if (!std::isfinite(ctrl[0]) || !std::isfinite(ctrl[1]) || !std::isfinite(ctrl[2]) || !std::isfinite(ctrl[3])) {
         RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), THROTTLE_INTERVAL_MS*4,
             "Skipping non-finite control command");
