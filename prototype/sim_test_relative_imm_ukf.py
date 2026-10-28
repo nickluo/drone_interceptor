@@ -760,11 +760,17 @@ class AdvancedHybridController:
         self.enable_fov_clamp = True
         self.mount_pitch = np.deg2rad(MOUNT_PITCH_DEG)
         self.max_body_rate = CTRL_MAX_BODY_RATE
+        self.az_priority_max = np.deg2rad(12.0)   # off-LOS thrust-azimuth bound at 90 deg tilt (pointing priority)
+        self.a_lat_tilt_start = np.deg2rad(65.0)  # lateral-authority attenuation window, in sin(pitch)
+        self.axial_deadband = 1.5                 # m/s, coast band around v_des_eff (mirror C++)
+        self.gimbal_nose_up_max = np.deg2rad(85.0)  # max body nose-up the gimbal can compensate (C20S: 35; 0 = unlimited)
+        self.a_lat_tilt_end = np.deg2rad(85.0)    # ... and end (a_lat -> 0); shallow-pitch banking untouched
         self.terminal_brake_range = CTRL_TERM_BRAKE_RANGE
         self.K_pitch = 1.2
         self.K_roll = 1.0
         self.K_z = CTRL_K_Z
         self.K_zd = CTRL_K_ZD
+        self.a_z_limit = 4.0     # m/s^2 vertical accel clamp (C++ yaml controller.a_z_limit is 12)
         self.K_fwd = 2.0
         self.has_gimbal = True                  # semi-strapdown pitch gimbal: boresight decoupled from theta
         self.gimbal_bias = GIMBAL_BIAS          # boresight elev = -gimbal_bias (down-gaze positive)
@@ -779,12 +785,12 @@ class AdvancedHybridController:
         self.terminal_tilt_range = CTRL_TERMINAL_TILT_RANGE
         self.turn_radius_cap_factor = CTRL_TURN_RADIUS_CAP_FACTOR
         # Attitude-reference slew governor + EMA state (dedicated; axial block reuses last_t/has_last).
-        self.last_phi_cmd = 0.0
-        self.last_theta_cmd = 0.0
+        self.last_tilt_fwd = 0.0
+        self.last_tilt_left = 0.0
         self.last_att_t = -1.0
         self.has_last_att = False
-        self.last_phi_cmd_f = 0.0
-        self.last_theta_cmd_f = 0.0
+        self.last_tilt_fwd_f = 0.0
+        self.last_tilt_left_f = 0.0
         # Vertical-accel slew-limit state (Fix C, mirror C++).
         self.last_a_z = 0.0
         self.last_az_t = -1.0
@@ -827,12 +833,12 @@ class AdvancedHybridController:
         self.last_axial_accel = 0.0
         self.last_t = -1.0
         self.has_last = False
-        self.last_phi_cmd = 0.0
-        self.last_theta_cmd = 0.0
+        self.last_tilt_fwd = 0.0
+        self.last_tilt_left = 0.0
         self.last_att_t = -1.0
         self.has_last_att = False
-        self.last_phi_cmd_f = 0.0
-        self.last_theta_cmd_f = 0.0
+        self.last_tilt_fwd_f = 0.0
+        self.last_tilt_left_f = 0.0
         self.last_a_z = 0.0
         self.last_az_t = -1.0
         self.has_last_az = False
@@ -846,9 +852,16 @@ class AdvancedHybridController:
         self.last_bbox_size = 0.0
         self.last_bbox_t = -1.0
 
-    def compute_control(self, roll, pitch, yaw, r_est, v_est, los_az, los_el, t,
+    def compute_control(self, R_b2n, az_bore, los_az_err, r_est, v_est, los_el, t,
                         v_fwd_body=0.0, bbox_size=0.0, v_z=0.0, los_rate=0.0, target_speed=0.0,
                         a_own_world=None):
+        # Quaternion attitude interface (high-pitch capable): R_b2n replaces Euler roll/pitch/yaw,
+        # az_bore (measured camera boresight azimuth, gimbal-stabilized) replaces the Euler yaw
+        # heading frame, and los_az_err = wrap(az_los - az_bore) replaces the Euler los_az. At low
+        # pitch this is mathematically equivalent to the former Euler P-laws; at pitch -> 90 deg the
+        # axis-angle attitude error re-allocates roll/yaw authority automatically (Euler yaw loses
+        # cos(pitch) of bearing authority there) and has no representation singularity.
+        az_los = np.arctan2(np.sin(az_bore + los_az_err), np.cos(az_bore + los_az_err))
         r_norm = np.linalg.norm(r_est)
         omega_los = np.zeros(3)
         if r_norm > 0.1:
@@ -871,6 +884,22 @@ class AdvancedHybridController:
         # speed — the correct PN proxy — and is available from t=0. Capped by v_pn_ref as before.
         v_pn = min(self.v_des, self.v_pn_ref)
         a_lat_mag = N_eff * v_pn * omega_los_mag
+        # Lateral-authority tilt attenuation: the single-axis pitch gimbal cannot compensate
+        # roll, so banking swings the boresight azimuth by ~sin(tilt) per radian of roll — PN
+        # lateral (which banks) increasingly costs pointing as the tilt deepens. In free flight
+        # PN self-extinguishes (own translation converges the bearing) before deep tilt, so this
+        # is dormant in the validated <=68 deg envelope; on a translation-locked bench the
+        # bearing rate NEVER decays and full lateral authority destabilizes pointing. Attenuate
+        # a_lat smoothly to zero over [a_lat_tilt_start, a_lat_tilt_end] of MEASURED tilt.
+        # sin(pitch) is the roll->boresight-azimuth coupling factor (a roll of phi at nose-down
+        # pitch theta swings the boresight azimuth by ~sin(theta)*phi): 0 at level (roll is pure
+        # image roll), ~1 at the 90 deg dive. Use IT, not the total tilt, so flight banking at
+        # low pitch is untouched while deep-dive pointing is protected.
+        sin_pitch = clamp(-np.asarray(R_b2n)[2, 0], -1.0, 1.0)   # nose-down positive
+        att_lat = clamp((np.sin(self.a_lat_tilt_end) - sin_pitch) /
+                        max(np.sin(self.a_lat_tilt_end) - np.sin(self.a_lat_tilt_start), 1e-6),
+                        0.0, 1.0)
+        a_lat_mag *= att_lat
         # Close-range lateral attenuation (Fix D/F, mirror C++): gently scale a_lat_mag toward
         # lateral_decay_floor over [terminal_brake_range, lat_decay_start] to damp the closed-loop
         # close-approach PN weave (full N + v_des=20 over-corrects; seen as far out as ~26 m in
@@ -932,7 +961,7 @@ class AdvancedHybridController:
         a_atp = clamp(0.02 / self.atp_tc, 0.0, 1.0)
         self.atp_ema += a_atp * (a_t_perp_geom - self.atp_ema)
         if abs(a_t_perp_geom) > self.K_apn_min_at:
-            a_lat_world = a_lat_world + self.K_apn * a_t_perp_geom * e_perp_xy
+            a_lat_world = a_lat_world + self.K_apn * att_lat * a_t_perp_geom * e_perp_xy
         # Flat v_des + single adaptive turn-radius cap (mirror C++): no deliberate terminal brake.
         # The cap keeps min turn radius inside the current range so the interceptor can still bend
         # onto a dodging target. Uses the range-appropriate tilt (terminal tilt inside terminal_tilt_range).
@@ -940,6 +969,10 @@ class AdvancedHybridController:
         moving_floor = (target_speed + 1.5) if target_speed > 1.0 else 3.0  # 3.0 = static-target stall guard
         v_des_eff = max(v_des_eff, min(moving_floor, self.v_des))
         tilt_for_cap = self.max_tilt_terminal_rad if r_norm < self.terminal_tilt_range else self.max_tilt_rad
+        # tan() is negative past 90 deg of tilt (sqrt of a negative): clamp the cap tilt into
+        # the valid turn-radius domain — past 90 deg of bank the "turn radius" concept has
+        # already conceded all maneuverability anyway.
+        tilt_for_cap = min(tilt_for_cap, np.deg2rad(89.0))
         v_des_eff = min(v_des_eff, self.turn_radius_cap_factor * np.sqrt(G * np.tan(tilt_for_cap) * r_norm))
         # v_fwd_body (= v_closing) is under-observable along-LOS until the parallax demod anchors
         # scale (~4s); a low v_closing inflates a_fwd -> ownship over-accelerates ON-AXIS, starving
@@ -955,7 +988,15 @@ class AdvancedHybridController:
         v_perp = abs(r_norm * los_rate)
         floor = 0.88 if abs(self.atp_ema) > 0.5 else (0.82 if v_perp > 1.0 else 0.8)
         v_fwd_for_afwd = max(v_fwd_body, floor * v_des_eff)
-        a_fwd = self.K_fwd * (v_des_eff - v_fwd_for_afwd)
+        # Axial deadband (mirror C++): coast (a_fwd=0) within +-axial_deadband of v_des_eff.
+        # Kills pitch oscillation from v_closing noise — on the bench the monocular scale is
+        # unobservable (no parallax), so v_closing wanders and the deadband keeps the axial
+        # channel from chasing it; shifted by the deadband (no step) outside the band.
+        v_error = v_des_eff - v_fwd_for_afwd
+        if abs(v_error) <= self.axial_deadband:
+            a_fwd = 0.0
+        else:
+            a_fwd = self.K_fwd * (v_error - np.sign(v_error) * self.axial_deadband)
         if self.has_last and t > self.last_t:
             dt = t - self.last_t
             if dt > 0.0 and dt < 1.0:
@@ -968,7 +1009,9 @@ class AdvancedHybridController:
         dz_target = r_est[2]
         # PD on vertical: K_z on position error, K_zd damps pursuer odom v_z so the climb rate
         # built up while dz_target was large is braked before the zero-crossing (mirror C++ fix).
-        a_z = clamp(self.K_z * dz_target - self.K_zd * v_z, -4.0, 4.0)
+        # a_z_limit matches the C++ yaml controller.a_z_limit (12) when overridden for missile-mode
+        # scenarios: d_z = a_z + G < 0 is what lets the thrust vector pass 90 deg of tilt.
+        a_z = clamp(self.K_z * dz_target - self.K_zd * v_z, -self.a_z_limit, self.a_z_limit)
         # Slew limit |da_z/dt| (Fix C, mirror C++): z-estimate can jump O(10 m) in one cycle ->
         # step a_z to +-4 -> pitch step. Ramp it instead.
         if self.has_last_az and t > self.last_az_t:
@@ -980,32 +1023,68 @@ class AdvancedHybridController:
         self.last_az_t = t
         self.has_last_az = True
         a_h_world = a_lat_world + a_fwd_world
-        cy = np.cos(yaw)
-        sy = np.sin(yaw)
-        fx_h = cy * a_h_world[0] + sy * a_h_world[1]
-        fy_h = -sy * a_h_world[0] + cy * a_h_world[1]
-        # Thrust-vector cascade (mirror C++ fix): forward accel -> nose-down pitch.
-        # theta_cmd positive = nose down = forward thrust (FLU body, pitch>0 tilts body-z +x).
-        theta_cmd = clamp(np.arctan2(fx_h, a_z + G), -self.max_tilt_rad, self.max_tilt_rad)
-        # Roll clamp relaxes inside the terminal phase: a maneuvering target needs more bank at
-        # close range. Pitch/FOV keep the conservative max_tilt.
-        max_tilt_roll = self.max_tilt_terminal_rad if r_norm < self.terminal_tilt_range else self.max_tilt_rad
-        phi_cmd = clamp(-np.arctan2(fy_h, a_z + G), -max_tilt_roll, max_tilt_roll)
-        target_behind = abs(los_az) > (M_PI / 2.0)
+        # ---- Thrust-vector cascade (quaternion, high-pitch capable) --------------------------
+        # The desired attitude is built from the desired specific-force direction d = [a_h, a_z+G]
+        # directly: body Z aligns with d, and the body X-Z plane contains the LOS azimuth so the
+        # gimbal-compensated boresight points at the target at ANY pitch. This replaces the former
+        # Euler theta_cmd/phi_cmd + Euler P-laws, whose representation singularity at pitch +-90 deg
+        # and no-wrap P-laws made the >65 deg regime unusable (bench rig / missile-mode dives).
+        target_behind = abs(los_az_err) > (M_PI / 2.0)
+        d = np.array([a_h_world[0], a_h_world[1], a_z + G])
+        # Tilt cap (flight envelope): cap the tilt of d from vertical, preserving the tilt azimuth.
+        # Replaces the separate theta/phi Euler clamps; valid beyond 90 deg (cap > 90 lets the
+        # thrust axis pass horizontal for missile-mode dives). Terminal range relaxes the cap,
+        # mirroring the old max_tilt_terminal roll relaxation.
+        tilt_cap = self.max_tilt_terminal_rad if r_norm < self.terminal_tilt_range else self.max_tilt_rad
+        a_h_mag = float(np.linalg.norm(d[0:2]))
+        if a_h_mag > 1e-9:
+            # Thrust-azimuth pointing budget: a thrust-azimuth deviation delta from the LOS
+            # swings the boresight azimuth by ~sin(pitch)*delta (the roll coupling above), so the
+            # affordable deviation is the remaining keep-in-frame margin divided by that coupling.
+            # At level pitch sin->0 and the budget is unbounded (flight banking untouched); at the
+            # 90 deg dive the boresight ~ the thrust axis and the budget collapses onto the LOS —
+            # exactly where pointing must be authoritative (bench: the bearing rate never
+            # self-extinguishes, and a wandering thrust azimuth walks the target out of frame).
+            tilt_raw = np.arctan2(a_h_mag, d[2])
+            az_ah = np.arctan2(a_h_world[1], a_h_world[0])
+            d_az = np.arctan2(np.sin(az_ah - az_los), np.cos(az_ah - az_los))
+            fov_az_budget = self.fov_half_h * self.fov_keep_margin - abs(los_az_err)
+            if fov_az_budget > 0.0 and sin_pitch > 0.15:
+                d_az_max = min(np.pi, fov_az_budget / max(sin_pitch, 0.15))
+            else:
+                d_az_max = np.pi
+            if abs(d_az) > d_az_max:
+                d_az = clamp(d_az, -d_az_max, d_az_max)
+                a_h_world = a_h_mag * np.array([np.cos(az_los + d_az), np.sin(az_los + d_az)])
+                d[0:2] = a_h_world
+            if tilt_raw > tilt_cap:
+                s_xy = d[0:2] / a_h_mag
+                d = np.array([np.sin(tilt_cap) * s_xy[0], np.sin(tilt_cap) * s_xy[1], np.cos(tilt_cap)])
+        # Decompose the tilt in the boresight-azimuth frame: (tilt_fwd, tilt_left) are the exact
+        # former theta_cmd / -phi_cmd at low tilt, and stay well-defined to +-180 deg.
+        fwd_h = np.array([np.cos(az_bore), np.sin(az_bore)])
+        left_h = np.array([-np.sin(az_bore), np.cos(az_bore)])
+        tilt_fwd = np.arctan2(float(np.dot(d[0:2], fwd_h)), d[2])
+        tilt_left = np.arctan2(float(np.dot(d[0:2], left_h)), d[2])
+        # Nose-up cap from the gimbal's up-travel: the semi-strapdown servo can only compensate
+        # so much nose-up body pitch (servo_cmd = -pitch + bias saturates at the mechanical max);
+        # braking harder nose-up than that drops the boresight below the target.
+        if self.has_gimbal and self.gimbal_nose_up_max > 0.0:
+            tilt_fwd = max(tilt_fwd, -(self.gimbal_nose_up_max - self.gimbal_bias))
         if self.enable_fov_clamp and not self.has_gimbal and not target_behind:
-            # Fixed-mount only: boresight elev = theta + mount_pitch, so clamp theta to keep the
-            # target within fov_keep vertically. With the semi-strapdown gimbal the boresight is
-            # DECOUPLED from body pitch (gimbal cancels it, elev ~= -GIMBAL_BIAS), so this clamp is
-            # geometry-stale and only throttles pitch authority — skip it (has_gimbal=True).
+            # Fixed-mount only: boresight elev = theta + mount_pitch, so clamp the forward tilt to
+            # keep the target within fov_keep vertically. With the semi-strapdown gimbal the
+            # boresight is DECOUPLED from body pitch (gimbal cancels it, elev ~= -GIMBAL_BIAS), so
+            # this clamp is geometry-stale and only throttles pitch authority — skip it (gimbal).
             fov_keep = self.fov_half_v * self.fov_keep_margin
             theta_hi = min(self.max_tilt_rad, los_el - self.mount_pitch + fov_keep)
             theta_lo = max(-self.max_tilt_rad, los_el - self.mount_pitch - fov_keep)
-            theta_cmd = clamp(theta_cmd, min(theta_lo, theta_hi), max(theta_lo, theta_hi))
+            tilt_fwd = clamp(tilt_fwd, min(theta_lo, theta_hi), max(theta_lo, theta_hi))
         elif self.enable_fov_clamp and self.has_gimbal and not target_behind:
             # Gimbal vertical keep-in-frame: pitch cannot move the boresight, ALTITUDE can. If the
             # target approaches the bottom edge (los_el << boresight elev = -gimbal bias), command
             # a descent so the frame re-centers; symmetric for the top edge. Overrides the PD a_z
-            # only near the edge (outer 30% of the half-FOV).
+            # only near the edge (outer 30% of the half-FOV). Affects only the throttle below.
             fov_keep = self.fov_half_v * self.fov_keep_margin
             boresight_el = -self.gimbal_bias
             el_err = los_el - boresight_el          # negative = target below boresight
@@ -1014,36 +1093,64 @@ class AdvancedHybridController:
                 a_z = min(a_z, -2.0 * clamp((-el_err - edge) / max(fov_keep - edge, 1e-3), 0.0, 1.0) * 4.0)
             elif el_err > edge:
                 a_z = max(a_z, 2.0 * clamp((el_err - edge) / max(fov_keep - edge, 1e-3), 0.0, 1.0) * 4.0)
-        # Attitude-reference EMA low-pass (iter 2): suppress camera-rate content / roll limit-cycle.
+        # Attitude-reference EMA low-pass (iter 2): suppress camera-rate content / roll
+        # limit-cycle. Applied to the tilt components — identical to the former phi/theta_cmd EMA
+        # at low tilt, still well-defined at high tilt.
         if self.has_last_att and self.att_ref_tc > 1e-6:
             dt_att = t - self.last_att_t
             if 0.0 < dt_att < 1.0:
                 a_ref = clamp(dt_att / self.att_ref_tc, 0.0, 1.0)
-                phi_cmd = self.last_phi_cmd_f + a_ref * (phi_cmd - self.last_phi_cmd_f)
-                theta_cmd = self.last_theta_cmd_f + a_ref * (theta_cmd - self.last_theta_cmd_f)
-        self.last_phi_cmd_f = phi_cmd
-        self.last_theta_cmd_f = theta_cmd
-        # Attitude-reference slew governor (iter 1): hard cap on |d(phi/theta)_cmd/dt|.
+                tilt_fwd = self.last_tilt_fwd_f + a_ref * (tilt_fwd - self.last_tilt_fwd_f)
+                tilt_left = self.last_tilt_left_f + a_ref * (tilt_left - self.last_tilt_left_f)
+        self.last_tilt_fwd_f = tilt_fwd
+        self.last_tilt_left_f = tilt_left
+        # Attitude-reference slew governor (iter 1): hard cap on |d(tilt)_cmd/dt|.
         if self.has_last_att:
             dt_att = t - self.last_att_t
             if 0.0 < dt_att < 1.0:
-                max_dphi = self.max_att_rate * dt_att
-                phi_cmd = clamp(phi_cmd, self.last_phi_cmd - max_dphi, self.last_phi_cmd + max_dphi)
-                theta_cmd = clamp(theta_cmd, self.last_theta_cmd - max_dphi, self.last_theta_cmd + max_dphi)
-        self.last_phi_cmd = phi_cmd
-        self.last_theta_cmd = theta_cmd
+                max_dtilt = self.max_att_rate * dt_att
+                tilt_fwd = clamp(tilt_fwd, self.last_tilt_fwd - max_dtilt, self.last_tilt_fwd + max_dtilt)
+                tilt_left = clamp(tilt_left, self.last_tilt_left - max_dtilt, self.last_tilt_left + max_dtilt)
+        self.last_tilt_fwd = tilt_fwd
+        self.last_tilt_left = tilt_left
         self.last_att_t = t
         self.has_last_att = True
-        # Throttle from the ACTUAL attitude, not the commanded tilt: during a hard brake the
-        # attitude lags theta_cmd, and (a_z+G)/cos(theta_cmd) then over-thrusts vertically ->
-        # brake-climb -> target exits the bottom of the (gimbal-horizontal) frame at 5-7 m.
-        # T*cos(actual tilt) = a_z + G  =>  vertical accel tracks a_z regardless of the lag.
-        cos_tilt_actual = max(np.cos(roll) * np.cos(pitch), np.cos(self.max_tilt_rad + 0.2))
+        # Rebuild the desired body Z (thrust axis) from the shaped tilts, then command rates via
+        # the TWO-CHANNEL decomposition (tailsitter-transition style):
+        #   heading channel: rotation about the world vertical — moves the camera plane (and so
+        #     the gimbal-compensated boresight) onto the LOS azimuth; never disturbs the thrust
+        #     axis' tilt geometry.
+        #   tilt channel: rotation about the axis perpendicular to the boresight plane taking
+        #     z_meas onto z_cmd — tilts the thrust WITHIN the plane; never rotates the plane, so
+        #     it never moves the boresight (below the 90 deg degeneracy where they merge).
+        # At low pitch this reproduces the former Euler P-laws term by term (omega_x ~ K_att*roll
+        # err, omega_y ~ K_att*pitch err, omega_z ~ K_yaw*los_az); at high pitch it stays
+        # decoupled and non-singular where the Euler interface (and a single shortest-rotation
+        # attitude error, which routes tilt corrections through plane rotations) fell apart.
+        z_cmd = np.array([fwd_h[0] * np.tan(tilt_fwd) + left_h[0] * np.tan(tilt_left),
+                          fwd_h[1] * np.tan(tilt_fwd) + left_h[1] * np.tan(tilt_left), 1.0])
+        z_cmd /= max(np.linalg.norm(z_cmd), 1e-9)
+        z_meas = np.asarray(R_b2n)[:, 2]
+        cr = np.cross(z_meas, z_cmd)
+        crn = np.linalg.norm(cr)
+        if crn > 1e-9:
+            theta_t = np.arctan2(crn, float(np.dot(z_meas, z_cmd)))
+            omega_tilt_world = (self.K_att * theta_t) * (cr / crn)
+        else:
+            omega_tilt_world = np.zeros(3)
+        omega_world = omega_tilt_world.copy()
+        omega_world[2] += self.K_yaw * los_az_err
+        omega_body = np.asarray(R_b2n).T @ omega_world
+        omega = np.array([clamp(omega_body[0], -self.max_body_rate, self.max_body_rate),
+                          clamp(omega_body[1], -self.max_body_rate, self.max_body_rate),
+                          clamp(omega_body[2], -self.max_body_rate, self.max_body_rate)])
+        # Throttle from the ACTUAL attitude (mirror C++ fix): T*cos(actual tilt) = a_z + G so the
+        # vertical accel tracks a_z regardless of attitude lag. R[2,2] = cos(actual tilt) with no
+        # Euler extraction; the floor follows the tilt cap (cos(cap+0.2)) so an over-tilted body
+        # cannot blow the throttle up, floored at 0.25 for caps beyond 90 deg.
+        cos_tilt_actual = max(R_b2n[2, 2], max(np.cos(self.max_tilt_rad + 0.2), 0.25))
         throttle = clamp((a_z + G) / cos_tilt_actual, 2.0, 25.0)
-        omega_x = clamp(self.K_att * (phi_cmd - roll), -self.max_body_rate, self.max_body_rate)
-        omega_y = clamp(self.K_att * (theta_cmd - pitch), -self.max_body_rate, self.max_body_rate)
-        omega_z = clamp(self.K_yaw * los_az, -self.max_body_rate, self.max_body_rate)
-        return np.array([throttle, omega_x, omega_y, omega_z])
+        return np.array([throttle, omega[0], omega[1], omega[2]])
 
 
 # ============================================================================
@@ -1078,6 +1185,126 @@ def R_to_euler(R):
     return roll, pitch, yaw
 
 
+def R_from_thrust_heading(z_b, az_ref, R_meas, eps=0.25):
+    """Desired body->world attitude from a desired thrust-axis direction and a heading reference.
+
+    Body Z aligns with z_b (unit, desired specific-force direction); the body X-Z plane contains
+    the horizontal reference direction az_ref (the LOS azimuth), so the gimbal-compensated camera
+    boresight — which always lies in the X-Z plane — points at the target azimuth at ANY pitch.
+    Degenerate when z_b is parallel to the reference direction (pitch ~90 deg with the thrust axis
+    along the LOS): the X-Z plane then trivially contains the reference and roll about Z is a free
+    DOF; blend toward holding the current roll (measured body Y projected perpendicular to z_b) so
+    the command stays continuous and the image does not churn.
+    """
+    z_b = np.asarray(z_b, dtype=float)
+    zn = np.linalg.norm(z_b)
+    if not np.isfinite(zn) or zn < 1e-9:
+        return np.asarray(R_meas, dtype=float).copy()
+    z_b = z_b / zn
+    h = np.array([np.cos(az_ref), np.sin(az_ref), 0.0])
+    y_c = np.cross(z_b, h)
+    w = float(np.linalg.norm(y_c))
+    if w >= eps:
+        y_b = y_c / w
+    else:
+        # hold-current-roll fallback: measured body Y (world), projected perpendicular to z_b
+        y_meas = np.asarray(R_meas, dtype=float)[:, 1]
+        y_hold = y_meas - np.dot(y_meas, z_b) * z_b
+        nh = np.linalg.norm(y_hold)
+        if nh < 1e-6:
+            # extreme fallback: any vector perpendicular to z_b
+            tmp = np.cross(z_b, np.array([0.0, 0.0, 1.0]))
+            y_hold = tmp if np.linalg.norm(tmp) > 1e-6 else np.array([1.0, 0.0, 0.0])
+            nh = np.linalg.norm(y_hold)
+        y_hold = y_hold / nh
+        if w > 1e-9:
+            y_b = (w / eps) * (y_c / w) + (1.0 - w / eps) * y_hold
+            y_b = y_b / np.linalg.norm(y_b)
+        else:
+            y_b = y_hold
+    x_b = np.cross(y_b, z_b)
+    R = np.column_stack([x_b, y_b, z_b])
+    # re-orthonormalize (blend path can be slightly off); guarantee det=+1
+    U, _, Vt = np.linalg.svd(R)
+    R = U @ Vt
+    if np.linalg.det(R) < 0.0:
+        U = U.copy()
+        U[:, 2] = -U[:, 2]
+        R = U @ Vt
+    return R
+
+
+def attitude_error_rates(R_meas, R_cmd, kx, ky, kz, max_rate):
+    """Body-rate command from the attitude error R_err = R_meas^T @ R_cmd via axis-angle.
+
+    The axis-angle error is the shortest rotation taking the measured attitude to the command,
+    expressed in BODY axes, so the per-axis gains reproduce the former Euler P-laws at low pitch
+    (err_x~roll err, err_y~pitch err, err_z~yaw err) while remaining valid at any attitude —
+    no Euler extraction, no representation singularity at pitch +-90 deg, no wrap jumps.
+    """
+    R_err = np.asarray(R_meas, dtype=float).T @ np.asarray(R_cmd, dtype=float)
+    tr = np.clip((np.trace(R_err) - 1.0) / 2.0, -1.0, 1.0)
+    angle = float(np.arccos(tr))
+    if angle < 1e-9:
+        return np.zeros(3)
+    if np.pi - angle < 1e-6:
+        # near-180 deg: axis from the symmetric part of R_err
+        A = (R_err + np.eye(3)) / 2.0
+        i = int(np.argmax(np.diag(A)))
+        axis = np.zeros(3)
+        axis[i] = 1.0
+        v = A[:, i]
+        nv = np.linalg.norm(v)
+        if nv > 1e-9:
+            axis = v / nv
+    else:
+        axis = np.array([R_err[2, 1] - R_err[1, 2],
+                         R_err[0, 2] - R_err[2, 0],
+                         R_err[1, 0] - R_err[0, 1]]) / (2.0 * np.sin(angle))
+    err = angle * axis
+    return np.array([clamp(kx * err[0], -max_rate, max_rate),
+                     clamp(ky * err[1], -max_rate, max_rate),
+                     clamp(kz * err[2], -max_rate, max_rate)])
+
+
+def tilt_channel_rates(R_b2n, z_cmd, k_tilt, max_rate):
+    """Tilt-channel body rates: rotate the thrust axis z_meas onto z_cmd about the axis
+    perpendicular to both (in the boresight plane at low tilt), WITHOUT any heading/rotated-plane
+    component — the two-channel decomposition's tilt half. Non-singular at any attitude."""
+    R = np.asarray(R_b2n, dtype=float)
+    z_meas = R[:, 2]
+    cr = np.cross(z_meas, np.asarray(z_cmd, dtype=float))
+    crn = np.linalg.norm(cr)
+    if crn > 1e-9:
+        w = (k_tilt * float(np.arctan2(crn, float(np.dot(z_meas, z_cmd))))) * (cr / crn)
+    else:
+        w = np.zeros(3)
+    wb = R.T @ w
+    return np.array([clamp(wb[0], -max_rate, max_rate),
+                     clamp(wb[1], -max_rate, max_rate),
+                     clamp(wb[2], -max_rate, max_rate)])
+
+
+def boresight_azimuth(R_b2n, R_n2c=None):
+    """Camera boresight azimuth in the world frame. Prefers the actual gimbal pose (R_n2c:
+    nav->camera; boresight = camera +Z) — non-singular at any body pitch since the semi-strapdown
+    gimbal keeps the boresight near horizontal. Without a gimbal, falls back to the body forward
+    axis, blending toward the body up (thrust) axis as the forward axis goes vertical (the
+    pitch-90 Euler heading degeneracy)."""
+    if R_n2c is not None:
+        b = np.asarray(R_n2c, dtype=float)[2, :]          # camera +Z in world
+        bxy = np.linalg.norm(b[0:2])
+        if bxy > 0.1:
+            return float(np.arctan2(b[1], b[0]))
+    R = np.asarray(R_b2n, dtype=float)
+    bx = R[:, 0]                                          # body forward in world
+    wx = float(np.linalg.norm(bx[0:2]))
+    if wx > 0.2:
+        return float(np.arctan2(bx[1], bx[0]))
+    bz = R[:, 2]                                          # body up/thrust in world
+    return float(np.arctan2(bz[1], bz[0]))
+
+
 @dataclass
 class QuadrotorState:
     pos: np.ndarray = field(default_factory=lambda: np.zeros(3))
@@ -1109,6 +1336,31 @@ def step_quadrotor(state, throttle, omega_cmd, dt, rate_tau=0.05):
     state.vel = state.vel + a_world * dt
     state.pos = state.pos + state.vel * dt
     return a_world
+
+
+def step_rig(state, omega_cmd, dt, r_imu, rate_tau=0.05):
+    """3-axis free-attitude test bench: translation LOCKED, rotation free (first-order rate
+    tracking like step_quadrotor). Returns the accelerometer artifact the IMU strapdown sees at an
+    IMU offset r_imu (body frame) from the rig rotation center:
+        a_meas_world = R * (alpha x r + omega x (omega x r)).
+    Thrust is absorbed by the rig structure (a proper accelerometer never sees constraint forces —
+    at the rotation center it reads pure gravity, indistinguishable from a hover), and gravity is
+    removed by the strapdown, so the TRUE ownship linear accel is 0 and these artifacts are the
+    entire strapdown input: the own_vel drift they cause is what the bench measures."""
+    omega_prev = state.omega.copy()
+    state.omega = state.omega + (np.asarray(omega_cmd, dtype=float) - state.omega) * (dt / rate_tau)
+    w = state.omega * dt
+    angle = np.linalg.norm(w)
+    if angle > 1e-9:
+        axis = w / angle
+        dR = np.eye(3) + np.sin(angle) * skew(axis) + (1.0 - np.cos(angle)) * skew(axis) @ skew(axis)
+        state.R_b2n = state.R_b2n @ dR
+        U, _, Vt = np.linalg.svd(state.R_b2n)
+        state.R_b2n = U @ Vt
+    alpha = (state.omega - omega_prev) / dt
+    r = np.asarray(r_imu, dtype=float)
+    a_body = np.cross(alpha, r) + np.cross(state.omega, np.cross(state.omega, r))
+    return state.R_b2n @ a_body
 
 
 def update_gimbal(state, dt, tau):
@@ -1181,14 +1433,25 @@ class ScenarioResult:
     nan_count: int
     sim_time: float
     single_pass: bool = True      # False if the range reopened before intercept (multi-pass)
+    captured: bool = False        # capture latch fired (brake-to-hold)
     notes: str = ""
 
 
 def run_scenario(name, target_init_pos, target_vel_fn, uav_init_pos, uav_init_yaw,
                  sim_time=20.0, dt_ctrl=1.0/CONTROL_RATE, dt_cam=DT_CAM,
                  bbox_dropout_steps=None, bad_size_steps=None, noise_pos=1.5, noise_size=2.0,
-                 target_width_true=1.5, intercept_range=1.0, seed=42, v_des_override=None):
-    """Run one interception scenario. Returns ScenarioResult + log arrays."""
+                 target_width_true=1.5, intercept_range=1.0, seed=42, v_des_override=None,
+                 rig_mode=False, r_imu=None, rig_vib=0.0, max_tilt_override=None,
+                 az_limit_override=None, dither_amp_override=None, uav_init_pitch_deg=0.0):
+    """Run one interception scenario. Returns ScenarioResult + log arrays.
+
+    rig_mode: emulate the 3-axis free-attitude test bench — translation LOCKED, rotation free.
+    The IMU strapdown then sees only the rotational artifacts at r_imu (body frame, offset from
+    the rig rotation center) plus optional vibration rig_vib (m/s^2 std); intercept metrics are
+    meaningless (use the boresight/pitch/roll logs in the rig report instead).
+    max_tilt_override: deg — raise the thrust tilt cap beyond the flight default (missile-mode
+    dives / the bench operating point near pitch 90).
+    """
     np.random.seed(seed)
     estimator = RelativeIMMUKFEstimator(dt_cam, FOCAL_LENGTH, W_GUESS, R_B2C)
     controller = AdvancedHybridController()
@@ -1196,12 +1459,21 @@ def run_scenario(name, target_init_pos, target_vel_fn, uav_init_pos, uav_init_ya
     r_est_xy_lp = None    # lowpass r_est horizontal -> dither-free LOS reference for the demod axis
     if v_des_override is not None:
         controller.v_des = v_des_override   # exercise the iter-3 terminal-authority path at high speed
+    if max_tilt_override is not None:
+        controller.max_tilt_rad = np.deg2rad(max_tilt_override)
+        controller.max_tilt_terminal_rad = np.deg2rad(max_tilt_override)
+    if az_limit_override is not None:
+        controller.a_z_limit = az_limit_override
+    if dither_amp_override is not None:
+        controller.dither_amp = dither_amp_override
+    if r_imu is None:
+        r_imu = np.array([0.08, 0.0, -0.06])
     fov_half = np.deg2rad(CAM_FOV_DEG / 2.0)
 
     # UAV state
     uav = QuadrotorState()
     uav.pos = np.array(uav_init_pos, dtype=float)
-    uav.R_b2n = euler_to_R(0.0, 0.0, uav_init_yaw)
+    uav.R_b2n = euler_to_R(0.0, np.deg2rad(uav_init_pitch_deg), uav_init_yaw)
 
     target_pos = np.array(target_init_pos, dtype=float)
     target_vel = np.array(target_vel_fn(0.0), dtype=float)
@@ -1222,7 +1494,8 @@ def run_scenario(name, target_init_pos, target_vel_fn, uav_init_pos, uav_init_ya
     cam_step = max(1, int(round(dt_cam / dt_ctrl)))
     log = {'t': [], 'range': [], 'los_rate': [], 'est_pos_err': [], 'est_vel_err': [],
            'est_w_err': [], 'mu': [], 'uav_pos': [], 'tgt_pos': [], 'est_pos': [], 'est_vel': [], 'est_acc': [],
-           'cmd': [], 'nan': 0}
+           'cmd': [], 'nan': 0, 'pitch': [], 'roll': [], 'az_err': [], 'own_vel': []}
+    own_vel_int = np.zeros(3)      # strapdown own_vel mirror (bench drift metric)
     min_range = 1e9
     nan_count = 0
     intercepted = False
@@ -1361,19 +1634,21 @@ def run_scenario(name, target_init_pos, target_vel_fn, uav_init_pos, uav_init_ya
         # control at control rate
         if cache is not None:
             r_est, v_est, los_az_world, los_el, bbox_size, t_cache, los_rate = cache
-            roll, pitch, yaw = R_to_euler(uav.R_b2n)
+            # Quaternion attitude interface: boresight azimuth from the actual (lagged) gimbal pose
+            # — a non-singular heading reference at any body pitch — and the bearing error relative
+            # to it (replaces los_az_world - euler_yaw, which degenerates at pitch +-90).
+            az_bore = boresight_azimuth(uav.R_b2n, R_n2c=R_B2C @ uav.R_b2n.T)
+            los_az_err = np.arctan2(np.sin(los_az_world - az_bore), np.cos(los_az_world - az_bore))
             # Closing speed along LOS from relative quantities only (no ownship vel):
             # v_closing = -d|r|/dt = -v_rel·r̂  (positive = approaching). Replaces odom v_fwd_body.
             v_closing = -np.dot(v_est, r_est) / max(np.linalg.norm(r_est), 1e-3)
-            los_az = los_az_world - yaw
-            los_az = np.arctan2(np.sin(los_az), np.cos(los_az))
             # Capture lockout (mirror C++): once intercepted, BRAKE-TO-HOLD to end of mission. The
             # close approach happens during a bbox dropout when the range estimate is biased, so trigger
             # on EITHER r_est<capture_range OR target-behind (|los_az|>90°) after being close — the
             # latter is the reliable overshoot signal. Then brake-to-hold (nose-up pitch cancels
             # forward speed; pure zero-rate hover sinks on a banked body and never stops a drag-free
             # body). Stops the post-intercept fly-away.
-            overshot = abs(los_az) > (np.pi / 2.0)
+            overshot = abs(los_az_err) > (np.pi / 2.0)
             r_norm = np.linalg.norm(r_est)
             min_range_seen = min(min_range_seen, r_norm)
             range_reopened = has_frozen_cmd and min_range_seen < 15.0 and r_norm > min_range_seen + 8.0
@@ -1382,13 +1657,16 @@ def run_scenario(name, target_init_pos, target_vel_fn, uav_init_pos, uav_init_ya
                                  range_reopened):
                 captured = True
             if captured:
+                # Brake-to-hold via the two-channel interface: tilt opposite the residual closing
+                # speed within the boresight plane, heading channel idle (the old Euler P-laws
+                # -3*roll / 5*(theta_brake-pitch) are this channel's low-pitch limit).
                 max_brake_tilt = np.deg2rad(25.0)
-                theta_brake = clamp(-0.12 * v_closing, -max_brake_tilt, max_brake_tilt)
-                tilt = np.sqrt(roll * roll + pitch * pitch)
-                ctrl = np.array([G / max(np.cos(tilt), 0.3),
-                                 clamp(-3.0 * roll, -3.0, 3.0),
-                                 clamp(5.0 * (theta_brake - pitch), -3.0, 3.0),
-                                 0.0])
+                tilt_fwd = clamp(-0.12 * v_closing, -max_brake_tilt, max_brake_tilt)
+                z_cmd = np.array([np.cos(az_bore) * np.tan(tilt_fwd),
+                                  np.sin(az_bore) * np.tan(tilt_fwd), 1.0])
+                z_cmd = z_cmd / np.linalg.norm(z_cmd)
+                omega = tilt_channel_rates(uav.R_b2n, z_cmd, 5.0, 3.0)
+                ctrl = np.array([G / max(uav.R_b2n[2, 2], 0.3), omega[0], omega[1], omega[2]])
             else:
                 # Terminal coast-on-dropout (mirror C++): if the bbox dropped inside the terminal phase,
                 # COAST (freeze last good cmd) for coast_max_dur to let the detector reacquire; past
@@ -1400,11 +1678,10 @@ def run_scenario(name, target_init_pos, target_vel_fn, uav_init_pos, uav_init_ya
                 if terminal_dropout and dropout_age < coast_max_dur:
                     ctrl = frozen_cmd.copy()   # COAST: last good (matched-speed) cmd — correct thrust, no sink
                 elif terminal_dropout:
-                    tilt = np.sqrt(roll * roll + pitch * pitch)
-                    ctrl = np.array([G / max(np.cos(tilt), 0.3),
-                                     clamp(-3.0 * roll, -3.0, 3.0),
-                                     clamp(-3.0 * pitch, -3.0, 3.0),
-                                     0.0])
+                    # LEVEL-AND-HOLD via the tilt channel: drive the thrust axis to vertical,
+                    # heading channel idle (old Euler -3*roll / -3*pitch P-laws, high-pitch valid).
+                    omega = tilt_channel_rates(uav.R_b2n, np.array([0.0, 0.0, 1.0]), 3.0, 3.0)
+                    ctrl = np.array([G / max(uav.R_b2n[2, 2], 0.3), omega[0], omega[1], omega[2]])
                 else:
                     # Relative-speed proxy drives the speed-aware brake floor (ownship absolute
                     # speed unobservable without odom). v_z ownship vertical speed ≈ -v_rel[2]
@@ -1415,9 +1692,9 @@ def run_scenario(name, target_init_pos, target_vel_fn, uav_init_pos, uav_init_ya
                     v_transverse = abs(r_est[0] * v_est[1] - r_est[1] * v_est[0]) / r_xy if r_xy > 1e-3 else 0.0
                     target_speed = clamp(v_transverse, 0.0, 15.0)
                     a_own_world = last_dv_own / max(dt_cam, 1e-3)   # ownship world accel (geometric-APN a_own_perp)
-                    raw_ctrl = controller.compute_control(roll, pitch, yaw, r_est, v_est, los_az, los_el,
-                                                          t, v_closing, bbox_size, -v_est[2], los_rate,
-                                                          target_speed, a_own_world=a_own_world)
+                    raw_ctrl = controller.compute_control(uav.R_b2n, az_bore, los_az_err, r_est, v_est,
+                                                          los_el, t, v_closing, bbox_size, -v_est[2],
+                                                          los_rate, target_speed, a_own_world=a_own_world)
                     if not np.all(np.isfinite(raw_ctrl)):
                         nan_count += 1
                         raw_ctrl = np.array([G, 0, 0, 0])
@@ -1430,14 +1707,20 @@ def run_scenario(name, target_init_pos, target_vel_fn, uav_init_pos, uav_init_ya
                         last_good_range = np.linalg.norm(r_est)
                         frozen_cmd = ctrl.copy()
                         has_frozen_cmd = True
-            a_world_step = step_quadrotor(uav, ctrl[0], ctrl[1:4], dt_ctrl)
+            if rig_mode:
+                a_world_step = step_rig(uav, ctrl[1:4], dt_ctrl, r_imu)
+                if rig_vib > 0.0:
+                    a_world_step = a_world_step + np.random.normal(0.0, rig_vib, 3)
+            else:
+                a_world_step = step_quadrotor(uav, ctrl[0], ctrl[1:4], dt_ctrl)
             dv_own_accum += a_world_step * dt_ctrl    # accumulate ownship Δv for next camera window
+            own_vel_int += a_world_step * dt_ctrl     # always-on strapdown own_vel mirror
 
         # range + LOS rate
         rel = target_pos - uav.pos
         range_now = np.linalg.norm(rel)
         min_range = min(min_range, range_now)
-        if range_now < intercept_range and not intercepted:
+        if range_now < intercept_range and not intercepted and not rig_mode:
             intercepted = True
             intercept_t = t
         if np.linalg.norm(rel) > 0.1 and np.linalg.norm(uav.vel) > 0.1:
@@ -1449,6 +1732,17 @@ def run_scenario(name, target_init_pos, target_vel_fn, uav_init_pos, uav_init_ya
         log['t'].append(t)
         log['range'].append(range_now)
         log['los_rate'].append(los_rate)
+        _roll_log, _pitch_log, _ = R_to_euler(uav.R_b2n)
+        log['pitch'].append(np.rad2deg(_pitch_log))
+        log['roll'].append(np.rad2deg(_roll_log))
+        _az_bore_log = boresight_azimuth(uav.R_b2n, R_n2c=R_B2C @ uav.R_b2n.T)
+        if np.linalg.norm(rel[0:2]) > 1e-6:
+            _az_tgt = np.arctan2(rel[1], rel[0])
+            log['az_err'].append(np.rad2deg(np.arctan2(np.sin(_az_tgt - _az_bore_log),
+                                                       np.cos(_az_tgt - _az_bore_log))))
+        else:
+            log['az_err'].append(np.nan)
+        log['own_vel'].append(float(np.linalg.norm(own_vel_int)))
         log['uav_pos'].append(uav.pos.copy())
         log['tgt_pos'].append(target_pos.copy())
         if estimator.initialized:
@@ -1474,7 +1768,7 @@ def run_scenario(name, target_init_pos, target_vel_fn, uav_init_pos, uav_init_ya
             log['mu'].append(np.array([np.nan]*3))
         log['cmd'].append(prev_rate.copy())
 
-        if intercepted:
+        if intercepted and not rig_mode:
             break
 
     # finalize
@@ -1502,7 +1796,7 @@ def run_scenario(name, target_init_pos, target_vel_fn, uav_init_pos, uav_init_ya
         est_vel_err_final=est_vel_err_final, est_width_err_final=est_w_err_final,
         max_los_rate=max_los_rate, final_los_rate=final_los_rate,
         nan_count=nan_count, sim_time=log['t'][-1] if log['t'] else 0.0,
-        single_pass=single_pass, notes=notes)
+        single_pass=single_pass, captured=captured, notes=notes)
     return result, log
 
 
@@ -1621,6 +1915,66 @@ def main():
         v_des_override=CTRL_V_DES*2)
     scenarios.append(r7)
 
+    # --- Scenario 8: Missile-mode steep dive (quaternion attitude layer, tilt cap 95 deg) --------
+    # Target below-and-ahead: the axial channel rails, the thrust vector pitches past the old 45-65
+    # deg Euler envelope toward ~75-85 deg. Pass = intercept with the quaternion attitude layer
+    # holding the camera on target through the dive (the former Euler P-laws are singular past 90).
+    print("[8] Missile-mode steep dive (tilt cap 95 deg, target below-ahead)...")
+    r8, l8 = run_scenario(
+        "dive_missile",
+        target_init_pos=[30.0, 0.0, -6.0],
+        target_vel_fn=lambda t: [0.0, 0.0, 0.0],
+        uav_init_pos=[0.0, 0.0, 8.0],
+        uav_init_yaw=0.0,
+        sim_time=12.0,
+        v_des_override=CTRL_V_DES,
+        max_tilt_override=95.0, az_limit_override=12.0)
+    scenarios.append(r8)
+
+    # --- Bench (rig) scenarios: 3-axis free-attitude stand, translation LOCKED ------------------
+    # These characterize the bench operating envelope, not intercept: metrics are boresight
+    # tracking error, pitch achieved, roll bounds, strapdown own-vel drift from the rig rotation
+    # artifacts, and stability (no NaN / no runaway rates).
+    rig_results = []
+
+    # [R1] Bench at the 90 deg operating point: rig pre-positioned at 60 deg pitch, target 10 m
+    # ahead and 4 m BELOW the rotation center — the descent channel drives d_z = a_z+G < 0, so the
+    # commanded thrust tilt passes 90 deg (the missile-mode geometry) while PN/heading keeps the
+    # boresight on the laterally sweeping target through the old Euler interface's singularity.
+    print("[R1] Rig @90deg operating point (target below), laterally sweeping target...")
+    def rig1_vel(t):
+        y = 3.5 * np.sin(2.0 * np.pi * 0.1 * t)
+        return [0.0, y, 0.0]
+    rr1, lr1 = run_scenario(
+        "rig_90_sweep",
+        target_init_pos=[10.0, 0.0, -4.0],
+        target_vel_fn=rig1_vel,
+        uav_init_pos=[0.0, 0.0, 0.0],
+        uav_init_yaw=0.0,
+        sim_time=20.0,
+        v_des_override=CTRL_V_DES,
+        rig_mode=True, max_tilt_override=95.0, az_limit_override=12.0, dither_amp_override=0.0,
+        uav_init_pitch_deg=60.0)
+    rig_results.append(rr1)
+
+    # [R2] Bench pitch sweep: target starts near-level ahead and descends, sweeping the commanded
+    # pitch from ~30 deg through the 90 deg operating point (validates continuity of the blend /
+    # degeneracy handling across the whole bench envelope).
+    print("[R2] Rig pitch sweep 30->90+ deg (descending target)...")
+    def rig2_vel(t):
+        return [0.0, 0.0, -0.3]
+    rr2, lr2 = run_scenario(
+        "rig_pitch_sweep",
+        target_init_pos=[10.0, 0.0, 0.0],
+        target_vel_fn=rig2_vel,
+        uav_init_pos=[0.0, 0.0, 0.0],
+        uav_init_yaw=0.0,
+        sim_time=16.0,
+        v_des_override=CTRL_V_DES,
+        rig_mode=True, max_tilt_override=95.0, az_limit_override=12.0, dither_amp_override=0.0,
+        uav_init_pitch_deg=30.0)
+    rig_results.append(rr2)
+
     # === Report ===
     print()
     print("=" * 80)
@@ -1658,6 +2012,35 @@ def main():
         print("\n>>> ALL SCENARIOS PASSED — algorithm verified correct <<<")
     else:
         print("\n>>> SOME SCENARIOS FAILED — see details above <<<")
+
+    # Missile-dive attitude envelope: prove the flight dive actually entered the >65 deg regime
+    # that the old Euler interface could not command.
+    _p8 = np.array(l8['pitch'])
+    print(f"\ndive_missile attitude envelope: pitch min={np.nanmin(_p8):.1f} deg  max={np.nanmax(_p8):.1f} deg"
+          f"  (old Euler-command ceiling was max_tilt 65/68 deg)")
+
+    # === Bench (rig) report: boresight tracking / attitude envelope / strapdown drift =========
+    if rig_results:
+        print()
+        print("=" * 80)
+        print("BENCH (3-AXIS RIG) REPORT — translation locked, rotation free")
+        print("=" * 80)
+        for rr, lg in zip(rig_results, [lr1, lr2]):
+            t_arr = np.array(lg['t'])
+            pitch_arr = np.array(lg['pitch'])
+            roll_arr = np.array(lg['roll'])
+            az_err_arr = np.array(lg['az_err'])
+            own_vel_arr = np.array(lg['own_vel'])
+            settled = t_arr > 3.0
+            az_abs = np.abs(az_err_arr[settled & ~np.isnan(az_err_arr)])
+            print(f"{rr.name}:")
+            print(f"  pitch   : min={np.nanmin(pitch_arr):7.1f} deg  max={np.nanmax(pitch_arr):7.1f} deg")
+            print(f"  |roll|  : max={np.nanmax(np.abs(roll_arr)):7.1f} deg")
+            print(f"  az_err  : mean={np.mean(az_abs):6.2f} deg  p95={np.percentile(az_abs, 95):6.2f} deg"
+                  f"  max={np.max(az_abs):6.2f} deg   (after 3 s settle)")
+            print(f"  strapdown own_vel drift (rig artifacts): {own_vel_arr[-1]:.3f} m/s over "
+                  f"{t_arr[-1]:.0f} s")
+            print(f"  NaN cmds: {rr.nan_count}   capture latched: {rr.captured}")
 
     # Save logs for plotting
     try:
