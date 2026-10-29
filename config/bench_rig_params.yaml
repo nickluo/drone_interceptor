@@ -1,0 +1,346 @@
+# ============================================================================
+# 三轴自由姿态测试台专用参数剖面 (bench rig profile)
+# ============================================================================
+# 用法（本文件是 relative_imm_ukf_params.yaml 的全量副本 + 台架覆盖，可独立加载）:
+#
+#   source install/setup.bash
+#   ros2 launch drone_interceptor launch_relative_imm_ukf.py use_simulation:=false \
+#       parameters:=$(ros2 pkg prefix drone_interceptor)/share/drone_interceptor/config/bench_rig_params.yaml
+#
+# 台架前提（Z 轴朝前指向目标的工作点 ≈90° 俯仰）:
+#   1. 相机内参必须换成真实相机实测值（camera.intrinsics 或 camera.fov_deg）——
+#      焦距错则宽度/距离全歪（见 AGENTS.md 的 AirSim 教训）。
+#   2. w_guess 必须是目标的有效视觉宽度，一次标定:
+#        目标放在卷尺量出的距离 L -> 稳定 bbox 尺寸 s (px)
+#        w_guess = s * L / focal   (focal = (width_px/2)/tan(fov/2))
+#      AirSim 实测: 宽度差 20% -> 距离偏 ~20% -> ~3 m 系统脱靶。
+#   3. 台架预置到 ~80° 再起任务（快速压机头时云台滞后 ~17° 会短暂出 FOV）;
+#      目标先静止锁稳 >=3 s 再动。
+#   4. freeze_width=true 在台架上必须开: 平移锁定 -> 无自机视差 -> 单目
+#      (W, 距离) 尺度不可观，不冻结则 W 塌缩（实测 1.5->0.5，r_est 12->3.7 m），
+#      一切距离门控失真。冻结后 r_est = focal*W/bbox 确定性地锚定尺寸通道。
+#   5. 高俯仰姿态解锁需放宽 small_angle（或回平解锁）；真机 PID 用 bench_pid
+#      profile（CMD_APPLY_PID 热切换，台架附加转动惯量）。
+#   6. 90° 工作点的持续指令油门是最小值（垂直通道拉满下降 -> 推力轴水平 ->
+#      垂直分量 ≈0），入架载荷很小。
+#
+# 与主飞行剖面的差异（均经 ROS harness rig_pitch_sweep / rig_90_sweep 验证:
+# 俯仰 30->89° 方位误差 3.4°；90° 保持 80-90° 方位 3.7° 无误捕获）:
+#   physics.max_tilt_deg/_terminal_deg   65/68 -> 95   （90° 工作点需越过水平）
+#   estimation.freeze_width              (新增) -> true （台架尺度不可观）
+#   estimation.gyro_attitude_during_mission true -> false（长会话陀螺漂移；FC 融合姿态在台上更准）
+#   controller.visual_speed_gain         600 -> 0      （图像制动垂直耦合钳下降率到
+#        "水平闭合速率"——台架上恒为零 -> 俯仰平衡被压到 ~60° 钉不住 90°）
+#   controller.a_lat_tilt_start_deg      65 -> 50      （扫掠段俯仰下探时横滚-视轴耦合回归）
+#   controller.use_imu_axial_speed       true -> false （own_vel≈0+漂移）
+#   controller.target_axial_feedforward_limit 3.0 -> 0 （节点校验: 依赖 IMU 轴速）
+#   controller.dither_amp                0.1 -> 0      （无平移 -> 视差激励无效）
+# ============================================================================
+
+interceptor_node_relative_imm_ukf:
+  ros__parameters:
+    use_simulation: false
+    collision_detection_enable: false
+    collision_min_ratio: 0.2
+
+    # Accelerometer bias in body frame, subtracted before the strapdown preintegration
+    # (dv_own = ∫(R·(f_imu − bias) − g)dt). The ROS2 Python sim harness publishes a bias-free
+    # IMU, so zeros here; set calibrated values on real hardware.
+    imu_bias: [0.0, 0.0, 0.0]
+
+    # Topic names are read at startup; restart the node after changing them.
+    topics:
+      imu: "/mavros/imu/data"
+      bbox: "/fpv/target_bbox"
+      gimbal: "/fpv/gimbal"  # sensor_msgs/Imu, camera FLU -> world ENU orientation
+      # ODOMETRY-FREE: the node no longer subscribes to any odometry. Ego-motion comes solely
+      # from the IMU (orientation + preintegrated accel); the estimator state is fully relative.
+      # Launch trigger: Header.frame_id is MISSION or OFF.
+      mission_launch: "/fpv/tracker_trigger"
+      mission_state: "/fpv/mission_state"
+      # Bool trigger for the ROS2 simulation harness; Header MISSION/OFF uses mission_launch above.
+      mission: "/fpv/mission_start"
+      control: "/fpv/control_command"
+
+    # Physics & airframe parameters
+    physics:
+      g: 9.81
+      # Linear ownship aero drag — consumed ONLY by the ROS2 sim harness (ros2_sim_node.py's
+      # quadrotor model, a_world -= k*v). The C++ node's estimator has no drag term: in relative
+      # coordinates the target velocity is unobservable, so the rotor mode runs as pure
+      # accel-relaxation (see f_rotor in src/relative_imm_ukf.h).
+      drag_coeff: 0.1125
+      # Airframe limits (calibrate to the real platform / AirSim)
+      max_tilt_deg: 95.0          # BENCH: 90 deg operating point needs past-horizontal (flight profile: 65)
+      max_tilt_terminal_deg: 95.0 # BENCH: (flight profile: 68)
+      max_body_rate: 3.0          # rad/s, hard cap on |omega_x/y/z| (attitude-loop / detector limit)
+      a_z_limit: 12.0             # m/s^2, vertical accel clamp (thrust limit); 30 (fast-target tuning) over-thrusts ~4g: the terminal arrival law then accelerates the vehicle THROUGH the pass horizontally (vh 14->18.7 while braking) and the near-side miss returns
+      v_climb: 20.0               # m/s, max commanded climb rate
+      v_descent: 20.0             # m/s, max commanded sink rate
+
+    # Retained test-profile entries; the current node uses its internal measurement-noise model,
+    # not these two parameters.
+    perception:
+      bbox_pos_std_dev: 12.0
+      bbox_size_std_dev: 3.0
+
+    # Delay / History
+    control:
+      rate: 100.0          # Control loop rate in Hz
+      rate_tc: 0.02       # First-order response time constant for body rates
+      rate_control_attenuation: false
+
+    # Camera Intrinsic parameters
+    camera:
+      width_px: 1536
+      height_px: 960
+      # Intrinsics source — exactly one must be valid or the node refuses to start:
+      #   fov_deg:    horizontal FOV in (0,180); vertical FOV derived from the aspect ratio
+      #               (~48.8° here). 0.0 = unset.
+      #   intrinsics: 9-element row-major K matrix [fx 0 cx; 0 fy cy; 0 0 1] used DIRECTLY
+      #               (takes precedence over fov_deg when both are set; skew/last-row entries
+      #               are validated, lens distortion is NOT modeled).
+      fov_deg: 72.0
+      # intrinsics: [1057.3, 0.0, 768.0, 0.0, 1057.3, 480.0, 0.0, 0.0, 1.0]
+      # Semi-strapdown single-axis pitch gimbal: servo keeps the boresight near-horizontal in the
+      # world frame regardless of body pitch (with servo lag). The ACTUAL camera-to-world orientation
+      # q_C_W is published on /fpv/gimbal (sensor_msgs/Imu, orientation = camera->world quaternion) —
+      # the SAME convention as the hardware gimbal driver and AirSim. The node
+      # rebuilds R_b2c from q_C_W each frame. gimbal_bias_deg = fixed down-gaze bias: boresight world
+      # elevation = -gimbal_bias_deg (keeps nonzero image-v for co-altitude targets); still consumed
+      # by the controller FOV clamp and the pre-first-message R_b2c placeholder.
+      use_gimbal: true
+      gimbal_bias_deg: 5.0
+
+    # Controller parameters
+    controller:
+      N: 3.5
+      K_att: 5.0     # attitude P-gain (was 9.0; lowered to damp the close-range roll limit-cycle)
+      K_yaw: 5.0
+      # --- Active vertical guidance: cascaded velocity-limited altitude track ---
+      # v_z_desired = clamp(dz * K_dz, ±v_climb/v_descent); a_z = K_az*(v_z_desired - own_vz).
+      # v_climb/v_descent are in physics.* (airframe limits). K_dz_up/dn (1/s): responsiveness;
+      # closure tau = 1/K. CLIMB uses a higher gain than DESCENT so an upper-FOV target does not
+      # asymptotically stall ~1 m short, while a below-FOV target still brakes without over-dive.
+      K_dz_up: 1.5     # 1/s, climb responsiveness before coordinated/braking speed limits
+      K_dz_dn: 2.0     # 1/s, descent responsiveness
+      # Cruise closing-speed ceiling. The observed terminal floor below prevents proximity-only
+      # braking on a stable approach; estimates of current target motion can still aid guidance.
+      v_des: 20.0  # m/s, ceiling for both cruise and the terminal floor
+      use_imu_axial_speed: false  # BENCH: strapdown own_vel is drift-only on the rig
+      target_axial_feedforward_limit: 0.0            # BENCH: off (requires use_imu_axial_speed; target-motion compensation is meaningless on the rig)
+                                           # reject estimates outside +/-limit instead of clipping.
+                                           # 0 disables; common hover/orbit profile uses 3.
+      K_apn: 0.6                 # augmented-PN target-accel feedforward; 0.6 for fast orbiting targets (was 0: noisy in SITL, needed here to lead 5 m/s orbits)
+      K_apn_max_range: 40.0       # m, APN range gate: a_t_perp ~ r*ydot amplifies monocular noise by r; long-range APN banked early and tripped the camera guard. 0 disables the gate.
+      axial_deadband: 0.05       # m/s, retain slow terminal closure instead of stalling
+      # sin(pitch)-keyed lateral-authority attenuation (quaternion attitude layer): banking
+      # swings the boresight by ~sin(pitch) per radian of roll (single-axis pitch gimbal
+      # cannot compensate roll). Dormant below 65 deg nose-down; a_lat -> 0 by 85 — keeps
+      # pointing authoritative at the bench/missile 90 deg regime where the bearing rate
+      # cannot self-extinguish without ownship translation.
+      a_lat_tilt_start_deg: 50.0  # BENCH window (flight: 65)
+      a_lat_tilt_end_deg: 85.0
+      # Max body NOSE-UP pitch the C20S gimbal can compensate (up-travel +40 deg minus the
+      # 5 deg down-gaze bias): braking harder nose-up saturates the servo and drops the
+      # boresight below the target. 0 = unlimited.
+      gimbal_nose_up_max_deg: 35.0
+      # FOV keep-in-frame guard
+      enable_fov_clamp: true   # hard-clamp pitch to keep target in FOV
+      fov_keep_margin: 0.65    # fraction of the FOV half-angle to keep the target within
+      axial_jerk_max: 12.0     # m/s^3, rate limit on |da_fwd/dt| (jerk). Lower = smoother motion (the user wants jerk→0). 12 is gentle yet responsive.
+      # Speed-scheduled PN: cap the forward speed used in a_lat = N*v*lambda_dot so v_des=20 does not
+      # overheat lateral authority (phi_cmd slamming to +-max_tilt -> roll limit-cycle). Steady-state
+      # lateral lead above v_pn_ref is reduced (maneuvering-authority trade for attitude stability).
+      # Raise toward v_des (or 1e9) to restore full high-speed PN lead.
+      v_pn_ref: 12.0      # m/s, cap on v_fwd in PN lateral accel
+      # Attitude reference slew governor: max |d(phi_cmd)/dt|, |d(theta_cmd)/dt|. Prevents the
+      # single-cycle +-max_tilt flips that bang omega_x/omega_y into +-max_body_rate saturation.
+      # Mirrors axial_jerk_max. Lower = smoother but more reference lag.
+      max_att_rate: 2.0   # rad/s, matches the common SITL mission profile
+      # Attitude reference EMA low-pass (on phi_cmd/theta_cmd). Suppresses camera-rate content /
+      # the close-range roll limit-cycle that the slew governor alone can't filter. Distinct from
+      # the body-rate decay coefficient (control.rate_control_attenuation) — this filters the
+      # attitude REFERENCE, not the rate output. Higher = smoother, more lag.
+      att_ref_tc: 0.15    # s, EMA time constant
+      # ---- Axial speed law: cruise ceiling + observed terminal speed floor ----
+      # The turn-radius cap keeps the minimum turn radius inside the estimated range.
+      # visual_speed_gain optionally adds a direct image-size cap, independent of range scale.
+      #   cap = turn_radius_cap_factor · sqrt(g · tan(tilt) · r),  tilt = max_tilt_terminal inside
+      #   terminal_tilt_range (65° here), else max_tilt (55°).
+      # The terminal floor is applied only when a sufficiently large, stable target is currently
+      # observed. It is shared by hover and orbit missions; no scenario label is consumed.
+      turn_radius_cap_factor: 0.8  # binding maneuverability cap (clamped [0.3,1.0] in the node; >1.0 warns+clamps). 1.0 = physics limit; <1 brakes sooner.
+      terminal_speed_floor: 12.0    # m/s, floor after both proximity caps; bounded by v_des; 0 disables
+      terminal_speed_bbox_threshold: 40.0  # px, current visual evidence required for the floor
+      terminal_speed_los_rate_threshold: 0.15  # rad/s, stable LOS required for the floor
+      terminal_brake_range: 5.0  # m, inner radius of the close-range lateral-decay ramp (not a speed-profile param)
+      terminal_tilt_range: 30.0    # m, below this range the roll clamp AND the speed cap use max_tilt_terminal
+      # Vertical-accel slew limit (Fix C/E, AirSim jitter): bounds |da_z/dt| so a monocular z-estimate
+      # jump (O(10 m) in one cycle) cannot step a_z straight to +-4 and pitch the body over. Relaxed
+      # 8 -> 20 (8 lagged the vertical PD loop ~1 s; 20 still softens spikes without the lag).
+      a_z_slew: 20.0               # m/s^3, rate limit on the vertical accel command
+      # Close-range lateral attenuation (Fix D, AirSim terminal weave): at v_des=20 the full PN gain
+      # inside 15 m over-corrects -> lambda_dot sign-flips -> phi_cmd rails +-max_tilt_terminal ->
+      # omega_x saturates (the close-approach weave). Gently scale a_lat_mag toward this floor over
+      # [terminal_brake_range, lateral_decay_start]. NOT 0 (a hard zero trailed maneuvering targets).
+      lateral_decay_floor: 0.4     # a_lat_mag floor at terminal_brake_range (0..1)
+      # Fix F: range at which the close-range lateral attenuation begins. Widened 12 -> 25 m so the
+      # 22-27 m weave zone (observed in AirSim at v_des=20) is covered. Must be > terminal_brake_range.
+      lateral_decay_start: 25.0    # m, lateral attenuation begins here (ramps to floor by terminal_brake_range)
+      # Guidance tuning (operator-facing, promoted from hardcoded constants):
+      K_fwd: 1.5                  # axial accel gain a_fwd = K_fwd*(v_des - v_fwd)
+      K_az: 4.0                   # vertical-speed tracking gain a_z = K_az*(v_z_desired - v_z)
+      # Optional stopping envelope: v*delay + v^2/(2*accel) <= abs(dz).
+      # Zero acceleration disables it.
+      vertical_brake_accel: 0.0   # fly-through interception: do not stop vertically before contact
+      vertical_brake_delay: 0.5   # s, control-loop delay allowance
+      # Terminal arrival-margin law (two-sided, both gated on this envelope):
+      #  (1) vertical: demand |v_z| >= terminal_arrival_margin * |dz| / t_go so the residual
+      #      height error is removed BY arrival (the proportional dz law and the
+      #      simultaneous-arrival profile cap leave no margin for vertical tracking lag —
+      #      from-below engagements arrived systematically ~1 m low);
+      #  (2) axial: cap the closing speed at 1.15 * |v_z_realized| * r_xy / |dz| so the
+      #      horizontal channel cannot outrun the climb the airframe is actually delivering
+      #      (deep far-side launches at 14-17 m/s still passed 2 m low with (1) alone);
+      #      floored at 4 m/s, dies out as dz -> 0. margin = 0 disables both.
+      terminal_arrival_margin: 1.8   # was 1.4;  x, arrival vertical-speed margin over dz/t_go
+      terminal_arrival_range: 35.0   # m, engagement radius of the arrival laws
+      visual_speed_gain: 0.0      # BENCH: image-braking vertical coupling clamps descent to the (zero on the rig) horizontal closure
+                                  # Calibrated at 1536x960, horizontal FOV 72 deg.
+                                  # Also bounds vertical closure by axial speed * abs(dz)/horizontal range.
+      visual_speed_floor: 2.6     # m/s; floors the image cap before the observed terminal floor.
+                                  # The terminal floor also requires current bbox and LOS evidence.
+      capture_range: 0.5          # estimated m; not the test's independent 1 m hit threshold
+      dither_amp: 0.0             # BENCH: no ownship translation -> no parallax benefit
+      dither_freq: 0.3            # Hz, lateral dither frequency
+      dither_min_range: 15.0       # m, suppress dither inside this range (don't disturb terminal)
+      dither_max_bbox: 80.0        # px, ALSO suppress the dither when the bbox >= this size (large
+                                   # bbox = good size-SNR / close target — the dither's observability job is done).
+                                   # Independent of the W-derived range estimate: W over-estimated by k
+                                   # over-estimates range by k, so dither_min_range never trips and the
+                                   # serpentine used to persist into true close range (miss). 80px chosen
+                                   # empirically (wrong_w x10 FOV sweep: 80px 7/10 vs 60px 5/10 vs off 6/10).
+                                   # At focal~1057: W=1.5 -> 20m, W=0.8 -> 10.6m. 0 = off.
+      # Radar mid-course smoothness: EMA on the range feeding the turn-radius speed cap + terminal
+      # decel ramp. The 10 Hz radar range carries ~4 m noise; fed 1:1 into sqrt(g*tan(max_tilt)*r) it
+      # swings v_des_eff and brakes every cycle. Lag is conservative on closing (over-estimates range
+      # -> cap allows slightly more speed, decel later). 0 = off. Drop to 0.2 if radar_only regresses.
+      range_smooth_tc: 0.3        # s, EMA time constant on the axial-chain range (0=off)
+
+    # State estimation aiding
+    estimation:
+      # ODOMETRY-FREE (mirror of the Python prototype): ego-motion from IMU strapdown
+      # preintegration only; the controller's lateral observability dither provides the parallax
+      # baseline that makes monocular depth/scale observable.
+      # Output smoothing of the estimator's RELATIVE velocity (Fix B): EMA before it drives
+      # guidance / the speed-aware brake floor. 0 disables.
+      vel_smooth_tc: 0.25          # s, EMA time constant on the relative-velocity estimate
+      gyro_attitude_during_mission: false  # BENCH: FC fused attitude on the rig (specific force = pure gravity); gyro-only drifts over long sessions
+                                          # avoids acceleration-induced tilt bias during the engagement.
+                                          # Direct-attitude SITL mission overlay sets false to use FC attitude.
+      w_guess: 1.0  # BENCH: <<< CALIBRATE to the target effective width (see header) >>>
+      freeze_width: true             # BENCH: pin the monocular scale (rig has no parallax; W collapses otherwise)
+
+    # ------------------------------------------------------------------------------------------
+    # Radar relay (mid-course guidance)
+    # ------------------------------------------------------------------------------------------
+    # An external radar tracks BOTH the target and the interceptor and reports each as a
+    # world-ENU nav_msgs/Odometry (pose = position, twist.linear = velocity, header.stamp = the
+    # MEASUREMENT epoch, not the publish time). The node differences the pair into a relative
+    # [r, v_rel] measurement, extrapolates it over the reported latency, and feeds it to the same
+    # IMM-UKF as a linear observation of x[0:6]. This carries the interceptor to the target long
+    # before the target is inside the camera FOV.
+    #
+    # Handover: while the target is BOTH inside the FOV and still on the radar track, the target
+    # width falls out of the pinhole relation W = bbox_size * r_radar / focal. That value is
+    # median-filtered over handover_frames and then LOCKED — it is the confidence anchor for the
+    # monocular terminal range r = focal*W/bbox_size once the radar is dropped.
+    radar:
+      enable: false               # Camera8 tests use vision only; enable explicitly with a radar relay
+      topic_target: "/fpv/radar/target"
+      topic_interceptor: "/fpv/radar/interceptor"
+      pos_std: 3.0                 # m, 1-sigma per axis (models a 1-5 m radar position error)
+      vel_std: 1.0                 # m/s, 1-sigma per axis
+      pair_window: 0.15            # s, max allowed stamp skew between the target/interceptor pair
+      timeout: 1.0                 # s, radar track considered stale beyond this age
+      max_delay_comp: 0.3          # s, cap on the latency extrapolation (radar lag is 50-100 ms)
+      max_range: 800.0             # m, sanitizer range ceiling while radar is enabled
+      handover_frames: 10          # consecutive RADAR-VALIDATED vision frames for the width fix + lock
+      lock_min_duration: 0.7       # s, the run must also span this long — a burst of consecutive
+                                   # false positives clears a pure frame count in a fraction of a second
+      width_window: 1.5            # s, rolling window for the width-median buffer. The buffer is no
+                                   # longer wiped on a single missed frame; stale samples age out over
+                                   # this window instead, so the width lock survives transient radar
+                                   # stalls / rejected bboxes. MAD outlier rejection runs on top of it.
+      width_min_bbox: 25.0         # px, only anchor the target width from a bbox at least this large.
+                                   # A tiny long-range bbox (e.g. 16px at 186m) is over-bound by the
+                                   # visual tracker and inflates W (observed W~2.26 vs ~1.5). This gate
+                                   # shifts the width lock closer (larger, accurate bbox). Lower = lock
+                                   # sooner/farther; raise if W is still inflated.
+      width_scale: 1.0             # multiplicative correction for tracker over-bounding, applied to the
+                                   # locked width (locked_W *= width_scale). Calibrate from one run as
+                                   # true_width / locked_W — e.g. set 0.66 if it locks 2.26m for a 1.5m
+                                   # target. 1.0 = no correction.
+      handover_max_range: 200.0    # m, do not derive a width from a radar range beyond this
+      # False-positive rejection. The detector fires on clouds/structures at long range and ONE fused
+      # phantom pixel measurement walks the monocular width — and with it the whole range scale —
+      # off (observed w_est 1.50 -> 0.66). Every bbox is checked against the radar track BEFORE it
+      # reaches the filter, not just before the handover.
+      bbox_gate: true
+      bbox_range_ratio: 2.0        # max focal*W/bbox_size vs radar-range ratio (only once W is locked)
+      width_min: 0.3               # m, clamp on the derived target width
+      width_max: 5.0               # m
+      # Terminal vision is PURE vision: once vision is locked AND delivering, the radar is fully
+      # disengaged (no fusion) — the radar is for MID-COURSE only; its metre-level position noise
+      # would corrupt the converged monocular range (already baked into the locked W).
+      vel_aid_after_lock: false    # OFF (default): the radar node must NOT influence terminal vision.
+                                   # Opt-in experiment: fuse radar VELOCITY (not position) while vision
+                                   # is locked to anchor the along-LOS v_closing. In AirSim this HURT
+                                   # (the lagged 10 Hz radar vel fought the 30 Hz vision update), so it
+                                   # is off — terminal vision runs pure, exactly like the no-radar case.
+      vel_aid_std: 2.5             # m/s, 1-sigma of the vel-only aid (only used if vel_aid_after_lock
+                                   # = true). Large = trust the monocular solution more.
+                                   # Lower (1.5-2.0) trusts the radar more; raise if the radar vel is
+                                   # noisy at close range or the range estimate walks.
+      vision_lost_timeout: 1.5     # s, vision gone this long -> guidance ownership reverts to radar
+      # Ownship velocity aiding: own_vel_ is otherwise an unbounded IMU integral running from the
+      # MISSION trigger, and it damps the vertical loop — a long wait for the FCU to accept external
+      # control (GUIDED) is enough to poison it. The radar measures it directly.
+      own_vel_aiding: true
+      own_vel_tc: 5.0              # s, DRIFT TRIM only. own_vel_ also damps the vertical loop, which
+                                   # needs its high-frequency content: a short time constant here
+                                   # hands that loop a 10 Hz lag-delayed signal and it oscillates
+                                   # (throttle bang-bangs between its clamps). Keep >> 1/K_az.
+      # Radar world frame -> IMU-referenced estimator frame yaw. Guidance mixes the two
+      # (los_az = atan2(r) - imu_yaw), so an offset here flies the interceptor at a constant angle
+      # off the target. Read the actual value off the [FRAME] log line, then set it here.
+      yaw_offset_deg: 0.0
+      handover_max_bearing_err: 0.20  # rad (11.5°), base camera-vs-radar LOS tolerance — tight enough to reject
+                                      # static false positives. A motion-dependent term (motion_gate_factor * v_perp *
+                                      # delay / r) is ADDED on top for moving targets, so the gate widens only when the
+                                      # target is actually moving — static FPs stay rejected.
+      motion_gate_factor: 1.0        # safety factor for the motion-dependent LOS gate widening. At close range with a
+                                      # fast-crossing target, the radar delay introduces a bearing error ~ v_perp * lag / r;
+                                      # this scales it. 0 = fixed gate (old behavior).
+      # Re-intercept: after a terminal vision-loss MISS (target lost > vision_lost_timeout, NOT a clean
+      # hit), re-engage the radar relay for another mid-course + terminal pass instead of brake-to-hold
+      # forever. Off by default — set true (with radar.enable=true) for a second chance after the target
+      # dodges out of the FOV near intercept.
+      reintercept_enable: false      # master switch (only acts when radar.enable is also true)
+      reintercept_max: 2             # max re-intercept attempts (total terminal passes = 1 + this)
+      reintercept_kill_range: 1.0    # m; if the closest approach was <= this, assume a clean HIT (don't re-attempt). 0 = always re-attempt on vision loss.
+      reintercept_min_range: 15.0    # m; re-engage only once radar shows the target back beyond this standoff (clean re-approach). 0 = re-engage immediately.
+      # Post-lock width re-anchor (safety net for a badly locked W — the failure that keeps the
+      # dither armed at close range): with W inflated by k, the monocular range r = focal*W/bbox is
+      # inflated by k and every close-range gate keyed on it is blinded. While vision is locked the
+      # radar fusion is off but the radar cache still updates, so r_vis = focal*W/bbox is continuously
+      # checked against r_radar; a sustained disagreement re-locks W and rescales the estimator onto
+      # the radar-consistent scale. No-ops without a fresh radar track.
+      width_reanchor_enable: true
+      width_reanchor_min_range: 10.0  # m; only trust the ratio beyond this radar range (metro noise dominates closer)
+      width_reanchor_max_range: 150.0 # m; only trust the ratio inside this radar range
+      width_reanchor_ratio: 1.25      # fire when the median r_vis/r_radar is outside [1/x, x]
+      width_reanchor_window: 2.0      # s, sustained-disagreement window (needs both frames and time span)
+      width_reanchor_min_frames: 15   # frames inside the window before the median is trusted
+      width_reanchor_max: 2           # max corrections per mission (plus cooldown between)
