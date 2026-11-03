@@ -20,6 +20,7 @@ DEFAULT_TOPICS = {
     "imu": "/mavros/imu/data",
     "bbox": "/fpv/target_bbox",
     "gimbal": "/fpv/gimbal",
+    "extended_state": "/mavros/extended_state",
     "mission_launch": "/fpv/tracker_trigger",
     "mission": "/fpv/mission_launch",
     "control": "/fpv/control_command",
@@ -29,6 +30,7 @@ SUBSCRIPTIONS = {
     "imu": "sensor_msgs/msg/Imu",
     "bbox": "vision_msgs/msg/Detection2D",
     "gimbal": "sensor_msgs/msg/Imu",
+    "extended_state": "mavros_msgs/msg/ExtendedState",
     "mission_launch": "std_msgs/msg/Header",
     "mission": "std_msgs/msg/Bool",
 }

@@ -40,7 +40,9 @@ camera_pose_history.h         — timestamped camera orientation ring buffer (de
 - **IMU strapdown**: preintegration (alpha/beta) for ego-motion; online accel bias calibration during idle
 - **Odometry-free**: ego-motion from IMU only; the controller's lateral observability dither provides the
   parallax baseline that makes monocular depth/scale observable
-- **Controller**: PN (proportional navigation) + IBVS, FOV keep-in-frame guard, soft-start ramp, axial jerk limit
+- **Controller**: PN (proportional navigation) + IBVS, FOV keep-in-frame guard, soft-start ramp, axial jerk limit,
+  ground-launch boost (`launch.*` params: min vertical accel + tilt cap from a ground trigger until the
+  initial climb speed is built; altitude comes from `topics.altitude`, absent data = airborne behavior)
 - **Observability dither close-gates** (3 conditions, ALL must hold to dither): estimated range >
   `controller.dither_min_range`; bbox < `controller.dither_max_bbox` px (direct observable,
   immune to the (W, range) scale error that blinds the range gate — a large bbox = good size-SNR /

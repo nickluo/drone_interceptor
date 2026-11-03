@@ -22,6 +22,21 @@ interceptor_node_relative_imm_ukf:
       # Bool trigger for the ROS2 simulation harness; Header MISSION/OFF uses mission_launch above.
       mission: "/fpv/mission_start"
       control: "/fpv/control_command"
+      # Bridge landed-state feed (debounced ON_GROUND/IN_AIR); only read at mission start to
+      # detect a ground launch. Absent/stale -> treated as airborne (behavior unchanged).
+      extended_state: "/mavros/extended_state"
+
+    # Ground-launch boost: a mission triggered while landed climbs with at least launch.accel
+    # until exit_speed is reached (a reasonable initial climb velocity) or max_duration
+    # elapses. Tilt is capped so the boost stays near-vertical. Airborne triggers (e.g. RC
+    # takeoff + hover handover) never arm it. Applies after every vertical override, so a
+    # camera boresight pointed above the target cannot suppress takeoff.
+    launch:
+      enable: true
+      accel: 8.0             # m/s^2, enforced minimum vertical accel while boosting
+      exit_speed: 3.0        # m/s, climb rate that ends the boost (the initial velocity)
+      max_duration: 3.0      # s, safety timeout
+      max_tilt_deg: 35.0     # deg, horizontal-accel cap during the boost
 
     # Physics & airframe parameters
     physics:
@@ -35,7 +50,7 @@ interceptor_node_relative_imm_ukf:
       max_tilt_deg: 65.0          # deg, mid-course tilt limit
       max_tilt_terminal_deg: 68.0 # deg, terminal roll limit and tilt used by the turn-radius speed cap; keep ~17deg margin under the 85deg mission abort (75 left too little overshoot room)
       max_body_rate: 3.0          # rad/s, hard cap on |omega_x/y/z| (attitude-loop / detector limit)
-      a_z_limit: 12.0             # m/s^2, vertical accel clamp (thrust limit); 30 (fast-target tuning) over-thrusts ~4g: the terminal arrival law then accelerates the vehicle THROUGH the pass horizontally (vh 14->18.7 while braking) and the near-side miss returns
+      a_z_limit: 25.0             # m/s^2, vertical accel clamp (thrust limit); 30 (fast-target tuning) over-thrusts ~4g: the terminal arrival law then accelerates the vehicle THROUGH the pass horizontally (vh 14->18.7 while braking) and the near-side miss returns
       v_climb: 20.0               # m/s, max commanded climb rate
       v_descent: 20.0             # m/s, max commanded sink rate
 
@@ -107,6 +122,8 @@ interceptor_node_relative_imm_ukf:
       # boresight below the target. 0 = unlimited.
       gimbal_nose_up_max_deg: 35.0
       # FOV keep-in-frame guard
+      # Gimbal altitude corrections only reinforce the target's relative-height direction:
+      # an upper target below the boresight cannot override a ground-launch climb with descent.
       enable_fov_clamp: true   # hard-clamp pitch to keep target in FOV
       fov_keep_margin: 0.65    # fraction of the FOV half-angle to keep the target within
       axial_jerk_max: 12.0     # m/s^3, rate limit on |da_fwd/dt| (jerk). Lower = smoother motion (the user wants jerk→0). 12 is gentle yet responsive.
@@ -165,7 +182,7 @@ interceptor_node_relative_imm_ukf:
       #      horizontal channel cannot outrun the climb the airframe is actually delivering
       #      (deep far-side launches at 14-17 m/s still passed 2 m low with (1) alone);
       #      floored at 4 m/s, dies out as dz -> 0. margin = 0 disables both.
-      terminal_arrival_margin: 1.8   # was 1.4;  x, arrival vertical-speed margin over dz/t_go
+      terminal_arrival_margin: 1.4   # was 1.4;  x, arrival vertical-speed margin over dz/t_go
       terminal_arrival_range: 35.0   # m, engagement radius of the arrival laws
       visual_speed_gain: 600.0    # px*m/s; 0 disables, otherwise image cap = max(floor, gain/bbox_size).
                                   # Calibrated at 1536x960, horizontal FOV 72 deg.

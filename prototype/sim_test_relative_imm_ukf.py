@@ -828,6 +828,15 @@ class AdvancedHybridController:
         self.los_rate_slow = 0.0      # EMA of a_own_perp matched to ydot_tc (so dither cancels in a_t_perp_geom)
         self.los_rate_slow = 0.0      # slow EMA of lambda_dot (rejects 0.5Hz dither for turn_sign)
         self.los_rate_slow_tc = 1.5   # s
+        # Ground-launch boost (mirror C++): a ground-triggered mission climbs with at least
+        # launch_accel until exit_speed or the safety timeout; tilt capped near-vertical.
+        self.launch_pending = False
+        self.launch_active = False
+        self.launch_start_t = 0.0
+        self.launch_accel = 8.0
+        self.launch_exit_speed = 3.0
+        self.launch_max_duration = 3.0
+        self.launch_max_tilt = np.deg2rad(25.0)
 
     def reset(self):
         self.last_axial_accel = 0.0
@@ -851,6 +860,24 @@ class AdvancedHybridController:
         self.los_rate_slow = 0.0
         self.last_bbox_size = 0.0
         self.last_bbox_t = -1.0
+        self.launch_pending = False
+        self.launch_active = False
+
+    def set_launch_boost(self, accel, exit_speed, max_duration, max_tilt_deg):
+        if accel <= 0 or exit_speed <= 0 or max_duration <= 0 or not 0 < max_tilt_deg < 90:
+            raise ValueError("invalid ground-launch boost parameters")
+        self.launch_accel = accel
+        self.launch_exit_speed = exit_speed
+        self.launch_max_duration = max_duration
+        self.launch_max_tilt = np.deg2rad(max_tilt_deg)
+
+    def begin_ground_launch(self):
+        self.launch_pending = True
+        self.launch_active = False
+
+    def cancel_launch(self):
+        self.launch_pending = False
+        self.launch_active = False
 
     def compute_control(self, R_b2n, az_bore, los_az_err, r_est, v_est, los_el, t,
                         v_fwd_body=0.0, bbox_size=0.0, v_z=0.0, los_rate=0.0, target_speed=0.0,
@@ -861,6 +888,10 @@ class AdvancedHybridController:
         # pitch this is mathematically equivalent to the former Euler P-laws; at pitch -> 90 deg the
         # axis-angle attitude error re-allocates roll/yaw authority automatically (Euler yaw loses
         # cos(pitch) of bearing authority there) and has no representation singularity.
+        if self.launch_pending:   # latch the mission-relative time base on the first tick
+            self.launch_pending = False
+            self.launch_active = True
+            self.launch_start_t = t
         az_los = np.arctan2(np.sin(az_bore + los_az_err), np.cos(az_bore + los_az_err))
         r_norm = np.linalg.norm(r_est)
         omega_los = np.zeros(3)
@@ -1107,10 +1138,21 @@ class AdvancedHybridController:
             boresight_el = -self.gimbal_bias
             el_err = los_el - boresight_el          # negative = target below boresight
             edge = 0.7 * fov_keep
-            if el_err < -edge:
+            if el_err < -edge and dz_target < 0.0:
                 a_z = min(a_z, -2.0 * clamp((-el_err - edge) / max(fov_keep - edge, 1e-3), 0.0, 1.0) * 4.0)
-            elif el_err > edge:
+            elif el_err > edge and dz_target > 0.0:
                 a_z = max(a_z, 2.0 * clamp((el_err - edge) / max(fov_keep - edge, 1e-3), 0.0, 1.0) * 4.0)
+        # Ground-launch boost (mirror C++): after every vertical override so it cannot be
+        # suppressed; exits on climb rate or the safety timeout; tilt capped near-vertical.
+        if self.launch_active:
+            if v_z >= self.launch_exit_speed or t - self.launch_start_t > self.launch_max_duration:
+                self.launch_active = False
+            else:
+                a_z = max(a_z, self.launch_accel)
+                a_h_max = np.tan(self.launch_max_tilt) * (a_z + G)
+                a_h_norm = float(np.linalg.norm(d[0:2]))
+                if a_h_norm > a_h_max:
+                    d[0:2] *= a_h_max / a_h_norm
         # Recompute the spherical normal coordinates (tilt_fwd, tilt_left) in the boresight frame
         # after the clamps: u = tilt_mag * s_az has norm ||u|| = tilt_mag in [0, pi] (valid past
         # 90 deg for missile-mode dives, unlike tan()) and has no polar-azimuth singularity at

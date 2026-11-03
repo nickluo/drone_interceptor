@@ -57,6 +57,10 @@ InterceptorNodeRelativeIMMUKF::InterceptorNodeRelativeIMMUKF() : Node("intercept
         this->get_parameter("topics.gimbal").as_string(), rclcpp::SensorDataQoS(),
         std::bind(&InterceptorNodeRelativeIMMUKF::gimbal_callback, this, std::placeholders::_1), sub_options);
 
+    extended_state_sub_ = this->create_subscription<mavros_msgs::msg::ExtendedState>(
+        this->get_parameter("topics.extended_state").as_string(), 10,
+        std::bind(&InterceptorNodeRelativeIMMUKF::extended_state_callback, this, std::placeholders::_1), sub_options);
+
     control_pub_ = this->create_publisher<quadrotor_msgs::msg::ControlCommand>(
         this->get_parameter("topics.control").as_string(), 10);
     mission_state_pub_ = this->create_publisher<std_msgs::msg::Bool>(
@@ -91,6 +95,7 @@ void InterceptorNodeRelativeIMMUKF::declare_parameters() {
     this->declare_parameter<std::string>("topics.imu", "/mavros/imu/data");
     this->declare_parameter<std::string>("topics.bbox", "/fpv/target_bbox");
     this->declare_parameter<std::string>("topics.gimbal", "/fpv/gimbal");
+    this->declare_parameter<std::string>("topics.extended_state", "/mavros/extended_state");
     this->declare_parameter<std::string>("topics.mission_launch", "/fpv/tracker_trigger");
     this->declare_parameter<std::string>("topics.mission", "/fpv/mission_launch");
     this->declare_parameter<std::string>("topics.control", "/fpv/control_command");
@@ -127,6 +132,13 @@ void InterceptorNodeRelativeIMMUKF::declare_parameters() {
     this->declare_parameter<double>("controller.terminal_tilt_range", 15.0);
     this->declare_parameter<double>("controller.a_z_slew", 20.0);   // Fix C/E: |da_z/dt| limit (m/s^3)
     this->declare_parameter<bool>("controller.enable_fov_clamp", true);
+    // Ground-launch boost (see AdvancedHybridController): a mission triggered at low altitude
+    // gets a decisive vertical acceleration + tilt cap until the climb rate builds up.
+    this->declare_parameter<bool>("launch.enable", true);
+    this->declare_parameter<double>("launch.accel", 8.0);
+    this->declare_parameter<double>("launch.exit_speed", 3.0);
+    this->declare_parameter<double>("launch.max_duration", 3.0);
+    this->declare_parameter<double>("launch.max_tilt_deg", 25.0);
     // Guidance tuning (set_guidance_tuning) — operator-facing knobs promoted from hardcoded.
     this->declare_parameter<double>("controller.K_fwd", 2.0);       // axial accel gain
     this->declare_parameter<double>("controller.K_az", 2.0);        // vertical-speed tracking gain
@@ -338,6 +350,14 @@ void InterceptorNodeRelativeIMMUKF::load_parameters() {
         this->get_parameter("controller.dither_freq").as_double(),
         this->get_parameter("controller.dither_min_range").as_double(),
         this->get_parameter("controller.dither_max_bbox").as_double());
+    launch_enable_ = this->get_parameter("launch.enable").as_bool();
+    launch_accel_ = this->get_parameter("launch.accel").as_double();
+    launch_exit_speed_ = this->get_parameter("launch.exit_speed").as_double();
+    launch_max_duration_ = this->get_parameter("launch.max_duration").as_double();
+    launch_max_tilt_deg_ = this->get_parameter("launch.max_tilt_deg").as_double();
+    if (launch_enable_)
+        controller_->set_launch_boost(launch_accel_, launch_exit_speed_,
+                                      launch_max_duration_, launch_max_tilt_deg_);
     controller_->set_range_smooth_tc(this->get_parameter("controller.range_smooth_tc").as_double());
     controller_->set_apn_gain(
         this->get_parameter("controller.K_apn").as_double(),
@@ -1655,6 +1675,27 @@ void InterceptorNodeRelativeIMMUKF::mission_launch_callback(const std_msgs::msg:
             own_vel_.setZero();
             brake_vel_seeded_ = false;
         }
+        // Ground-launch detection: the bridge's debounced landed detector says ON_GROUND at
+        // the trigger -> the mission starts from rest on the ground -> arm the launch boost.
+        // Absent/stale state (sim harness, missing feed) leaves behavior unchanged.
+        if (launch_enable_ && controller_) {
+            uint8_t landed;
+            double landed_t;
+            {
+                std::lock_guard<std::mutex> ol(odom_mtx_);
+                landed = landed_state_;
+                landed_t = landed_state_t_;
+            }
+            const double now_s = this->get_clock()->now().seconds();
+            if (landed == mavros_msgs::msg::ExtendedState::LANDED_STATE_ON_GROUND &&
+                landed_t > 0.0 && now_s - landed_t < 1.0) {
+                controller_->begin_ground_launch();
+                RCLCPP_INFO(this->get_logger(),
+                    "Ground launch detected (landed state ON_GROUND): launch boost armed "
+                    "(a_z >= %.1f m/s^2 until v_z >= %.1f m/s or %.1f s)",
+                    launch_accel_, launch_exit_speed_, launch_max_duration_);
+            }
+        }
         transition_to_state(MissionState::INITIALIZING, "Mission launch command");
         publish_mission_state(true);
         start_control_timer();
@@ -1734,6 +1775,13 @@ void InterceptorNodeRelativeIMMUKF::gimbal_callback(const sensor_msgs::msg::Imu:
         latest_gimbal_q_ = q_rdf.normalized();
         gimbal_received_ = true;
     }
+}
+
+void InterceptorNodeRelativeIMMUKF::extended_state_callback(
+        const mavros_msgs::msg::ExtendedState::SharedPtr msg) {
+    std::lock_guard<std::mutex> odom_lock(odom_mtx_);
+    landed_state_ = msg->landed_state;
+    landed_state_t_ = this->get_clock()->now().seconds();
 }
 
 Eigen::Matrix3d InterceptorNodeRelativeIMMUKF::gimbal_R_b2c(double angle) const {

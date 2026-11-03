@@ -152,7 +152,19 @@ public:
     // Dormant in the validated <=68 deg flight envelope; authoritative pointing at the bench/missile
     // 90 deg regime, where the bearing rate cannot self-extinguish without ownship translation.
     double a_lat_tilt_start_ = 65.0 * M_PI / 180.0;   // window start, in sin(pitch) units
-    double a_lat_tilt_end_ = 85.0 * M_PI / 180.0;     // ... end (a_lat -> 0)
+    double a_lat_tilt_end_ = 85.0 * M_PI / 180.0;
+    // Ground-launch boost: a mission triggered on the ground (node checks altitude at launch)
+    // gets a guaranteed vertical acceleration and a tilt cap until the climb rate reaches
+    // launch_exit_speed_ (a reasonable initial velocity) or the safety timeout expires.
+    // Without it a co-altitude target commands only hover thrust (g) — marginal vs any
+    // thrust-curve pessimism — and a camera pointing above the target can suppress the climb.
+    bool   launch_pending_ = false;   // set by begin_ground_launch, latched to t on first tick
+    bool   launch_active_ = false;
+    double launch_start_t_ = 0.0;
+    double launch_accel_ = 8.0;          // m/s^2, enforced minimum vertical accel while active
+    double launch_exit_speed_ = 3.0;     // m/s, climb rate that ends the boost (initial velocity)
+    double launch_max_duration_ = 3.0;   // s, safety timeout
+    double launch_max_tilt_rad_ = 25.0 * M_PI / 180.0;  // horizontal-accel cap during boost     // ... end (a_lat -> 0)
     // Max body NOSE-UP pitch the semi-strapdown gimbal can compensate (its up-travel minus the
     // down-gaze bias): braking harder nose-up than this saturates the servo and drops the
     // boresight below the target. 0 = unlimited.
@@ -255,8 +267,22 @@ public:
         has_rn_ema_ = false;
         last_bbox_size_ = 0.0;
         last_bbox_t_ = -1.0;
+        launch_pending_ = false;
+        launch_active_ = false;
     }
     void set_a_z_slew(double v) { a_z_slew_ = (v > 0.0) ? v : 1e9; }  // <=0 disables the slew limit
+    void set_launch_boost(double accel, double exit_speed, double max_duration, double max_tilt_deg) {
+        if (!std::isfinite(accel) || accel <= 0.0 || !std::isfinite(exit_speed) || exit_speed <= 0.0 ||
+            !std::isfinite(max_duration) || max_duration <= 0.0 ||
+            !std::isfinite(max_tilt_deg) || max_tilt_deg <= 0.0 || max_tilt_deg >= 90.0)
+            throw std::invalid_argument("invalid ground-launch boost parameters");
+        launch_accel_ = accel;
+        launch_exit_speed_ = exit_speed;
+        launch_max_duration_ = max_duration;
+        launch_max_tilt_rad_ = max_tilt_deg * M_PI / 180.0;
+    }
+    void begin_ground_launch() { launch_pending_ = true; launch_active_ = false; }
+    void cancel_launch() { launch_pending_ = false; launch_active_ = false; }
     void set_lateral_decay_floor(double v) { lateral_decay_floor_ = clamp(v, 0.0, 1.0); }
     void set_lat_decay_start(double v) { lat_decay_start_ = std::max(v, terminal_brake_range_ + 1.0); }
     void set_g(double g_val) { g = g_val; }
@@ -367,6 +393,11 @@ public:
                                         bool radar_close_range = false) {
         (void)v_est;
         (void)target_speed;
+        if (launch_pending_) {   // latch the mission-relative time base on the first control tick
+            launch_pending_ = false;
+            launch_active_ = true;
+            launch_start_t_ = t;
+        }
         const double az_los = wrapAngle(az_bore + los_az_err);
         // sin(pitch) is the roll->boresight-azimuth coupling factor (a roll of phi at nose-down
         // pitch theta swings the boresight azimuth by ~sin(theta)*phi): 0 at level (roll is pure
@@ -732,10 +763,12 @@ public:
                 ? boresight_el_meas : -gimbal_bias_;
             const double el_err = los_el - boresight_el;   // negative = target below boresight
             const double edge = 0.7 * fov_keep;
-            if (el_err < -edge) {
+            // A tracking gimbal can put an upper target below its boresight (and vice versa).
+            // Do not reverse altitude guidance solely to chase the camera's pointing error.
+            if (el_err < -edge && dz_target < 0.0) {
                 a_z = std::min(a_z, -8.0 * clamp((-el_err - edge) /
                                                  std::max(fov_keep - edge, 1e-3), 0.0, 1.0));
-            } else if (el_err > edge) {
+            } else if (el_err > edge && dz_target > 0.0) {
                 a_z = std::max(a_z, 8.0 * clamp((el_err - edge) /
                                                 std::max(fov_keep - edge, 1e-3), 0.0, 1.0));
             }
@@ -759,6 +792,25 @@ public:
             } else if (tf > tf_hi2) {
                 d = rotate_about_left(d, tf_hi2 - tf);
                 tf = tf_hi2;
+            }
+        }
+
+        // ---- Ground-launch boost ---------------------------------------------------------
+        // Runs AFTER the FOV override so it cannot be suppressed: a ground launch must climb
+        // with a decisive acceleration and build a reasonable initial climb speed even when the
+        // camera boresight points above the target (AIM pitch) or the target is co-altitude.
+        // Tilt stays capped so the boost is near-vertical; the guidance vertical demand may
+        // exceed launch_accel_ (max, not replace). Exits on climb rate or the safety timeout.
+        if (launch_active_) {
+            if (v_z >= launch_exit_speed_ || t - launch_start_t_ > launch_max_duration_) {
+                launch_active_ = false;
+            } else {
+                a_z = std::max(a_z, launch_accel_);
+                const double a_h_max = std::tan(launch_max_tilt_rad_) * (a_z + g);
+                const double a_h_norm = d.head<2>().norm();
+                if (a_h_norm > a_h_max) {
+                    d.head<2>() *= a_h_max / a_h_norm;
+                }
             }
         }
 
@@ -846,7 +898,7 @@ public:
         // up, floored at 0.25 for caps beyond 90 deg.
         const double cos_tilt_actual = std::max(R_b2n(2, 2),
                                                 std::max(std::cos(max_tilt_rad + 0.2), 0.25));
-        const double throttle = clamp((a_z + g) / cos_tilt_actual, 2.0, 25.0);
+        const double throttle = clamp((a_z + g) / cos_tilt_actual, 2.0, 50.0);
 
         return {throttle,
                 clamp(omega_body(0), -max_body_rate_, max_body_rate_),

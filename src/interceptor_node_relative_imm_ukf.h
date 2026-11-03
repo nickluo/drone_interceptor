@@ -19,12 +19,14 @@
 #include <std_msgs/msg/bool.hpp>
 #include <std_msgs/msg/header.hpp>
 #include <quadrotor_msgs/msg/control_command.hpp>
+#include <mavros_msgs/msg/extended_state.hpp>
 #include <nav_msgs/msg/odometry.hpp>
 
 #include <Eigen/Dense>
 #include <Eigen/Geometry>
 
 #include <cstdint>
+#include <limits>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -132,6 +134,12 @@ private:
     // are NOT consumed here — this node runs its own IMM-UKF + body-IMU strapdown.
     void gimbal_callback(const sensor_msgs::msg::Imu::SharedPtr msg);
 
+    // /mavros/extended_state (mavros_msgs/ExtendedState): the bridge's debounced landed
+    // detector (relative altitude + confirm times). Read only at mission start: LANDED means
+    // a GROUND launch that arms the controller's launch boost. Absent/stale data means "not
+    // ground" — airborne handover and sim harnesses without the feed are unchanged.
+    void extended_state_callback(const mavros_msgs::msg::ExtendedState::SharedPtr msg);
+
     // Build R_b2c from the given gimbal cam-x pitch angle (positive = down-gaze).
     Eigen::Matrix3d gimbal_R_b2c(double angle) const;
 
@@ -178,6 +186,7 @@ private:
     rclcpp::Subscription<sensor_msgs::msg::Imu>::SharedPtr imu_sub_;
     rclcpp::Subscription<vision_msgs::msg::Detection2D>::SharedPtr bbox_sub_;
     rclcpp::Subscription<sensor_msgs::msg::Imu>::SharedPtr gimbal_sub_;
+    rclcpp::Subscription<mavros_msgs::msg::ExtendedState>::SharedPtr extended_state_sub_;
     rclcpp::Subscription<nav_msgs::msg::Odometry>::SharedPtr radar_target_sub_;
     rclcpp::Subscription<nav_msgs::msg::Odometry>::SharedPtr radar_own_sub_;
     rclcpp::Publisher<quadrotor_msgs::msg::ControlCommand>::SharedPtr control_pub_;
@@ -331,6 +340,15 @@ private:
     // vertical PD over-dived on below-FOV targets. Drifts long-term from accel bias, but the
     // high-frequency component (what damping needs) is accurate; reset on mission launch.
     Eigen::Vector3d own_vel_ = Eigen::Vector3d::Zero();
+    // Latest landed state from the bridge (guarded by odom_mtx_); stale/unknown = airborne.
+    uint8_t landed_state_ = mavros_msgs::msg::ExtendedState::LANDED_STATE_UNDEFINED;
+    double landed_state_t_ = -1.0;
+    // Ground-launch boost configuration (launch.* params; controller enforces the profile).
+    bool   launch_enable_ = true;
+    double launch_accel_ = 8.0;
+    double launch_exit_speed_ = 3.0;
+    double launch_max_duration_ = 3.0;
+    double launch_max_tilt_deg_ = 25.0;
     // Collision detection (AirSim/real HW only): a gyro spike vs the
     // last commanded body rate signals physical contact -> intercept success -> COMPLETED. Gated on
     // !use_simulation_: the ROS2 Python sim has ground-truth range and judges intercept externally.

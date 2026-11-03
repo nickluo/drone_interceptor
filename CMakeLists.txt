@@ -78,6 +78,10 @@ if(BUILD_TESTING)
     target_link_libraries(guidance_limits_test m)
     add_test(NAME guidance_limits_test COMMAND guidance_limits_test)
 
+    add_executable(controller_thrust_test test/controller_thrust_test.cpp)
+    target_link_libraries(controller_thrust_test m)
+    add_test(NAME controller_thrust_test COMMAND controller_thrust_test)
+
     add_executable(camera_pose_history_test test/camera_pose_history_test.cpp)
     add_test(NAME camera_pose_history_test COMMAND camera_pose_history_test)
 endif()
