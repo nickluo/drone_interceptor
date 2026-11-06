@@ -123,6 +123,47 @@ int main()
     const double free_rate = std::hypot(free_cmd[1], std::hypot(free_cmd[2], free_cmd[3]));
     require(capped_cmd[0] > 17.0, "boost thrust holds under horizontal demand");
     require(capped_rate < free_rate, "launch tilt cap must reduce attitude rates");
+
+    // ---- 12-06-28 round 2 regression: over-tilt demand through the launch cap --------------
+    // The exact flight state: body 44.6 deg nose-down on the launcher, target reconstructed
+    // below-forward at r=(18, 0, -27) m (elevation -56.3 deg) drives tilt_raw > max_tilt, so
+    // the regular tilt cap replaces d with a dimensionless unit vector. In that regime the
+    // launch boost must still enforce its angular cap with consistent units: desired tilt
+    // re-clamped to launch_max_tilt (25 deg < the current 44.6 deg) and d rebuilt from the
+    // boosted a_z, so the pitch-rate command turns nose-UP instead of pitching further
+    // nose-down toward the 65 deg cap (the unfixed controller reproduces the logged +1.81
+    // rad/s nose-down and 24.97 m/s^2 thrust on this exact input).
+    const Eigen::Matrix3d nose_down =
+        Eigen::AngleAxisd(44.6 * M_PI / 180.0, Eigen::Vector3d::UnitY()).toRotationMatrix();
+    const Eigen::Vector3d below_forward(18.0, 0.0, -27.0);
+    const double el_below = std::atan2(-27.0, 18.0);
+    auto overtilt = [&](AdvancedHybridController &c) {
+        return c.compute_control(nose_down, 0.0, 0.0, below_forward, Eigen::Vector3d::Zero(),
+                                 el_below, 0.0, 0.0, 35.0, 0.0, 0.0, 0.0,
+                                 Eigen::Vector3d::Zero(), el_below);
+    };
+    auto free_over = controller();
+    free_over.set_guidance_tuning(10.0, 4.0, 12.0, 0.0, 0.5, 10.0, 0.0);
+    const auto free_over_cmd = overtilt(free_over);
+    require(free_over_cmd[2] > 0.5,
+            "over-tilt scenario must command further nose-down without the boost");
+    auto boost_over = controller();
+    boost_over.set_guidance_tuning(10.0, 4.0, 12.0, 0.0, 0.5, 10.0, 0.0);
+    boost_over.set_launch_boost(8.0, 3.0, 3.0, 25.0);
+    boost_over.begin_ground_launch();
+    const auto boost_over_cmd = overtilt(boost_over);
+    require(boost_over_cmd[0] > 17.0, "over-tilt launch boost thrust holds");
+    require(boost_over_cmd[2] < -0.5,
+            "launch tilt cap must reverse the over-tilt pitch demand (12-06-28 round 2 regression)");
+    // The same over-tilt state with a 35 deg cap (the deployed YAML value) must also bind:
+    // 35 deg < 44.6 deg current tilt still commands nose-up, just gentler.
+    auto boost35 = controller();
+    boost35.set_guidance_tuning(10.0, 4.0, 12.0, 0.0, 0.5, 10.0, 0.0);
+    boost35.set_launch_boost(8.0, 3.0, 3.0, 35.0);
+    boost35.begin_ground_launch();
+    const auto boost35_cmd = overtilt(boost35);
+    require(boost35_cmd[2] < 0.0 && boost35_cmd[0] > 17.0,
+            "35 deg launch cap must also bind in the over-tilt regime");
     bool invalid_launch_rejected = false;
     try {
         plain.set_launch_boost(-1.0, 3.0, 3.0, 25.0);

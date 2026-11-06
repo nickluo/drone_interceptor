@@ -681,6 +681,12 @@ public:
         // relaxation).
         const double tilt_cap = (r_norm < terminal_tilt_range_) ? max_tilt_terminal_rad_ : max_tilt_rad;
         const double a_h_mag = a_h_world.norm();
+        // Horizontal acceleration after the azimuth-budget clamp below, kept in ACCELERATION
+        // units: the tilt cap below replaces d with a dimensionless unit vector, and the
+        // ground-launch boost must re-clamp tilt from acceleration-domain data (the old launch
+        // comparison mixed units — |d.xy| <= 1 against tan(cap)*(a_z+g) in m/s^2 — and never
+        // bound; 12-06-28 round 2 held 65 deg of desired tilt straight through a 25 deg cap).
+        Eigen::Vector2d a_h_eff = a_h_world;
         if (a_h_mag > 1e-9) {
             const double tilt_raw = std::atan2(a_h_mag, d(2));
             // Thrust-azimuth pointing budget: a thrust-azimuth deviation delta from the LOS
@@ -707,7 +713,6 @@ public:
             // ~60 deg pointing error and ~100 deg residual roll on the rig).
             const double d_az_max = (sin_pitch > 0.75)
                 ? clamp(fov_az_budget / std::max(sin_pitch, 0.75), 0.0, M_PI) : M_PI;
-            Eigen::Vector2d a_h_eff = a_h_world;
             if (std::abs(d_az) > d_az_max) {
                 const double d_az_c = clamp(d_az, -d_az_max, d_az_max);
                 a_h_eff = a_h_mag * Eigen::Vector2d(std::cos(az_los + d_az_c), std::sin(az_los + d_az_c));
@@ -806,6 +811,14 @@ public:
                 launch_active_ = false;
             } else {
                 a_z = std::max(a_z, launch_accel_);
+                // Rebuild d in ACCELERATION units from the boosted vertical demand and the
+                // azimuth-clamped horizontal acceleration: the regular tilt cap above may have
+                // replaced d with a dimensionless unit vector, which made the old comparison
+                // below compare 0.9 against m/s^2 and never bind — the launch tilt cap failed
+                // exactly in the over-tilt regime it exists for. Boost intentionally overrides
+                // the nose-up/FOV clamp results above: the ground launch prioritizes the
+                // decisive near-vertical climb.
+                d = Eigen::Vector3d(a_h_eff(0), a_h_eff(1), a_z + g);
                 const double a_h_max = std::tan(launch_max_tilt_rad_) * (a_z + g);
                 const double a_h_norm = d.head<2>().norm();
                 if (a_h_norm > a_h_max) {
