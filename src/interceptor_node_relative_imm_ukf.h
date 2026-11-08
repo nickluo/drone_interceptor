@@ -140,8 +140,8 @@ private:
     // ground" — airborne handover and sim harnesses without the feed are unchanged.
     void extended_state_callback(const mavros_msgs::msg::ExtendedState::SharedPtr msg);
 
-    // Build R_b2c from the given gimbal cam-x pitch angle (positive = down-gaze).
-    Eigen::Matrix3d gimbal_R_b2c(double angle) const;
+    // Initial body->camera mount: camera pitched -90 deg (optical axis along body +Z, up).
+    Eigen::Matrix3d gimbal_R_b2c() const;
 
     void transition_to_state(MissionState new_state, const char* reason);
     void publish_mission_state(bool active);
@@ -164,7 +164,6 @@ private:
     Eigen::Matrix3d R_b2c_base_ = Eigen::Matrix3d::Identity();
     // Semi-strapdown gimbal state (see parameter declaration for the convention).
     bool use_gimbal_ = false;
-    double gimbal_bias_rad_ = 0.0;
     // Camera-to-world quaternion q_C_W from /fpv/gimbal (Imu). Guarded by odom_mtx_.
     Eigen::Quaterniond latest_gimbal_q_ = Eigen::Quaterniond::Identity();
     bool gimbal_received_ = false;       // true once the first valid /fpv/gimbal msg arrives

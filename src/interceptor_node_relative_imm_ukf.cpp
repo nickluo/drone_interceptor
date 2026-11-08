@@ -109,12 +109,11 @@ void InterceptorNodeRelativeIMMUKF::declare_parameters() {
     //               Takes precedence when both are set. No lens-distortion model.
     this->declare_parameter<double>("camera.fov_deg", 0.0);
     this->declare_parameter<std::vector<double>>("camera.intrinsics", std::vector<double>{});
-    // Semi-strapdown single-axis pitch gimbal: gimbal_bias_deg is the UNIFIED camera down-gaze
-    // angle (positive = down). Used for both the gimbal (world-stabilized boresight) and the
-    // fixed mount (body-relative). The gimbal rebuilds R_b2c from q_C_W each frame; the fixed
-    // mount uses the initial value.
+    // Semi-strapdown single-axis pitch gimbal. R_b2c_ is rebuilt from the measured q_C_W
+    // (/fpv/gimbal) every frame; until the first gimbal message arrives it keeps its initial
+    // value, which models the launcher mount: camera pitched -90 deg (optical axis along the
+    // body +Z, pointing up).
     this->declare_parameter<bool>("camera.use_gimbal", false);
-    this->declare_parameter<double>("camera.gimbal_bias_deg", 5.0);
     this->declare_parameter<double>("physics.g", 9.81);
     this->declare_parameter<double>("controller.N", 4.5);
     this->declare_parameter<double>("controller.K_att", 9.0);
@@ -284,11 +283,10 @@ void InterceptorNodeRelativeIMMUKF::load_parameters() {
                    1.0,  0.0,  0.0;
     g_ = this->get_parameter("physics.g").as_double();
     use_gimbal_ = this->get_parameter("camera.use_gimbal").as_bool();
-    gimbal_bias_rad_ = this->get_parameter("camera.gimbal_bias_deg").as_double() * M_PI / 180.0;
-    // gimbal_bias_deg (positive = down-gaze) is the unified camera tilt for BOTH the gimbal
-    // (world-stabilized) and the fixed mount (body-relative). The gimbal rebuilds R_b2c_ from
-    // q_C_W each frame; the fixed mount keeps this initial value.
-    R_b2c_ = gimbal_R_b2c(gimbal_bias_rad_);
+    // Initial body->camera mount: pitch -90 deg (optical axis along body +Z, up) — the
+    // launcher pose. In gimbal mode /fpv/gimbal overwrites R_b2c_ every frame; a fixed
+    // mount keeps this value.
+    R_b2c_ = gimbal_R_b2c();
 
     w_guess_ = this->get_parameter("estimation.w_guess").as_double();
     freeze_width_ = this->get_parameter("estimation.freeze_width").as_bool();
@@ -328,14 +326,14 @@ void InterceptorNodeRelativeIMMUKF::load_parameters() {
     const bool enable_fov_clamp = this->get_parameter("controller.enable_fov_clamp").as_bool();
     controller_ = std::make_unique<AdvancedHybridController>(
         N, K_att, K_yaw, v_des, max_tilt,
-        fov_half_v, fov_half_h, fov_keep, jerk, enable_fov_clamp, gimbal_bias_rad_,
+        fov_half_v, fov_half_h, fov_keep, jerk, enable_fov_clamp, M_PI / 2.0,
         max_body_rate, terminal_brake_range,
         v_pn_ref, max_att_rate, att_ref_tc,
         max_tilt_terminal_deg, terminal_tilt_range);
     controller_->set_a_z_slew(this->get_parameter("controller.a_z_slew").as_double());
     controller_->set_lateral_decay_floor(this->get_parameter("controller.lateral_decay_floor").as_double());
     controller_->set_lat_decay_start(this->get_parameter("controller.lateral_decay_start").as_double());
-    controller_->set_gimbal(use_gimbal_, gimbal_bias_rad_);
+    controller_->set_gimbal(use_gimbal_);
     controller_->set_g(g_);
     controller_->set_vertical_climb(
         this->get_parameter("physics.v_climb").as_double(),
@@ -1044,12 +1042,13 @@ void InterceptorNodeRelativeIMMUKF::bbox_callback(const vision_msgs::msg::Detect
     // R_b2n*R_b2c^T*ray reproduce the camera projection from q_C_W: with R_b2c_ = q_C_W^T * R_b2n,
     // R_n2c = q_C_W^T and LOS = q_C_W*ray_cam. The same local R_b2n read here is passed to
     // process_camera below (so the two cancel exactly). Until the first /fpv/gimbal msg arrives,
-    // fall back to the bias-derived body->camera mount (R_n2c then includes attitude via R_b2n^T).
+    // fall back to the initial launcher mount, camera pitched -90 deg along body +Z (R_n2c then
+    // includes attitude via R_b2n^T).
     if (use_gimbal_) {
         if (gimbal_rcvd) {
             R_b2c_ = gimbal_q_now.normalized().toRotationMatrix().transpose() * R_b2n;
         } else {
-            R_b2c_ = gimbal_R_b2c(gimbal_bias_rad_);
+            R_b2c_ = gimbal_R_b2c();
         }
         estimator_->R_b2c = R_b2c_;
     }
@@ -1246,7 +1245,7 @@ void InterceptorNodeRelativeIMMUKF::control_timer_callback() {
     // horizontal), replacing the Euler yaw that degenerated at pitch +-90 deg. The ELEVATION
     // feeds the controller's vertical-FOV clamp so it tracks the TRUE boresight (incl. servo
     // lag). Elevation is NaN when the gimbal is disabled or no /fpv/gimbal msg has arrived yet
-    // (the clamp then falls back to the -gimbal_bias_ assumption).
+    // (the clamp then falls back to a level-boresight assumption).
     double boresight_el_meas = std::numeric_limits<double>::quiet_NaN();
     Eigen::Matrix3d R_c2n_gimbal;
     const bool have_gimbal_pose = use_gimbal_ && gimbal_rcvd;
@@ -1784,7 +1783,11 @@ void InterceptorNodeRelativeIMMUKF::extended_state_callback(
     landed_state_t_ = this->get_clock()->now().seconds();
 }
 
-Eigen::Matrix3d InterceptorNodeRelativeIMMUKF::gimbal_R_b2c(double angle) const {
+Eigen::Matrix3d InterceptorNodeRelativeIMMUKF::gimbal_R_b2c() const {
+    // Initial body->camera mount: camera pitched -90 deg (optical axis along body +Z, up) —
+    // the launcher pose. /fpv/gimbal overwrites R_b2c_ per frame in gimbal mode; a fixed
+    // mount keeps this value. No configurable mount angle: the gimbal supplies the truth.
+    constexpr double angle = -M_PI / 2.0;
     Eigen::Matrix3d R_g;
     R_g << 1.0, 0.0, 0.0,
            0.0, std::cos(angle), -std::sin(angle),

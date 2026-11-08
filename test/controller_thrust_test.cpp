@@ -14,7 +14,7 @@ namespace
         AdvancedHybridController c(3.5, 5.0, 5.0, 20.0, 65.0, half_v,
                                    36.0 * M_PI / 180.0, 0.65, 12.0, fov,
                                    0.0, 3.0, 5.0, 12.0, 2.0, 0.15, 68.0, 30.0);
-        c.set_gimbal(true, 0.0);
+        c.set_gimbal(true);
         c.set_vertical_climb(20.0, 20.0, 1.5, 2.0);
         c.set_guidance_tuning(2.0, 4.0, 12.0, 0.0, 0.5, 10.0, 0.0);
         return c;
@@ -164,6 +164,63 @@ int main()
     const auto boost35_cmd = overtilt(boost35);
     require(boost35_cmd[2] < 0.0 && boost35_cmd[0] > 17.0,
             "35 deg launch cap must also bind in the over-tilt regime");
+
+    // ---- rotate_about_left materialization regression ---------------------------------------
+    // Target BEHIND the boresight (azimuth error pi) points the capped tilt demand
+    // nose-up: tf = -65 deg < the gimbal up-travel floor (default gimbal_nose_up_max_
+    // 35 deg), so the nose-up cap must rotate d up to tf_min = -35 deg and produce a
+    // finite, bounded nose-up rate command. Before the lambda's return type was
+    // materialized to Eigen::Vector3d, the lazy expression dangled and these clamps
+    // emitted garbage (1e155-class under gcc -O3, NaN under clang).
+    auto nose_up_capped = controller();
+    nose_up_capped.set_guidance_tuning(10.0, 4.0, 12.0, 0.0, 0.5, 10.0, 0.0);
+    const Eigen::Vector3d behind(-30.0, 0.0, -10.0);
+    const double el_behind = std::atan2(-10.0, 30.0);
+    const auto behind_cmd = nose_up_capped.compute_control(
+        Eigen::Matrix3d::Identity(), 0.0, M_PI, behind, Eigen::Vector3d::Zero(), el_behind,
+        0.0, 0.0, 35.0, 0.0, 0.0, 0.0, Eigen::Vector3d::Zero(), el_behind);
+    require(std::isfinite(behind_cmd[0]) && behind_cmd[0] >= 1.99 && behind_cmd[0] < 50.0,
+            "nose-up cap must leave a finite, bounded thrust");
+    require(std::isfinite(behind_cmd[2]) && behind_cmd[2] > -4.2 && behind_cmd[2] < -2.0,
+            "nose-up cap must clamp the tilt to the gimbal up-travel floor (materialized rotation)");
+    for (double c : {behind_cmd[1], behind_cmd[3]})
+        require(std::isfinite(c) && std::abs(c) < 10.0,
+                "nose-up cap must leave finite rate commands");
+
+    // ---- NaN r_est quarantine ---------------------------------------------------------------
+    // A single NaN guidance frame must (1) still produce fully finite commands (the reference
+    // holds the last finite attitude), and (2) leave no NaN in the EMA/slew states — the next
+    // clean tick must resume with live rate commands and the outputs must reconverge to the
+    // never-poisoned run. Before the quarantine, one NaN frame froze the rate law at zero
+    // permanently (crn = NaN skips the cross-product branch) while thrust continued, and
+    // clamped the vertical accel to the full-climb rail (clamp(NaN, lo, hi) = hi).
+    constexpr double qnan = std::numeric_limits<double>::quiet_NaN();
+    auto clean_run = controller();
+    auto poisoned_run = controller();
+    const auto tick = [](AdvancedHybridController &c, double t, double rx) {
+        const Eigen::Vector3d rel(rx, 0.0, -10.0);
+        const double el = std::atan2(-10.0, 30.0);
+        return c.compute_control(Eigen::Matrix3d::Identity(), 0.0, 0.0, rel,
+                                 Eigen::Vector3d::Zero(), el, t, 0.0, 35.0, 0.0, 0.0, 0.0,
+                                 Eigen::Vector3d::Zero(), el);
+    };
+    tick(clean_run, 0.0, 30.0);
+    tick(poisoned_run, 0.0, 30.0);
+    const auto nan_cmd = tick(poisoned_run, 0.01, qnan);
+    for (double c : nan_cmd)
+        require(std::isfinite(c), "NaN frame must still produce finite commands (held reference)");
+    const auto resumed = tick(poisoned_run, 0.02, 30.0);
+    require(std::isfinite(resumed[2]) && resumed[2] != 0.0,
+            "rate law must resume after a NaN frame (previously frozen at zero)");
+    for (int i = 3; i <= 150; ++i) {
+        tick(clean_run, i * 0.01, 30.0);
+        tick(poisoned_run, i * 0.01, 30.0);
+    }
+    const auto clean_final = tick(clean_run, 1.51, 30.0);
+    const auto poison_final = tick(poisoned_run, 1.51, 30.0);
+    for (size_t i = 0; i < 4; ++i)
+        require(std::abs(clean_final[i] - poison_final[i]) < 1e-3,
+                "controller must fully reconverge after a NaN frame (EMA/slew state clean)");
     bool invalid_launch_rejected = false;
     try {
         plain.set_launch_boost(-1.0, 3.0, 3.0, 25.0);

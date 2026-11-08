@@ -117,12 +117,12 @@ public:
     double axial_deadband_ = 1.5;
     // Motion-dependent LOS gate widening: bearing_tol += motion_gate_factor * v_perp * delay / r.
     double motion_gate_factor_ = 3.0;
-    // Semi-strapdown single-axis pitch gimbal: keeps the camera boresight near-horizontal
-    // (world elev = -gimbal_bias_) regardless of body pitch, so the vertical FOV is DECOUPLED
-    // from theta_cmd. When true, the fixed-mount pitch FOV clamp is skipped and vertical
-    // keep-in-frame is done through ALTITUDE (a_z) instead (see compute_control).
+    // Semi-strapdown single-axis pitch gimbal: keeps the camera boresight world-stabilized
+    // regardless of body pitch (the true boresight elevation is measured and fed in each
+    // control cycle), so the vertical FOV is DECOUPLED from theta_cmd. When true, the
+    // fixed-mount pitch FOV clamp is skipped and vertical keep-in-frame is done through
+    // ALTITUDE (a_z) instead (see compute_control).
     bool has_gimbal_ = false;
-    double gimbal_bias_ = 0.0;   // rad, down-gaze bias: boresight elev = -gimbal_bias_
     // Vertical cascade (cascaded velocity-limited altitude track): v_climb_/v_descent_ = max
     // commanded climb/sink rate [m/s] (the cap); K_dz_up_/dn_ = dz->rate gain [1/s] (closure
     // tau = 1/K). Asymmetric: climb more responsive than descent (avoid below-FOV over-dive).
@@ -286,9 +286,8 @@ public:
     void set_lateral_decay_floor(double v) { lateral_decay_floor_ = clamp(v, 0.0, 1.0); }
     void set_lat_decay_start(double v) { lat_decay_start_ = std::max(v, terminal_brake_range_ + 1.0); }
     void set_g(double g_val) { g = g_val; }
-    void set_gimbal(bool has_gimbal, double gimbal_bias_rad) {
+    void set_gimbal(bool has_gimbal) {
         has_gimbal_ = has_gimbal;
-        gimbal_bias_ = gimbal_bias_rad;
     }
     // Vertical-cascade tuning (cascaded velocity-limited altitude track). Independent so the
     // operator can set the climb/sink RATE (m/s, the cap — calibrate to the airframe's real
@@ -648,7 +647,14 @@ public:
                                                            vertical_brake_accel_, vertical_brake_delay_);
             v_z_desired = clamp(v_z_desired, -speed_limit, speed_limit);
         }
-        double a_z = clamp(K_az_ * (v_z_desired - v_z), -a_z_limit_, a_z_limit_);
+        // NaN quarantine (vertical channel): a non-finite vertical demand (e.g. a NaN r_est
+        // frame makes braking_speed_limit -> NaN, and clamp(NaN, lo, hi) returns HIGH) would
+        // silently rail the vertical accel to the full-climb side for one tick; the slew state
+        // below then walks it back over seconds at a_z_slew_. Hold the last finite command
+        // instead (0 before the first tick).
+        const double a_z_raw = K_az_ * (v_z_desired - v_z);
+        double a_z = std::isfinite(a_z_raw) ? clamp(a_z_raw, -a_z_limit_, a_z_limit_)
+                                            : (has_last_az_ ? last_a_z_ : 0.0);
         // Slew limit |da_z/dt|: the z-estimate can jump O(10 m) in one cycle; ramp a_z instead of
         // stepping it (which would pitch the body over).
         if (has_last_az_ && t > last_az_t_) {
@@ -735,17 +741,22 @@ public:
         const Eigen::Vector3d left_h3(-std::sin(az_bore), std::cos(az_bore), 0.0);
         // Rotate d about the horizontal left axis (exact at any tilt) — the pitch-plane clamp
         // operator for the nose-up cap and the fixed-mount FOV window.
-        auto rotate_about_left = [&left_h3](const Eigen::Vector3d& v, double angle) {
+        // The declared Eigen::Vector3d return type is REQUIRED: an auto-deduced return keeps
+        // the lazy expression, which holds const& to the temporary from left_h3.cross(v)
+        // destroyed at the end of the return statement — every caller then read a dangling
+        // expression (garbage under gcc -O3, NaN under clang), so these clamps never actually
+        // clamped before this was materialized.
+        auto rotate_about_left = [&left_h3](const Eigen::Vector3d& v, double angle) -> Eigen::Vector3d {
             return v * std::cos(angle) + left_h3.cross(v) * std::sin(angle)
                  + left_h3 * left_h3.dot(v) * (1.0 - std::cos(angle));
         };
         // fwd-plane tilt (the former theta_cmd).
         double tf = std::atan2(d.head<2>().dot(fwd_h), d(2));
-        // Nose-up cap from the gimbal's up-travel: the semi-strapdown servo (cmd = -pitch + bias)
-        // saturates at its mechanical max; braking harder nose-up than that drops the boresight
-        // below the target.
+        // Nose-up cap from the gimbal's up-travel: the semi-strapdown servo saturates at its
+        // mechanical up-travel; braking harder nose-up than that drops the boresight below
+        // the target.
         if (has_gimbal_ && gimbal_nose_up_max_ > 0.0) {
-            const double tf_min = -(gimbal_nose_up_max_ - gimbal_bias_);
+            const double tf_min = -gimbal_nose_up_max_;
             if (tf < tf_min) {
                 d = rotate_about_left(d, tf_min - tf);
                 tf = tf_min;
@@ -753,19 +764,19 @@ public:
         }
 
         if (enable_fov_clamp_ && has_gimbal_ && !target_behind) {
-            // Semi-strapdown gimbal: the boresight is decoupled from body pitch (gimbal cancels
-            // it; elev ~= -gimbal_bias_), so a tilt clamp cannot keep the target in the vertical
-            // FOV — ALTITUDE can. If the target approaches the bottom edge (los_el well below the
-            // boresight), command a descent so the frame re-centers; symmetric for the top edge.
-            // Overrides the PD a_z only near the edge (outer 30% of the half-FOV). Affects only
-            // the throttle below (the tilt was built from the pre-override a_z, as before).
+            // Semi-strapdown gimbal: the boresight is decoupled from body pitch (the gimbal
+            // stabilizes it in the world frame), so a tilt clamp cannot keep the target in the
+            // vertical FOV — ALTITUDE can. If the target approaches the bottom edge (los_el well
+            // below the boresight), command a descent so the frame re-centers; symmetric for the
+            // top edge. Overrides the PD a_z only near the edge (outer 30% of the half-FOV).
+            // Affects only the throttle below (the tilt was built from the pre-override a_z).
             const double fov_keep = fov_half_v_ * fov_keep_margin_;
             // Boresight world elevation: prefer the ACTUAL camera orientation measured by the gimbal
             // (q_C_W) — this tracks the true boresight INCLUDING servo lag, so the vertical-FOV clamp
             // reacts to where the camera really points during pitch transients (closer to real HW).
-            // Fall back to the constant -gimbal_bias_ assumption when no measurement is available.
+            // With no measurement yet (no /fpv/gimbal msg), assume a level boresight.
             const double boresight_el = std::isfinite(boresight_el_meas)
-                ? boresight_el_meas : -gimbal_bias_;
+                ? boresight_el_meas : 0.0;
             const double el_err = los_el - boresight_el;   // negative = target below boresight
             const double edge = 0.7 * fov_keep;
             // A tracking gimbal can put an upper target below its boresight (and vice versa).
@@ -838,6 +849,18 @@ public:
         const Eigen::Vector2d s_az_raw = (d_h_mag > 1e-9) ? (d.head<2>() / d_h_mag) : fwd_h;
         double tilt_fwd  = tilt_mag_raw * s_az_raw.dot(fwd_h);
         double tilt_left = tilt_mag_raw * s_az_raw.dot(left_h);
+        // NaN quarantine (attitude reference): a single non-finite guidance tick — e.g. a NaN
+        // r_est sample from the estimator, which survives into d through the horizontal
+        // acceleration — would otherwise be written into the EMA/slew states below and survive
+        // the recursion forever (clamp(v, NaN, NaN) = NaN): every later tick then yields NaN
+        // tilt, the rate law reads crn = NaN and freezes at zero while thrust continues.
+        // Substitute the last finite filtered reference (level before the first tick); the
+        // EMA/slew blocks then hold it exactly and the next clean tick resumes from
+        // uncontaminated state.
+        if (!std::isfinite(tilt_fwd) || !std::isfinite(tilt_left)) {
+            tilt_fwd = last_tilt_fwd_f_;
+            tilt_left = last_tilt_left_f_;
+        }
 
         // ---- Attitude reference EMA low-pass ------------------------------------------------
         // Suppress camera-rate content / roll limit-cycle before the rate law. An EMA (vs the slew
