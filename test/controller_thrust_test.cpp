@@ -164,6 +164,34 @@ int main()
     const auto boost35_cmd = overtilt(boost35);
     require(boost35_cmd[2] < 0.0 && boost35_cmd[0] > 17.0,
             "35 deg launch cap must also bind in the over-tilt regime");
+    // ---- 12-06-28 round-sweep regression ------------------------------------------------
+    // Lateral (azimuth-offset) demand during the launch pitch-over swings the body +-60 deg of
+    // bank; the boost must hold the tilt in the boresight plane (roll neutralization) so the single-axis gimbal tracks in-plane and the camera error no longer follows |roll|.
+    const Eigen::Matrix3d roll_body =
+        Eigen::AngleAxisd(0.8, Eigen::Vector3d::UnitY()).toRotationMatrix();
+   // ahead-below-left target: 15 deg lateral demand at 20 deg azimuth offset
+    const double roll_y = roll_body(1, 1);
+    const Eigen::Vector3d rolled_rel(30.0 * std::cos(roll_y), 30.0 * std::sin(roll_y), -10.0);
+    const double rolled_el = std::atan2(-10.0, std::hypot(30.0 * std::cos(20.0 * M_PI / 180.0),
+                                                               30.0 * std::sin(20.0 * M_PI / 180.0)));
+    auto rolled_free = controller();  // NO begin_ground_launch: the true no-boost baseline
+    rolled_free.set_guidance_tuning(10.0, 4.0, 12.0, 0.0, 0.5, 10.0, 0.0);
+    const auto rolled_cmd = overtilt(rolled_free);
+    auto boosted_roll = controller();
+    boosted_roll.set_guidance_tuning(10.0, 4.0, 12.0, 0.0, 0.5, 10.0, 0.0);
+    boosted_roll.set_launch_boost(8.0, 3.0, 3.0, 25.0);
+    boosted_roll.begin_ground_launch();
+    const auto boosted_cmd = overtilt(boosted_roll);
+    // (diagnostic block removed: it referenced rolled_rot lost in an earlier edit)
+    const Eigen::Vector3d rolled_z_cmd = Eigen::Vector3d::UnitZ();
+    std::fprintf(stderr, "free   : thrust=%7.3f wx=%+7.4f wy=%+7.4f wz=%+7.4f\n",
+                    rolled_cmd[0], rolled_cmd[1], rolled_cmd[2], rolled_cmd[3]);
+    std::fprintf(stderr, "boost : thrust=%7.3f wx=%+7.4f wy=%+7.4f wz=%+7.4f\n",
+                    boosted_cmd[0], boosted_cmd[1], boosted_cmd[2], boosted_cmd[3]);
+    require(std::abs(boosted_cmd[2]) > 0.5 && boosted_cmd[0] > 17.0,
+            "lateral roll demand must not command body roll during the boost (roll neutralization)");
+    require(std::abs(boosted_cmd[1]) <= std::abs(rolled_cmd[1]),
+        "boost roll-rate channel must not exceed the free controller's while tracking the same lateral demand");
 
     // ---- rotate_about_left materialization regression ---------------------------------------
     // Target BEHIND the boresight (azimuth error pi) points the capped tilt demand

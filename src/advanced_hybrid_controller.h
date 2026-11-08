@@ -829,7 +829,14 @@ public:
                 // exactly in the over-tilt regime it exists for. Boost intentionally overrides
                 // the nose-up/FOV clamp results above: the ground launch prioritizes the
                 // decisive near-vertical climb.
-                d = Eigen::Vector3d(a_h_eff(0), a_h_eff(1), a_z + g);
+                // Roll neutralization: the single-axis gimbal cannot cancel roll-coupled
+                // azimuth error (err ~ j*sin(roll), see camera-pose history):
+                // during the boost pitch-over the lateral PN demand swings the body +-60 deg of
+                // bank and walks the target out of the FOV (12-06-28 sim
+                // run: camera error tracked |roll| row-by-row). Hold the tilt in the
+                // boresight plane during the boost; lateral guidance re-engages at boost exit. The subsequent cap clamps magnitude only.
+                const double a_h_fwd = a_h_eff.dot(fwd_h);
+                d = Eigen::Vector3d(a_h_fwd * fwd_h(0), a_h_fwd * fwd_h(1), a_z + g);
                 const double a_h_max = std::tan(launch_max_tilt_rad_) * (a_z + g);
                 const double a_h_norm = d.head<2>().norm();
                 if (a_h_norm > a_h_max) {
