@@ -152,6 +152,8 @@ void InterceptorNodeRelativeIMMUKF::declare_parameters() {
     this->declare_parameter<double>("controller.axial_deadband", 1.5); // m/s, coast within ±this of v_des — kills radar-noise-driven pitch oscillation during blind flight
     this->declare_parameter<double>("controller.a_lat_tilt_start_deg", 65.0); // sin(pitch)-keyed lateral-authority attenuation window start (see advanced_hybrid_controller.h)
     this->declare_parameter<double>("controller.a_lat_tilt_end_deg", 85.0);   // ... end (a_lat -> 0); the <=68 deg flight envelope is untouched
+    this->declare_parameter<double>("controller.a_lat_bank_start_deg", 20.0); // |bank|-keyed lateral-authority taper start: full authority below this bank (single-axis-gimbal roll-coupling guard, 2026-11-09)
+    this->declare_parameter<double>("controller.a_lat_bank_end_deg", 45.0);   // ... end (a_lat -> 0 above this bank)
     this->declare_parameter<double>("controller.gimbal_nose_up_max_deg", 35.0); // max body nose-up the gimbal can compensate (C20S +40 deg up-travel minus the 5 deg down-gaze bias); 0 = unlimited
     this->declare_parameter<double>("radar.motion_gate_factor", 3.0); // widens the bbox-radar LOS gate for moving targets: bearing_tol += this * v_perp * delay / r
     this->declare_parameter<double>("controller.lateral_decay_floor", 0.4);  // Fix D: close-range a_lat floor
@@ -387,6 +389,9 @@ void InterceptorNodeRelativeIMMUKF::load_parameters() {
     controller_->set_lateral_tilt_attenuation(
         this->get_parameter("controller.a_lat_tilt_start_deg").as_double(),
         this->get_parameter("controller.a_lat_tilt_end_deg").as_double());
+    controller_->set_lateral_bank_attenuation(
+        this->get_parameter("controller.a_lat_bank_start_deg").as_double(),
+        this->get_parameter("controller.a_lat_bank_end_deg").as_double());
     controller_->set_gimbal_nose_up_max(this->get_parameter("controller.gimbal_nose_up_max_deg").as_double());
     dither_radar_range_ = std::max(0.0, this->get_parameter("controller.dither_radar_range").as_double());
     vel_smooth_tc_ = this->get_parameter("estimation.vel_smooth_tc").as_double();

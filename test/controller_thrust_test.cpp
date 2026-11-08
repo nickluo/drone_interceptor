@@ -193,6 +193,44 @@ int main()
     require(std::abs(boosted_cmd[1]) <= std::abs(rolled_cmd[1]),
         "boost roll-rate channel must not exceed the free controller's while tracking the same lateral demand");
 
+    // ---- 2026-11-08 orbit-intercept regression: bank-keyed lateral taper --------------------
+    // A banked body must lose LATERAL guidance authority: with a single-axis gimbal the
+    // rolled image derotation injects false azimuth (err ~ j*sin(roll)); PN chasing it
+    // deepens the bank and the loop ran away on 2026-11-08 orbit-intercept runs (roll to
+    // -74 deg, rates saturated, target walked out of the FOV). Differential test: the
+    // roll-rate response to a measured bearing rate (los_rate) at 50 deg of bank must
+    // nearly vanish (taper zero past a_lat_bank_end_=45 deg), while a level body keeps
+    // the full lateral response; 25 deg of bank keeps a reduced response.
+    {
+        const Eigen::Vector3d rel(30.0, 0.0, -5.0);
+        const double el = std::atan2(-5.0, 30.0);
+        const double bearing_rate = 0.3;  // rad/s measured LOS rate -> lateral PN demand
+        auto lateral_response = [&](const Eigen::Matrix3d &rotation) {
+            auto quiet = controller();
+            const auto cmd_quiet = quiet.compute_control(
+                rotation, 0.0, 0.0, rel, Eigen::Vector3d::Zero(), el, 0.0, 0.0, 35.0,
+                0.0, 0.0, 0.0, Eigen::Vector3d::Zero(), el);
+            auto tracking = controller();
+            const auto cmd_track = tracking.compute_control(
+                rotation, 0.0, 0.0, rel, Eigen::Vector3d::Zero(), el, 0.0, 0.0, 35.0,
+                0.0, 0.0, bearing_rate, Eigen::Vector3d::Zero(), el);
+            return std::abs(cmd_track[1] - cmd_quiet[1]);
+        };
+        const double level_response = lateral_response(Eigen::Matrix3d::Identity());
+        const double banked25_response = lateral_response(
+            Eigen::AngleAxisd(25.0 * M_PI / 180.0, Eigen::Vector3d::UnitX()).toRotationMatrix());
+        const double banked50_response = lateral_response(
+            Eigen::AngleAxisd(50.0 * M_PI / 180.0, Eigen::Vector3d::UnitX()).toRotationMatrix());
+        require(level_response > 0.2,
+            "level body must answer a measured bearing rate with lateral (roll-rate) demand");
+        require(banked25_response < 0.9 * level_response,
+            "25 deg of bank must reduce the lateral response (taper window 20..45 deg)");
+        require(banked50_response < 0.1 * level_response + 1e-9,
+            "50 deg of bank must nearly eliminate the lateral response (taper ends at 45 deg)");
+        std::fprintf(stderr, "bank taper: level=%.4f bank25=%.4f bank50=%.4f\n",
+                     level_response, banked25_response, banked50_response);
+    }
+
     // ---- rotate_about_left materialization regression ---------------------------------------
     // Target BEHIND the boresight (azimuth error pi) points the capped tilt demand
     // nose-up: tf = -65 deg < the gimbal up-travel floor (default gimbal_nose_up_max_

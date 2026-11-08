@@ -153,6 +153,17 @@ public:
     // 90 deg regime, where the bearing rate cannot self-extinguish without ownship translation.
     double a_lat_tilt_start_ = 65.0 * M_PI / 180.0;   // window start, in sin(pitch) units
     double a_lat_tilt_end_ = 85.0 * M_PI / 180.0;
+    // Bank-keyed lateral-authority taper (2026-11-09): a lateral demand that deepens the body
+    // bank is self-reinforcing with a single-axis gimbal — the rolled image (and its derotation
+    // through the gimbal attitude stream) produces false azimuth (err ~ j*sin(roll), see the
+    // ground-launch roll-neutralization note below), PN chases it and banks further; past
+    // ~+-60 deg of bank this loop ran away and tumbled the craft (2026-11-08 intercept runs,
+    // roll -74 deg -> rates saturated -> target out of FOV). Taper ALL lateral authority (PN,
+    // APN, dither) with the measured bank of the body lateral axis out of the horizontal plane
+    // (|R_b2n(2,1)|, pitch-insensitive): full authority below a_lat_bank_start_, zero above
+    // a_lat_bank_end_. Wings-level pursuit keeps full authority; the loop cannot close.
+    double a_lat_bank_start_ = 20.0 * M_PI / 180.0;   // |bank| below: full lateral authority, in sin(bank) units
+    double a_lat_bank_end_ = 45.0 * M_PI / 180.0;     // ... above: a_lat -> 0
     // Ground-launch boost: a mission triggered on the ground (node checks altitude at launch)
     // gets a guaranteed vertical acceleration and a tilt cap until the climb rate reaches
     // launch_exit_speed_ (a reasonable initial velocity) or the safety timeout expires.
@@ -361,6 +372,10 @@ public:
         a_lat_tilt_start_ = std::max(0.0, start_deg) * M_PI / 180.0;
         a_lat_tilt_end_ = std::max(a_lat_tilt_start_ + 1e-3, end_deg) * M_PI / 180.0;
     }
+    void set_lateral_bank_attenuation(double start_deg, double end_deg) {
+        a_lat_bank_start_ = std::max(0.0, start_deg) * M_PI / 180.0;
+        a_lat_bank_end_ = std::max(a_lat_bank_start_ + 1e-3, end_deg) * M_PI / 180.0;
+    }
     void set_gimbal_nose_up_max(double deg) { gimbal_nose_up_max_ = std::max(0.0, deg) * M_PI / 180.0; }
 
     // Odometry-free control with optional coordinated terminal speed limits. Inputs:
@@ -412,6 +427,15 @@ public:
         const double att_lat = clamp((std::sin(a_lat_tilt_end_) - sin_pitch) /
                                       std::max(std::sin(a_lat_tilt_end_) - std::sin(a_lat_tilt_start_), 1e-6),
                                       0.0, 1.0);
+        // Bank-keyed lateral taper: |R_b2n(2,1)| is the world-z (up) component of the body
+        // lateral axis = sin(bank)*cos(pitch) for a ZYX attitude — a pitch-insensitive bank
+        // measure read straight off the rotation matrix (no Euler extraction, valid through
+        // +-90 deg of body pitch). See a_lat_bank_start_ for why lateral authority must
+        // vanish with bank on a single-axis-gimbal seeker.
+        const double bank_lat_sin = clamp(std::abs(R_b2n(2, 1)), 0.0, 1.0);
+        const double att_bank = clamp((std::sin(a_lat_bank_end_) - bank_lat_sin) /
+                                      std::max(std::sin(a_lat_bank_end_) - std::sin(a_lat_bank_start_), 1e-6),
+                                      0.0, 1.0);
         const double r_norm = r_est.norm();
         // Axial-only range EMA (radar smoothness): r_norm carries +-~4 m of 10 Hz radar noise; fed
         // 1:1 into the turn-radius cap (sqrt(g*tan*r)) it swings v_des_eff and brakes every cycle.
@@ -455,7 +479,7 @@ public:
         const double lat_f = clamp((r_norm - terminal_brake_range_) /
                                    std::max(lat_decay_start_ - terminal_brake_range_, 1.0), 0.0, 1.0);
         a_lat_mag *= lateral_decay_floor_ + (1.0 - lateral_decay_floor_) * lat_f;
-        a_lat_mag *= att_lat;
+        a_lat_mag *= att_lat * att_bank;
         // Lateral direction in world horizontal plane: perpendicular to LOS projected to xy.
         Eigen::Vector2d e_los_xy(r_est(0), r_est(1));
         if (e_los_xy.norm() < 1e-3) e_los_xy << 1.0, 0.0;
@@ -489,7 +513,7 @@ public:
         }
         if (dither_amp_ > 0.0 && r_norm > dither_min_range_ && !radar_owns_guidance &&
             !dither_suppressed_by_bbox && !radar_close_range) {
-            const double a_dither = dither_amp_ * std::sin(2.0 * M_PI * dither_freq_ * t);
+            const double a_dither = dither_amp_ * att_bank * std::sin(2.0 * M_PI * dither_freq_ * t);
             a_lat_world += a_dither * e_perp_xy;
         }
         // Geometric APN: classic PN lags a turning target. Recover the target lateral accel from
@@ -518,7 +542,7 @@ public:
         }
         if (K_apn_max_range_ <= 0.0 || r_norm < K_apn_max_range_) {
             if (std::abs(a_t_perp_geom) > K_apn_min_at_) {
-                a_lat_world += K_apn_ * att_lat * a_t_perp_geom * e_perp_xy;
+                a_lat_world += K_apn_ * att_lat * att_bank * a_t_perp_geom * e_perp_xy;
             }
         }
 

@@ -115,6 +115,13 @@ interceptor_node_relative_imm_ukf:
       # cannot self-extinguish without ownship translation.
       a_lat_tilt_start_deg: 65.0
       a_lat_tilt_end_deg: 85.0
+      # |bank|-keyed lateral-authority taper (2026-11-09): single-axis-gimbal roll-coupling
+      # guard. A lateral demand that deepens the bank is self-reinforcing (rolled image ->
+      # false azimuth err ~ j*sin(roll) -> PN banks further; ran away to -74 deg bank and a
+      # tumble on 2026-11-08 orbit-intercept runs). Full lateral authority below 20 deg of
+      # bank, zero above 45 deg — wings-level pursuit is unaffected, the loop cannot close.
+      a_lat_bank_start_deg: 20.0
+      a_lat_bank_end_deg: 45.0
       # Max body NOSE-UP pitch the C20S gimbal can compensate (up-travel is +40 deg; 35 keeps
       # a 5 deg margin): braking harder nose-up saturates the servo and drops the boresight
       # below the target. 0 = unlimited.
