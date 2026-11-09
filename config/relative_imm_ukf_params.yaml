@@ -6,8 +6,11 @@ interceptor_node_relative_imm_ukf:
 
     # Accelerometer bias in body frame, subtracted before the strapdown preintegration
     # (dv_own = ∫(R·(f_imu − bias) − g)dt). The ROS2 Python sim harness publishes a bias-free
-    # IMU, so zeros here; set calibrated values on real hardware.
-    imu_bias: [0.0, 0.0, 0.0]
+    # IMU, so zeros there. Real-hardware calibration (2026-11-09, ARROWF405V5, 11600 静置
+    # 样本/60s, imu_bias_calibration.py; 电机静止): x/y 可忽略, z=+6.9mg 主导。
+    # 验证: 标定后无桨 MISSION own_vz 漂移 0.33 -> 0.02 m/s² (17x); 偏置随温度漂移,
+    # 大温差/长间隔后建议重标 (冷机首任务的旧漂移可能与热机标定值不符)。
+    imu_bias: [0.0026, -0.0014, 0.0675]
 
     # Topic names are read at startup; restart the node after changing them.
     topics:
