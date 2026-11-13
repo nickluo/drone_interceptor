@@ -73,6 +73,10 @@ class ThrottleMirror:
                 return
             self.pm = pm
             self.model = pm.PropulsionModel.from_parameters(mp, lipo_cells, pm.DEFAULT_U_IDLE)
+            # 输出保护限幅 (与节点 pushControl 输出端一致; 缺省 1.0 = 不限制)
+            self.limit = float(mp.get("throttle_limit", 1.0))
+            if not (0.0 <= self.limit <= 1.0):
+                self.limit = 1.0
             self.enabled = True
         except Exception as exc:  # noqa: BLE001 - 镜像是可选增强
             self.reason = f"推力模型镜像加载失败 ({exc}); 油门列记 NaN"
@@ -89,7 +93,7 @@ class ThrottleMirror:
         env = env_factor if self.baro_comp else 1.0
         v, i = (vbat, current) if self.voltage_comp else (float("nan"),) * 2
         try:
-            return self.model.collective(collective_ms2 * mass, env, v, i)
+            return min(self.model.collective(collective_ms2 * mass, env, v, i), self.limit)
         except Exception:  # noqa: BLE001
             return float("nan")
 
@@ -147,7 +151,8 @@ class BenchMissionRecorder(Node):
 
         self.log("recorder started, out=%s", args.out)
         if self.mirror.enabled:
-            self.log("throttle mirror ENABLED (calibrated); waiting for /fpv/cli motor_idle")
+            self.log("throttle mirror ENABLED (calibrated, limit=%.2f); waiting for /fpv/cli motor_idle"
+                     % self.mirror.limit)
         else:
             self.log("throttle mirror DISABLED: %s", self.mirror.reason)
         self.next_status = time.monotonic() + 1.0
